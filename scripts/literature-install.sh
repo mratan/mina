@@ -6,13 +6,14 @@
 set -euo pipefail
 dir="$(cd "$(dirname "$0")/../services/literature-mcp" && pwd)"
 venv="$dir/.venv"
+. "$(dirname "$0")/find-uv.sh"
 
 npm ci --prefix "$dir" --ignore-scripts --no-audit --no-fund
 
 python=/usr/bin/python3
 for candidate in "$venv"/runtime/python/cpython-*/bin/python3; do [ -x "$candidate" ] && python="$candidate"; done
-uv venv -q --allow-existing "$venv" --python "$python"
-uv pip install -q --python "$venv/bin/python" -r "$dir/requirements.lock.txt"
+"$UV" venv -q --allow-existing "$venv" --python "$python"
+"$UV" pip install -q --python "$venv/bin/python" -r "$dir/requirements.lock.txt"
 
 if [ -x "$venv/runtime/node/bin/node" ]; then ln -sfn ../runtime/node/bin/node "$venv/bin/node"; else ln -sfn /usr/bin/node "$venv/bin/node"; fi
 major="$("$venv/bin/node" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"

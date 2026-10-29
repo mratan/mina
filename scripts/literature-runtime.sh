@@ -7,6 +7,7 @@ set -euo pipefail
 node_version="${1:-v26.12.1}"
 python_version="${2:-3.14}"
 runtime="$(cd "$(dirname "$0")/.." && pwd)/services/literature-mcp/.venv/runtime"
+. "$(dirname "$0")/find-uv.sh"
 case "$(uname -m)" in
   x86_64) arch=x64 ;;
   aarch64 | arm64) arch=arm64 ;;
@@ -23,5 +24,5 @@ rm -rf "$runtime/node"
 mkdir -p "$runtime/node"
 tar -xf "$download/$tarball" -C "$runtime/node" --strip-components=1
 
-UV_PYTHON_INSTALL_DIR="$runtime/python" uv python install -q --no-bin "$python_version"
+UV_PYTHON_INSTALL_DIR="$runtime/python" "$UV" python install -q --no-bin "$python_version"
 echo "literature runtime: node $("$runtime/node/bin/node" --version), Python $python_version in $runtime/python"

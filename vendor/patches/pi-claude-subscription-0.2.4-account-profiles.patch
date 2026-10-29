@@ -1,0 +1,317 @@
+Mina patch "account-profiles" for pi-claude-subscription 0.2.4 (github.com/jkeskikangas/pi-claude-subscription),
+Copyright (c) 2026 Jarno Keskikangas, MIT License. Changes by Mina contributors, MIT License. See docs/vendor-patches.md.
+
+--- a/src/cc-sessions.ts
++++ b/src/cc-sessions.ts
+@@ -5,27 +5,27 @@
+ import type { AssistantMessage } from "@earendil-works/pi-ai";
+ import { assistantBlocks, type TurnMessage, userTurnBlocks } from "./convert.ts";
+ 
+-function projectsRoot(): string {
+-	return join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "projects");
++function projectsRoot(configDir?: string): string {
++	return join(configDir ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "projects");
+ }
+ 
+ /** Claude Code's per-project session directory: the working directory's realpath, sanitized. */
+-export function projectDir(cwd: string): string {
++export function projectDir(cwd: string, configDir?: string): string {
+ 	let real = cwd;
+ 	try {
+ 		real = realpathSync(cwd);
+ 	} catch {}
+-	return join(projectsRoot(), real.replace(/[^a-zA-Z0-9]/g, "-"));
++	return join(projectsRoot(configDir), real.replace(/[^a-zA-Z0-9]/g, "-"));
+ }
+ 
+ /** Path of a session's transcript, wherever Claude Code filed it. */
+-export function sessionFile(cwd: string, sessionId: string): string | undefined {
++export function sessionFile(cwd: string, sessionId: string, configDir?: string): string | undefined {
+ 	const name = `${sessionId}.jsonl`;
+-	const direct = join(projectDir(cwd), name);
++	const direct = join(projectDir(cwd, configDir), name);
+ 	if (existsSync(direct)) return direct;
+ 	try {
+-		for (const dir of readdirSync(projectsRoot())) {
+-			const f = join(projectsRoot(), dir, name);
++		for (const dir of readdirSync(projectsRoot(configDir))) {
++			const f = join(projectsRoot(configDir), dir, name);
+ 			if (existsSync(f)) return f;
+ 		}
+ 	} catch {}
+@@ -37,8 +37,8 @@
+  * message `messageId` (it stores one entry per content block). New anchors capture this uuid
+  * from the SDK stream instead; this scan serves anchors persisted before that was possible.
+  */
+-export function findMessageUuid(cwd: string, sessionId: string, messageId: string): string | undefined {
+-	const file = sessionFile(cwd, sessionId);
++export function findMessageUuid(cwd: string, sessionId: string, messageId: string, configDir?: string): string | undefined {
++	const file = sessionFile(cwd, sessionId, configDir);
+ 	if (!file) return undefined;
+ 	let uuid: string | undefined;
+ 	for (const line of readFileSync(file, "utf8").split("\n")) {
+@@ -56,7 +56,7 @@
+  * provider's turns, a compacted session, a session from before this extension). Returns the
+  * session id and the uuid to resume at. `messages` must end with an assistant message.
+  */
+-export function synthesizeSession(cwd: string, model: string, messages: TurnMessage[]): { sessionId: string; at: string } {
++export function synthesizeSession(cwd: string, model: string, messages: TurnMessage[], configDir?: string): { sessionId: string; at: string } {
+ 	const sessionId = randomUUID();
+ 	const lines: string[] = [];
+ 	let parent: string | null = null;
+@@ -115,7 +115,7 @@
+ 		}
+ 		parent = uuid;
+ 	}
+-	mkdirSync(projectDir(cwd), { recursive: true });
+-	writeFileSync(join(projectDir(cwd), `${sessionId}.jsonl`), `${lines.join("\n")}\n`);
++	mkdirSync(projectDir(cwd, configDir), { recursive: true });
++	writeFileSync(join(projectDir(cwd, configDir), `${sessionId}.jsonl`), `${lines.join("\n")}\n`);
+ 	return { sessionId, at: parent! };
+ }
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -1,7 +1,16 @@
+ import { existsSync, readFileSync } from "node:fs";
+ import { join } from "node:path";
++import { accountProfiles } from "./profiles.ts";
++
++export interface AccountProfile {
++	id: string;
++	name: string;
++	configDir: string;
++}
+ 
+ export interface Config {
++	/** Owner-only account profiles; never read from project configuration. */
++	profiles?: AccountProfile[];
+ 	pathToClaudeCodeExecutable?: string;
+ 	/** "claude" (default): a pi prompt prefix written for Claude. "pi": pi's default prompt. */
+ 	promptMode?: "claude" | "pi";
+@@ -32,6 +41,7 @@
+ 	const project = readJson(join(where.cwd, ".pi", "claude-sdk.json")) ?? {};
+ 	return {
+ 		...global,
++		profiles: accountProfiles(global.profiles),
+ 		...(validMaxSessions(project.maxSessions) ? { maxSessions: project.maxSessions } : {}),
+ 		...(validIdleMinutes(project.idleMinutes) ? { idleMinutes: project.idleMinutes } : {}),
+ 		pathToClaudeCodeExecutable: where.env.PI_CLAUDE_SDK_CLAUDE_PATH ?? global.pathToClaudeCodeExecutable,
+--- /dev/null
++++ b/src/fork-session.ts
+@@ -0,0 +1,22 @@
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
++import { forkSession } from "@anthropic-ai/claude-agent-sdk";
++
++const exec = promisify(execFile);
++
++/** SDK disk helpers use process-global account state. Isolate them, not process.env. */
++export async function forkPersistedSession(sessionId: string, cwd: string, at: string, configDir?: string): Promise<{ sessionId: string }> {
++	if (!configDir) return forkSession(sessionId, { dir: cwd, upToMessageId: at, title: "pi" });
++	const moduleUrl = import.meta.resolve("@anthropic-ai/claude-agent-sdk");
++	const code = `import { forkSession } from ${JSON.stringify(moduleUrl)};
++const [sessionId, dir, upToMessageId] = process.argv.slice(1);
++console.log(JSON.stringify(await forkSession(sessionId, { dir, upToMessageId, title: "pi" })));`;
++	const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", code, sessionId, cwd, at], {
++		env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
++		timeout: 20_000,
++		maxBuffer: 64 * 1024,
++	});
++	const result = JSON.parse(stdout);
++	if (typeof result.sessionId !== "string") throw new Error("Claude SDK fork returned no session id");
++	return result;
++}
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,4 +1,6 @@
+ import { appendFileSync } from "node:fs";
++import { join } from "node:path";
++import { AnchorRegistry } from "./anchors.ts";
+ import { type ExtensionAPI, getAgentDir, getDocsPath, getExamplesPath, getReadmePath } from "@earendil-works/pi-coding-agent";
+ import { resolveConfig } from "./config.ts";
+ import { anthropicChatModels, claudeModels } from "./models.ts";
+@@ -15,23 +17,30 @@
+ export default function (pi: ExtensionAPI) {
+ 	const config = resolveConfig({ cwd: process.cwd(), agentDir: getAgentDir(), env: process.env });
+ 	const debugPath = process.env.PI_CLAUDE_SDK_DEBUG;
+-	const provider = new ClaudeSdkProvider({
++	const accounts = [
++		{ id: PROVIDER, name: "Claude (subscription via Agent SDK)", configDir: undefined as string | undefined, label: "" },
++		...(config.profiles ?? []).map((p) => ({ id: `${PROVIDER}-${p.id}`, name: `Claude ${p.name}`, configDir: p.configDir, label: p.name })),
++	].map((account) => ({ ...account, provider: new ClaudeSdkProvider({
++		configDir: account.configDir,
++		// Profiles never share anchors, even when their Pi transcript bytes match.
++		...(account.configDir ? { registry: new AnchorRegistry(join(getAgentDir(), account.id, "anchors.jsonl")) } : {}),
+ 		pathToClaudeCodeExecutable: config.pathToClaudeCodeExecutable,
+ 		...(config.maxSessions ? { maxSessions: config.maxSessions } : {}),
+ 		...(config.idleMinutes ? { idleMs: config.idleMinutes * 60_000 } : {}),
+-		debug: debugPath ? (msg) => appendFileSync(debugPath, `${new Date().toISOString()} ${msg}\n`) : undefined,
+-	});
++		debug: debugPath ? (msg) => appendFileSync(debugPath, `${new Date().toISOString()} ${account.id} ${msg}\n`) : undefined,
++	}) }));
+ 
+-	const register = (models = claudeModels()) =>
+-		pi.registerProvider(PROVIDER, {
+-			name: "Claude (subscription via Agent SDK)",
++	const register = (models = claudeModels()) => {
++		for (const account of accounts) pi.registerProvider(account.id, {
++			name: account.name,
+ 			// Claude Code authenticates itself; pi only needs a non-empty key to treat the provider as configured.
+ 			apiKey: "claude-code-login",
+ 			api: API as any,
+ 			baseUrl: "claude-agent-sdk://local",
+-			models,
+-			streamSimple: provider.streamSimple,
++			models: account.label ? models.map((m) => ({ ...m, name: `${m.name} [${account.label}]` })) : models,
++			streamSimple: account.provider.streamSimple,
+ 		});
++	};
+ 	register();
+ 
+ 	// Pick up Claude models newer than the bundled snapshot from pi's own catalog.
+@@ -49,8 +58,11 @@
+ 	});
+ 
+ 	const docs = { readme: getReadmePath(), docs: getDocsPath(), examples: getExamplesPath() };
+-	pi.on("before_agent_start", (event, ctx) => applyClaudePrompt(event, ctx.model, config.promptMode ?? "claude", docs));
++	pi.on("before_agent_start", (event, ctx) => {
++		if (accounts.some((a) => a.id === ctx.model?.provider)) applyClaudePrompt(event, { provider: PROVIDER }, config.promptMode ?? "claude", docs);
++	});
+ 
+-	pi.on("session_shutdown", () => provider.shutdown());
+-	process.once("exit", () => provider.shutdown());
++	const shutdown = () => { for (const account of accounts) account.provider.shutdown(); };
++	pi.on("session_shutdown", () => { shutdown(); process.removeListener("exit", shutdown); });
++	process.once("exit", shutdown);
+ }
+--- /dev/null
++++ b/src/profiles.ts
+@@ -0,0 +1,19 @@
++import { isAbsolute } from "node:path";
++import type { AccountProfile } from "./config.ts";
++
++/** Account selection is explicit, absolute, and owner-configured. Fail closed on mistakes. */
++export function accountProfiles(value: unknown): AccountProfile[] {
++	if (value === undefined) return [];
++	if (!Array.isArray(value)) throw new Error("claude-sdk.json: profiles must be an array");
++	const ids = new Set<string>();
++	return value.map((p) => {
++		if (!p || typeof p.id !== "string" || !/^[a-z][a-z0-9-]*$/.test(p.id) ||
++			typeof p.name !== "string" || !p.name.trim() ||
++			typeof p.configDir !== "string" || !isAbsolute(p.configDir)) {
++			throw new Error("claude-sdk.json: each profile needs an id, name, and absolute configDir");
++		}
++		if (ids.has(p.id)) throw new Error("claude-sdk.json: duplicate profile id");
++		ids.add(p.id);
++		return { id: p.id, name: p.name.trim(), configDir: p.configDir };
++	});
++}
+--- a/src/provider.ts
++++ b/src/provider.ts
+@@ -12,7 +12,7 @@
+ 	TranscriptContext,
+ } from "@earendil-works/pi-ai";
+ import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+-import { forkSession as forkSdkSession } from "@anthropic-ai/claude-agent-sdk";
++import { forkPersistedSession } from "./fork-session.ts";
+ import { AnchorRegistry } from "./anchors.ts";
+ import { findMessageUuid, synthesizeSession } from "./cc-sessions.ts";
+ import { piToolName, readTranscript, type Transcript, type TurnMessage, userTurnBlocks, fingerprint } from "./convert.ts";
+@@ -23,6 +23,7 @@
+ export const API = "claude-agent-sdk";
+ 
+ export interface ProviderOptions {
++	configDir?: string;
+ 	pathToClaudeCodeExecutable?: string;
+ 	/** Live Claude Code processes kept for reuse (one per concurrent conversation). */
+ 	maxSessions?: number;
+@@ -47,7 +48,7 @@
+ 	/** Sessions a provider call is reading right now (not the `busy` flag, which a failed attach could leave set). */
+ 	private readonly active = new Set<ClaudeSession>();
+ 	private readonly registry: AnchorRegistry;
+-	private readonly opts: Required<Omit<ProviderOptions, "registry" | "pathToClaudeCodeExecutable" | "debug" | "createSession" | "forkSession">> & ProviderOptions;
++	private readonly opts: Required<Omit<ProviderOptions, "registry" | "pathToClaudeCodeExecutable" | "debug" | "createSession" | "forkSession" | "configDir">> & ProviderOptions;
+ 	private timer?: NodeJS.Timeout;
+ 	lastRoute?: Route;
+ 
+@@ -106,6 +107,7 @@
+ 			}
+ 			const thinking = thinkingOptions(options?.reasoning, !!(model as any).thinkingLevelMap);
+ 			const spec = {
++				configDir: this.opts.configDir,
+ 				cwd: this.opts.cwd(),
+ 				model: model.id,
+ 				systemPrompt: t.systemPrompt,
+@@ -219,7 +221,7 @@
+ 			if (!a || a.cwd !== spec.cwd) continue;
+ 			// Another call is mid-response on that session; resuming would end it.
+ 			if (this.sessions.some((s) => s.busy && s.sessionId === a.sessionId)) continue;
+-			const at = a.entryUuid ?? findMessageUuid(a.cwd, a.sessionId, a.messageId);
++			const at = a.entryUuid ?? findMessageUuid(a.cwd, a.sessionId, a.messageId, spec.configDir);
+ 			if (!at) {
+ 				this.log(`anchor ${a.sessionId}/${a.messageId} not found on disk`);
+ 				continue;
+@@ -230,7 +232,9 @@
+ 			await this.waitExited(a.sessionId);
+ 			resume = { sessionId: a.sessionId, at };
+ 			try {
+-				const forked = await (this.opts.forkSession ?? forkPersistedSession)(a.sessionId, spec.cwd, at);
++				const forked = await (this.opts.forkSession
++					? this.opts.forkSession(a.sessionId, spec.cwd, at)
++					: forkPersistedSession(a.sessionId, spec.cwd, at, spec.configDir));
+ 				if (forked.sessionId && forked.sessionId !== a.sessionId) resume = { sessionId: forked.sessionId };
+ 			} catch (e) {
+ 				this.log(`fork anchor ${a.sessionId}/${a.messageId} failed (${errorText(e)}); resuming source session`);
+@@ -245,7 +249,7 @@
+ 				if (m.role === "assistant") last = i;
+ 			});
+ 			if (last >= 0) {
+-				resume = synthesizeSession(spec.cwd, spec.model, t.messages.slice(0, last + 1));
++				resume = synthesizeSession(spec.cwd, spec.model, t.messages.slice(0, last + 1), spec.configDir);
+ 				prefix = last + 1;
+ 				route = "synth";
+ 			}
+@@ -500,10 +504,6 @@
+ 	}
+ }
+ 
+-async function forkPersistedSession(sessionId: string, cwd: string, at: string): Promise<{ sessionId: string }> {
+-	return forkSdkSession(sessionId, { dir: cwd, upToMessageId: at, title: "pi" });
+-}
+-
+ function mapStop(reason: string | undefined): StopReason {
+ 	switch (reason) {
+ 		case "tool_use":
+--- a/src/session.ts
++++ b/src/session.ts
+@@ -8,6 +8,8 @@
+ import { AsyncQueue } from "./util.ts";
+ 
+ export interface SessionSpec {
++	/** Immutable account selection for this provider. Never mutate process.env. */
++	configDir?: string;
+ 	cwd: string;
+ 	model: string;
+ 	systemPrompt: string;
+@@ -57,8 +59,21 @@
+ 
+ /** Environment for the Claude Code child process. */
+ export function childEnv(base: Record<string, string | undefined>, spec: SessionSpec): Record<string, string | undefined> {
++	// An explicit account must not inherit OAuth, host-session, federation, or endpoint authentication.
++	const profileAuth = spec.configDir ? Object.fromEntries(Object.keys(base)
++		.filter((key) => /^(ANTHROPIC_|CLAUDE_CODE_OAUTH_|CLAUDE_CODE_HOST_)/.test(key) || [
++			"CLAUDE_CODE_SESSION_ACCESS_TOKEN", "CLAUDE_SESSION_INGRESS_TOKEN_FILE", "CLAUDE_CODE_REMOTE_SESSION_ID",
++			"CLAUDE_CODE_ENVIRONMENT_KIND", "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "CLAUDE_CODE_API_BASE_URL",
++			"CLAUDE_CODE_CUSTOM_OAUTH_URL", "CLAUDE_CODE_FEDERATION_CACHE_DIR",
++			"CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH", "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH",
++		].includes(key)).map((key) => [key, undefined])) : {};
+ 	return {
+ 		...base,
++		...profileAuth,
++		...(spec.configDir ? {
++			CLAUDE_CONFIG_DIR: spec.configDir,
++			CLAUDE_SECURESTORAGE_CONFIG_DIR: spec.configDir,
++		} : {}),
+ 		// Subscription auth: no inherited key or cloud-provider switch may move Claude Code to API billing.
+ 		ANTHROPIC_API_KEY: undefined,
+ 		ANTHROPIC_AUTH_TOKEN: undefined,

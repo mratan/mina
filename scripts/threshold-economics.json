@@ -1,0 +1,92 @@
+{
+  "claude-sdk/claude-opus-5-5, API-equivalent (Anthropic list prices)": {
+    "g": 2600,
+    "o": 1000,
+    "B": 42000,
+    "R": 50000,
+    "g_reorient": 5000,
+    "A0": 38000,
+    "k": 0.25,
+    "s_out": 6000,
+    "note_out": 2300,
+    "price": {
+      "base": {
+        "input": 4,
+        "cache_read": 0.2,
+        "cache_write": 8,
+        "cache_write_oneshot": 8,
+        "output": 20
+      }
+    },
+    "grid": [
+      100000,
+      160000,
+      200000,
+      250000,
+      300000,
+      400000,
+      500000,
+      600000
+    ]
+  },
+  "openai-codex/gpt-6.1-sol, Codex credits (no 272K tier documented)": {
+    "g": 1900,
+    "o": 500,
+    "B": 32000,
+    "R": 50000,
+    "g_reorient": 4000,
+    "A0": 38000,
+    "k": 0.25,
+    "s_out": 6000,
+    "note_out": 2300,
+    "price": {
+      "base": {
+        "input": 50,
+        "cache_read": 2.5,
+        "output": 250
+      }
+    },
+    "grid": [
+      100000,
+      160000,
+      200000,
+      250000,
+      300000,
+      350000
+    ]
+  },
+  "openai-codex/gpt-6.1-sol, Codex credits if the API 272K tier applied": {
+    "g": 1900,
+    "o": 500,
+    "B": 32000,
+    "R": 50000,
+    "g_reorient": 4000,
+    "A0": 38000,
+    "k": 0.25,
+    "s_out": 6000,
+    "note_out": 2300,
+    "price": {
+      "base": {
+        "input": 50,
+        "cache_read": 2.5,
+        "output": 250
+      },
+      "tiers": [
+        {
+          "above": 272000,
+          "input": 100,
+          "cache_read": 5,
+          "output": 375
+        }
+      ]
+    },
+    "grid": [
+      100000,
+      160000,
+      200000,
+      250000,
+      300000,
+      350000
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "pi-literature-broker",
+  "version": "0.1.0",
+  "description": "Pi extension exposing Mina's unified literature broker: literature_search, paper_resolve, paper_get, citation_expand.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "main": "./index.js",
+  "exports": { ".": "./index.js" },
+  "pi": { "extensions": ["./index.js"] },
+  "engines": { "node": ">=22" }
+}

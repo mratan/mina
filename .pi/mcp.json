@@ -1,0 +1,109 @@
+{
+  "mcpServers": {
+    "openalex": {
+      "url": "https://mcp.openalex.org/mcp",
+      "exposure": "codemode",
+      "timeout": 90,
+      "description": "OpenAlex (official, remote): broad scholarly discovery, semantic and Boolean work search, citations, references and related works, author/institution/venue metadata, DOI/PMID/PMCID resolution. Sign in once: /mcp login openalex.",
+      "toolExposure": {
+        "claim_author_profile": "hidden",
+        "submit_curations": "hidden",
+        "list_my_curations": "hidden",
+        "get_my_account": "hidden",
+        "find_candidate_works": "hidden"
+      }
+    },
+    "pubmed": {
+      "command": "node",
+      "args": [
+        "scripts/mcp-sandbox.mjs",
+        "--name",
+        "pubmed",
+        "--secret",
+        "NCBI_API_KEY",
+        "--secret",
+        "NCBI_ADMIN_EMAIL=RESEARCH_EMAIL",
+        "--secret",
+        "UNPAYWALL_EMAIL=RESEARCH_EMAIL,NCBI_ADMIN_EMAIL",
+        "--secret",
+        "EUROPEPMC_EMAIL=RESEARCH_EMAIL,NCBI_ADMIN_EMAIL",
+        "--env",
+        "MCP_TRANSPORT_TYPE=stdio",
+        "--env",
+        "MCP_LOG_LEVEL=warning",
+        "--",
+        ".venv/bin/node",
+        "node_modules/@cyanheads/pubmed-mcp-server/dist/index.js"
+      ],
+      "cwd": ".",
+      "exposure": "codemode",
+      "timeout": 120,
+      "description": "PubMed, PMC and Europe PMC: biomedical search, metadata, MeSH, related/citing articles, DOI/PMID/PMCID conversion, and open-access full text (PMC, then Europe PMC, then Unpaywall)."
+    },
+    "biorxiv": {
+      "command": "node",
+      "args": [
+        "scripts/mcp-sandbox.mjs",
+        "--name",
+        "biorxiv",
+        "--secret",
+        "BIORXIV_MAILTO=RESEARCH_EMAIL,NCBI_ADMIN_EMAIL",
+        "--env",
+        "MCP_TRANSPORT_TYPE=stdio",
+        "--env",
+        "MCP_LOG_LEVEL=warning",
+        "--",
+        ".venv/bin/node",
+        "node_modules/@cyanheads/biorxiv-mcp-server/dist/index.js"
+      ],
+      "cwd": ".",
+      "exposure": "codemode",
+      "timeout": 120,
+      "description": "bioRxiv and medRxiv preprints: keyword/author search, recent preprints, metadata and version history, journal-publication links, and full text of a specific version."
+    },
+    "semantic_scholar": {
+      "command": "node",
+      "args": [
+        "scripts/mcp-sandbox.mjs",
+        "--name",
+        "semantic_scholar",
+        "--secret",
+        "SEMANTIC_SCHOLAR_API_KEY",
+        "--",
+        ".venv/bin/semantic-scholar-mcp"
+      ],
+      "cwd": ".",
+      "exposure": "codemode",
+      "timeout": 120,
+      "description": "Semantic Scholar: paper search, lookup by DOI/PMID/arXiv ID, references and citations, recommended papers, authors, open-access PDF locations.",
+      "toolExposure": {
+        "*_memory": "hidden",
+        "list_memories": "hidden",
+        "*_project": "hidden",
+        "list_projects": "hidden",
+        "get_current_config": "hidden",
+        "get_dataset_*": "hidden",
+        "get_incremental_dataset_updates": "hidden"
+      }
+    },
+    "arxiv": {
+      "command": "node",
+      "args": [
+        "scripts/mcp-sandbox.mjs",
+        "--name",
+        "arxiv",
+        "--env",
+        "MCP_TRANSPORT_TYPE=stdio",
+        "--env",
+        "MCP_LOG_LEVEL=warning",
+        "--",
+        ".venv/bin/node",
+        "node_modules/@cyanheads/arxiv-mcp-server/dist/index.js"
+      ],
+      "cwd": ".",
+      "exposure": "codemode",
+      "timeout": 120,
+      "description": "arXiv: search by query, category and date; metadata by ID; full paper text (native HTML, then ar5iv, then PDF text)."
+    }
+  }
+}

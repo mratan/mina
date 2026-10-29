@@ -1,0 +1,12 @@
+{
+  "model": "claude-sdk/claude-haiku-5-5",
+  "note": "Claude Haiku 5.5 through the Claude Agent SDK (pi-claude-subscription). Also the tuning of the account profiles claude-sdk-<profile>/claude-haiku-5-5. Requests count against the plan limits of the account that runs them.",
+  "context_window": 1000000,
+  "default_mode": "full",
+  "compact_at_tokens": 70000,
+  "handoff_at_tokens": 95000,
+  "thresholds_note": "Handoff at 95K, below the 100K long-context price tier of Haiku 5.5 (5x input, cache and output for the whole request, from the provider's model catalog); whether that tier applies to plan usage is undocumented. Compaction at 70K leaves hot compaction room to commit before the handoff.",
+  "collapse_tool_outputs": "with_compaction",
+  "collapse_note": "As for Opus: old tool outputs are collapsed only together with a compaction, so the provider does not rebuild its Claude Code session after every turn.",
+  "goal_prompt_note": "No goal_prompt: Haiku gets the full goal instructions, not the minimal ones set for Opus and Sol."
+}

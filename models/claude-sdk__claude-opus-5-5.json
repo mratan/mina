@@ -1,0 +1,11 @@
+{
+  "model": "claude-sdk/claude-opus-5-5",
+  "note": "Claude Opus 5.5 through the Claude Agent SDK (pi-claude-subscription). Also the tuning of the account profiles claude-sdk-<profile>/claude-opus-5-5. Requests count against the plan limits of the account that runs them.",
+  "context_window": 1000000,
+  "default_mode": "full",
+  "thresholds_note": "Thresholds: mina's defaults, 40% / 60% of the window capped at 250K / 350K (docs/threshold-economics.md). Opus 5.5 has no long-context premium.",
+  "collapse_tool_outputs": "with_compaction",
+  "collapse_note": "Old tool outputs are collapsed only together with a compaction. Each collapse on its own rewrites an earlier message, and the provider then rebuilds its Claude Code session without the prompt cache. Before pi-claude-subscription 0.2.4-mina.4, it also hid the model's later replies (repeated answers and tool calls).",
+  "goal_prompt": "minimal",
+  "goal_prompt_note": "minimal, as for Sol: the model sees how the goal machinery works; behaviour is left to the model and the deterministic gates."
+}

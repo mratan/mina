@@ -1,0 +1,31 @@
+Mina patch "telemetry-off" for pi-claude-subscription 0.2.4 (github.com/jkeskikangas/pi-claude-subscription),
+Copyright (c) 2026 Jarno Keskikangas, MIT License. Changes by Mina contributors, MIT License. See docs/vendor-patches.md.
+
+--- a/src/session.ts
++++ b/src/session.ts
+@@ -67,9 +67,25 @@
+ 			"CLAUDE_CODE_CUSTOM_OAUTH_URL", "CLAUDE_CODE_FEDERATION_CACHE_DIR",
+ 			"CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH", "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH",
+ 		].includes(key)).map((key) => [key, undefined])) : {};
++	// No telemetry from Claude Code: inherited exporters (OTEL_*, tracing endpoints) are removed, and every opt-out the
++	// bundled CLI reads is set. Inference, sign-in, and organization policy (managed settings, policy limits) remain.
++	const telemetryExporters = Object.fromEntries(Object.keys(base)
++		.filter((key) => /^(OTEL_|ANT_OTEL_)/.test(key) || [
++			"CLAUDE_CODE_ENABLE_TELEMETRY", "BETA_TRACING_ENDPOINT", "ENABLE_BETA_TRACING_DETAILED", "ENABLE_ENHANCED_TELEMETRY_BETA",
++		].includes(key)).map((key) => [key, undefined]));
+ 	return {
+ 		...base,
+ 		...profileAuth,
++		...telemetryExporters,
++		DISABLE_TELEMETRY: "1",
++		DO_NOT_TRACK: "1",
++		DISABLE_ERROR_REPORTING: "1",
++		DISABLE_AUTOUPDATER: "1",
++		DISABLE_UPDATES: "1",
++		DISABLE_BUG_COMMAND: "1",
++		DISABLE_FEEDBACK_COMMAND: "1",
++		CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: "1",
++		ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+ 		...(spec.configDir ? {
+ 			CLAUDE_CONFIG_DIR: spec.configDir,
+ 			CLAUDE_SECURESTORAGE_CONFIG_DIR: spec.configDir,

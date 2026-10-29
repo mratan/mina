@@ -1,0 +1,10 @@
+{
+  "model": "openai-codex/gpt-6.1-sol",
+  "note": "Codex via the ChatGPT sign-in. Its usage limit is shared with your other Codex use: avoid running Codex sessions in parallel.",
+  "context_window": 500000,
+  "default_mode": "full",
+  "handoff_at_tokens": 265000,
+  "thresholds_note": "Thresholds: compaction at mina's default (40% of 500K = 200K, the cheapest point in docs/threshold-economics.md). Handoff at 265K, below the 272K long-context price tier of the API (2x input and cache, 1.5x output for the whole request); whether that tier applies to plan usage is undocumented. Window 500K from pi's model registry.",
+  "goal_prompt": "minimal",
+  "goal_prompt_note": "minimal: the model sees only how the goal machinery works (pi-goal rule block and mina goal instructions reduced to operational facts); behaviour is left to the model and the deterministic gates. 2026-10-13."
+}

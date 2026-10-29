@@ -1,0 +1,10 @@
+{
+  "name": "mina-literature-mcp",
+  "private": true,
+  "description": "Pinned literature MCP servers for Mina (docs/research-literature.md). Install: npm ci --ignore-scripts",
+  "dependencies": {
+    "@cyanheads/pubmed-mcp-server": "2.10.19",
+    "@cyanheads/biorxiv-mcp-server": "0.3.0",
+    "@cyanheads/arxiv-mcp-server": "1.5.3"
+  }
+}

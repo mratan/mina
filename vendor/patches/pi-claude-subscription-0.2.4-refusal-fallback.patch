@@ -1,0 +1,71 @@
+Mina patch "refusal-fallback" for pi-claude-subscription 0.2.4 (github.com/jkeskikangas/pi-claude-subscription),
+Copyright (c) 2026 Jarno Keskikangas, MIT License. Changes by Mina contributors, MIT License. See docs/vendor-patches.md.
+
+diff --git a/src/provider.ts b/src/provider.ts
+--- a/src/provider.ts
++++ b/src/provider.ts
+@@ -287,6 +287,9 @@
+ 		let inResponse = false;
+ 		let responseStart = 0;
+ 		let turnStop: StopReason | undefined;
++		// The API refused the last response (stop_reason "refusal"). Claude Code then either retries once on its
++		// fallback model, retracting the refused partial, or ends the turn with no answer.
++		let refusal: { from: number; category: string | null; notice?: string } | undefined;
+ 		const finished = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0 };
+ 		let current = { ...finished };
+ 		const start = () => {
+@@ -327,6 +330,13 @@
+ 				}
+ 				if (m === undefined) return { ok: false, error: errorText(new Error("Claude Code exited unexpectedly"), session.stderr) };
+ 				if (m.type === "pi_error") return { ok: false, error: m.error };
++				if (m.type === "system" && (m.subtype === "model_refusal_fallback" || m.subtype === "model_refusal_no_fallback")) {
++					// Claude Code's refusal notice, for extensions, as the raw SDK frame. A notice can arrive turns after the
++					// refusal it reports: Claude Code sends it at the end of its own turn, which spans pi's tool calls.
++					await options?.onProviderStreamEvent?.(m, model);
++					if (m.subtype === "model_refusal_no_fallback" && refusal) refusal.notice = m.content;
++					continue;
++				}
+ 				if (m.type === "rate_limit_event") {
+ 					// Plan rate-limit state from Claude Code (no extra request): expose it to extensions
+ 					// through pi's provider_stream_event hook, as the raw SDK frame.
+@@ -340,6 +350,10 @@
+ 						case "message_start":
+ 							// The previous response broke off mid-stream and Claude Code retried it: drop its partial blocks.
+ 							if (inResponse) blocks.length = responseStart;
++							// The fallback model retries a refused response: drop the refused partial, as Claude Code does.
++							// Its tool calls never ran and must not reach pi.
++							else if (refusal) blocks.length = refusal.from;
++							refusal = undefined;
+ 							responseStart = blocks.length;
+ 							inResponse = true;
+ 							current = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0 };
+@@ -365,6 +379,9 @@
+ 							} else if (cb.type === "tool_use") {
+ 								blocks.push({ type: "toolCall", id: cb.id, name: piToolName(cb.name), arguments: {}, partialJson: "", index: ev.index });
+ 								stream.push({ type: "toolcall_start", contentIndex: blocks.length - 1, partial: output });
++							} else if (cb.type === "fallback" && typeof cb.to?.model === "string") {
++								// A server-side fallback inside one response: the content after this block comes from `to`.
++								output.responseModel = cb.to.model;
+ 							}
+ 							break;
+ 						}
+@@ -407,6 +424,7 @@
+ 						}
+ 						case "message_delta":
+ 							stopReason = ev.delta?.stop_reason ?? stopReason;
++							if (stopReason === "refusal") refusal = { from: responseStart, category: ev.delta?.stop_details?.category ?? null };
+ 							setUsage(ev.usage);
+ 							break;
+ 						case "message_stop":
+@@ -432,6 +450,11 @@
+ 					return { ok: false, error: text || `Claude Code error: ${m.error}` };
+ 				} else if (m.type === "result") {
+ 					if (m.is_error || m.subtype !== "success") return { ok: false, error: (m.errors ?? []).join("\n") || m.result || `Claude Code ${m.subtype}` };
++					if (refusal) {
++						// The turn ended on a refusal that no fallback model answered: an error, not a normal stop.
++						const why = `refusal${refusal.category ? `, category ${refusal.category}` : ""}`;
++						return { ok: false, error: `Claude Code: ${output.responseModel ?? model.id} declined this request (${why}) and no fallback model answered.${refusal.notice ? ` ${refusal.notice}` : ""}` };
++					}
+ 					output.stopReason = turnStop ?? "stop";
+ 					start();
+ 					return { ok: true, messageId };

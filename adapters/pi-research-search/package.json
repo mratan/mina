@@ -1,0 +1,19 @@
+{
+  "name": "pi-research-search",
+  "version": "0.1.0",
+  "description": "Research-oriented search for Pi: explicit modes routed to Exa (discovery), local SearXNG (scholarly literature) and Brave (docs/exact), plus an SSRF-guarded web_fetch. Derived from @bytetrue/pi-web-search 0.5.1.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "main": "./index.js",
+  "exports": { ".": "./index.js" },
+  "pi": {
+    "extensions": [
+      "./index.js"
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "engines": { "node": ">=22" }
+}

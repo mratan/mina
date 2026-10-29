@@ -1,0 +1,3 @@
+# mina's push-gate config (host/git-push-gate.py): gitleaks' default rules, nothing from the scanned repository.
+[extend]
+useDefault = true

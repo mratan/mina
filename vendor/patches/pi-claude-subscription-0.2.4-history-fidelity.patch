@@ -1,0 +1,84 @@
+Mina patch "history-fidelity" for pi-claude-subscription 0.2.4 (github.com/jkeskikangas/pi-claude-subscription),
+Copyright (c) 2026 Jarno Keskikangas, MIT License. Changes by Mina contributors, MIT License. See docs/vendor-patches.md.
+
+diff --git a/src/anchors.ts b/src/anchors.ts
+--- a/src/anchors.ts
++++ b/src/anchors.ts
+@@ -18,6 +18,10 @@
+ }
+ 
+ const MAX_ENTRIES = 20_000;
++// Entries of an older format are ignored. Version 2: builds before 0.2.4-mina.4 also recorded anchors for Claude Code
++// sessions resumed from an older anchor, whose history lacked the model's later replies; resuming one would carry
++// that loss on. Those conversations are synthesized from pi's transcript once instead.
++const FORMAT = 2;
+ 
+ export class AnchorRegistry {
+ 	private map = new Map<string, Anchor>();
+@@ -37,7 +41,8 @@
+ 		for (const line of lines) {
+ 			if (!line) continue;
+ 			try {
+-				const { k, s, m, c, u } = JSON.parse(line);
++				const { v, k, s, m, c, u } = JSON.parse(line);
++				if (v !== FORMAT) continue;
+ 				this.map.set(k, { sessionId: s, messageId: m, cwd: c, ...(typeof u === "string" ? { entryUuid: u } : {}) });
+ 			} catch {}
+ 		}
+@@ -69,5 +74,5 @@
+ }
+ 
+ function line(k: string, a: Anchor): string {
+-	return `${JSON.stringify({ k, s: a.sessionId, m: a.messageId, c: a.cwd, ...(a.entryUuid ? { u: a.entryUuid } : {}) })}\n`;
++	return `${JSON.stringify({ v: FORMAT, k, s: a.sessionId, m: a.messageId, c: a.cwd, ...(a.entryUuid ? { u: a.entryUuid } : {}) })}\n`;
+ }
+diff --git a/src/convert.ts b/src/convert.ts
+--- a/src/convert.ts
++++ b/src/convert.ts
+@@ -131,7 +131,7 @@
+ 		else if (m.role === "system") {
+ 			const text = systemUpdateText(m);
+ 			if (text) rest.push({ type: "text", text });
+-		}
++		} else throw new Error(`pi-claude-subscription: a ${m.role} message cannot be sent inside a user turn`);
+ 	}
+ 	return [...results, ...rest];
+ }
+diff --git a/src/provider.ts b/src/provider.ts
+--- a/src/provider.ts
++++ b/src/provider.ts
+@@ -217,6 +217,10 @@
+ 		let route: Route = "fresh";
+ 		for (let k = n - 1; k >= 1 && spec.tools.length > 0; k--) {
+ 			if (t.messages[k - 1].role !== "assistant") continue;
++			// Everything after the anchor goes to Claude Code as one user turn, which cannot carry an assistant message.
++			// An older anchor would silently drop the model's own later replies (it then re-answers and repeats its
++			// calls), so only the anchor at the last assistant message can resume; otherwise the session is synthesized.
++			if (t.messages.slice(k).some((m) => m.role === "assistant")) break;
+ 			const a = this.registry.get(t.chain[k]);
+ 			if (!a || a.cwd !== spec.cwd) continue;
+ 			// Another call is mid-response on that session; resuming would end it.
+diff --git a/src/session.ts b/src/session.ts
+--- a/src/session.ts
++++ b/src/session.ts
+@@ -297,10 +297,16 @@
+ 	close(): void {
+ 		if (this.dead) return;
+ 		this.dead = true;
+-		this.input.close();
+-		try {
+-			this.q.close();
+-		} catch {}
++		const end = () => {
++			this.input.close();
++			try {
++				this.q.close();
++			} catch {}
++		};
++		if (this.parked.size === 0) return end();
++		// A turn still waiting on pi's tool results would carry on by itself once they fail: Claude Code records them as
++		// interrupted and makes more API requests before the process ends. Interrupt the turn first.
++		void Promise.race([this.q.interrupt().catch(() => {}), new Promise((r) => setTimeout(r, 2000).unref())]).finally(end);
+ 	}
+ 
+ 	get stderr(): string {

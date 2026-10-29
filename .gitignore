@@ -1,0 +1,10 @@
+node_modules/
+keys/
+services/literature-mcp/.venv/
+__pycache__/
+*.pyc
+*.log
+.mina/
+.mina-test-sessions/
+.env
+.env.*

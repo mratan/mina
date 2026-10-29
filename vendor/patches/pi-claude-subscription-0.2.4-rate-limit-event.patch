@@ -1,0 +1,20 @@
+Mina patch "rate-limit-event" for pi-claude-subscription 0.2.4 (github.com/jkeskikangas/pi-claude-subscription),
+Copyright (c) 2026 Jarno Keskikangas, MIT License. Changes by Mina contributors, MIT License. See docs/vendor-patches.md.
+
+diff --git a/src/provider.ts b/src/provider.ts
+index afd8cd6..939729e 100644
+--- a/src/provider.ts
++++ b/src/provider.ts
+@@ -323,6 +323,12 @@ export class ClaudeSdkProvider {
+ 				}
+ 				if (m === undefined) return { ok: false, error: errorText(new Error("Claude Code exited unexpectedly"), session.stderr) };
+ 				if (m.type === "pi_error") return { ok: false, error: m.error };
++				if (m.type === "rate_limit_event") {
++					// Plan rate-limit state from Claude Code (no extra request): expose it to extensions
++					// through pi's provider_stream_event hook, as the raw SDK frame.
++					await options?.onProviderStreamEvent?.(m, model);
++					continue;
++				}
+ 				if (m.type === "stream_event" && !m.parent_tool_use_id) {
+ 					const ev = m.event;
+ 					await options?.onProviderStreamEvent?.(ev, model);

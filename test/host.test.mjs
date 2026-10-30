@@ -4,10 +4,13 @@ import { createServer } from 'node:net';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, symlinkSync, unlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import minaHost, { manifestText, request } from '../extensions/host/index.js';
-import { outerArgs, innerArgs, settings, hostPaths } from '../sandbox/sandbox.mjs';
-import { hostEnv } from '../bin/mina.mjs';
+import minaHost, { manifestText, request, UNREGISTERED_MANIFEST, wrappedLines, DIALOG_CHROME_LINES } from '../extensions/host/index.js';
+import { outerArgs, innerArgs, settings, hostPaths, BWRAP_PATH } from '../sandbox/sandbox.mjs';
+import { hostEnv, openHostSession, POLICY_PROTOCOL } from '../bin/mina.mjs';
 import { needsSandbox } from './capabilities.mjs';
+import { spawnSync } from 'node:child_process';
+import { homedir } from 'node:os';
+import { dirname } from 'node:path';
 
 const CLAIM = Symbol.for('mina:host-claim');
 
@@ -524,4 +527,156 @@ test('a budget-capable broker without receipt support rejects the marked envelop
     assert.equal(mutations.length, 1);
     assert.equal(mutations[0].request_protocol, 'mina-workload-request-v1');
   } finally { await pi.emit('session_shutdown'); await b.close(); }
+});
+
+// --- host policy: policy_propose, inventory, unregistered projects -------------------------------------------------
+
+const POLICY_CAPS = { ...CAPS, policy_protocol: 'mina-policy-v1', registered: true };
+const UNREG_CAPS = { confirmation_protocol: 'mina-confirmation-v1', mutation_protocol: WIRE, policy_protocol: 'mina-policy-v1', registered: false,
+  capabilities: [{ capability: 'project', status: 'REQUIRES_AUTHORIZATION', detail: 'not registered', remediation: 'Add it' },
+    { capability: 'inventory', status: 'AVAILABLE', detail: 'the GPUs' },
+    { capability: 'policy_propose', status: 'REQUIRES_AUTHORIZATION', detail: 'propose a registration' }] };
+
+test('mina_host lists inventory and policy_propose; policy_propose is a mutation with changes and reason', async () => {
+  delete globalThis[CLAIM];
+  const b = await fakeBroker((req) => (req.op === 'inventory' ? { ok: true, result: { devices: [] } } : { ok: true, result: POLICY_CAPS }));
+  const pi = fakePi();
+  minaHost(pi, { env: { MINA_HOST_SOCKET: b.socket, MINA_HOST_GRANT_FILE: b.grantFile }, pollMs: 60_000 });
+  try {
+    const tool = pi.tools.mina_host;
+    for (const a of ['inventory', 'policy_propose']) assert.ok(tool.parameters.properties.action.enum.includes(a), a);
+    assert.equal(tool.parameters.properties.changes.type, 'array');
+    assert.equal(tool.parameters.properties.reason.maxLength, 500);
+    assert.match(tool.description, /policy_propose \(propose a change to the host policy/);
+    assert.match(tool.description, /inventory \(read-only/);
+    const inv = await tool.execute('i', { action: 'inventory' }, null, null, { cwd: b.dir, hasUI: false });
+    assert.equal(inv.isError, false);
+    assert.deepEqual(b.seen.at(-1), { op: 'inventory', grant: 'G' }, 'inventory is a read, not a mutation');
+    await tool.execute('p', { action: 'policy_propose', changes: [{ kind: 'project_register' }], reason: 'GPUs' }, null, null, { cwd: b.dir, hasUI: false });
+    const sent = b.seen.find((r) => r.action === 'policy_propose');
+    assert.deepEqual(sent, { op: WIRE, action: 'policy_propose', grant: 'G', args: { changes: [{ kind: 'project_register' }], reason: 'GPUs' } });
+  } finally { await pi.emit('session_shutdown'); await b.close(); }
+});
+
+test('an unregistered project with a policy-capable broker gets a one-line manifest; an older broker the full one', async () => {
+  assert.equal(manifestText(UNREG_CAPS), UNREGISTERED_MANIFEST);
+  assert.equal(UNREGISTERED_MANIFEST.trim().split('\n').length, 1);
+  assert.match(UNREGISTERED_MANIFEST, /^Host broker: this project is not registered\. .*mina_host inventory .*mina_host policy_propose asks the user to approve a registration\.$/m);
+  const old = { ...UNREG_CAPS, policy_protocol: undefined };
+  assert.match(manifestText(old), /^## Host capabilities/);
+  assert.match(manifestText(POLICY_CAPS), /^## Host capabilities[^]*REQUIRES AUTHORIZATION:/);
+  // An old-protocol broker cannot have policy_propose shown as usable.
+  const legacy = manifestText({ capabilities: [{ capability: 'policy_propose', status: 'REQUIRES_AUTHORIZATION', detail: 'x' }] });
+  assert.match(legacy, /BLOCKED:\n- policy_propose/);
+  delete globalThis[CLAIM];
+  const b = await fakeBroker(() => ({ ok: true, result: UNREG_CAPS }));
+  const pi = fakePi();
+  minaHost(pi, { env: { MINA_HOST_SOCKET: b.socket, MINA_HOST_GRANT_FILE: b.grantFile }, pollMs: 60_000 });
+  try {
+    await pi.emit('session_start', {}, { cwd: b.dir });
+    const event = { systemPromptOptions: {} };
+    await pi.emit('before_agent_start', event);
+    assert.equal(event.systemPromptOptions.sections.host, UNREGISTERED_MANIFEST);
+  } finally { await pi.emit('session_shutdown'); await b.close(); }
+});
+
+test('policy_propose dialog: the user sees the whole broker prompt; only a confirmed retry carries the approval', async () => {
+  delete globalThis[CLAIM];
+  const diff = Array.from({ length: 50 }, (_, i) => `+ "w${i}": {"argv": ["/usr/bin/tool-${i}"], "max_s": 5}`).join('\n');
+  const prompt = `Change the host policy (/home/you/.config/mina/host.json) for the Mina session of /home/you/work/proj?\n\n`
+    + `The agent's reason (the agent's words, not examined):\n  needs tools\n\nRisk flags:\n  ! workload "w1" runs without the broker's sandbox\n\nDiff:\n${diff}`;
+  const b = await fakeBroker((req) => {
+    if (req.op !== WIRE) return { ok: true, result: POLICY_CAPS };
+    return req.args.approval?.granted === true ? { ok: true, result: { written: true, diff_sha256: 'd'.repeat(64), flags: [] } }
+      : { ok: false, error: { code: 'REQUIRES_AUTHORIZATION', message: 'needs confirmation', approval_needed: true, approval_prompt: prompt,
+        approval_request: { protocol: 'mina-confirmation-v1', challenge: 'policy-token' } } };
+  });
+  try {
+    for (const [rows, tall] of [[200, false], [30, true], [undefined, false]]) {
+      delete globalThis[CLAIM];
+      const pi = fakePi();
+      minaHost(pi, { env: { MINA_HOST_SOCKET: b.socket, MINA_HOST_GRANT_FILE: b.grantFile }, pollMs: 60_000, terminal: { rows, columns: 100 } });
+      const asked = [], notes = [];
+      const ui = { confirm: async (title, message) => { asked.push({ title, message }); return true; }, notify: (m, t) => notes.push({ m, t }) };
+      const before = b.seen.length;
+      const out = await pi.tools.mina_host.execute('pp', { action: 'policy_propose', changes: [{ kind: 'workload_set' }], reason: 'needs tools',
+        approval: { granted: true, challenge: 'forged' } }, null, null, { cwd: b.dir, hasUI: true, ui });
+      assert.equal(out.isError, false, out.content[0].text);
+      assert.equal(asked.length, 1);
+      assert.equal(asked[0].message, prompt, 'the dialog gets the whole prompt, unchanged');
+      assert.equal(asked[0].title.startsWith('mina host: change the host policy'), true);
+      assert.equal(/long: scroll up/.test(asked[0].title), tall, `rows ${rows}`);
+      assert.equal(notes.length, tall ? 1 : 0, 'a prompt taller than the terminal is also put into the chat in full');
+      if (tall) { assert.ok(notes[0].m.endsWith(prompt)); assert.equal(notes[0].t, 'warning'); }
+      const sent = b.seen.slice(before).filter((r) => r.action === 'policy_propose');
+      assert.equal(sent.length, 2);
+      assert.equal(sent[0].args.approval, undefined, 'the model\'s approval is dropped');
+      assert.deepEqual([sent[1].args.approval.challenge, sent[1].args.approval.by], ['policy-token', 'user']);
+      assert.ok(!JSON.stringify(out.content).includes('policy-token'));
+      await new Promise((r) => setTimeout(r, 50));
+      assert.ok(b.seen.slice(before).some((r) => r.op === 'capabilities'), 'the capabilities are refreshed after a change');
+      await pi.emit('session_shutdown');
+    }
+    assert.ok(wrappedLines(prompt, 100) + 1 + DIALOG_CHROME_LINES > 30);
+    assert.equal(wrappedLines('a'.repeat(250), 102), 3);
+  } finally { await b.close(); }
+});
+
+test('Pi renders a long confirmation message in full: wrapped, nothing cut', async () => {
+  const base = '../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive';
+  const { initTheme } = await import(`${base}/theme/theme.js`);
+  const { ExtensionSelectorComponent } = await import(`${base}/components/extension-selector.js`);
+  initTheme('dark');
+  const prompt = Array.from({ length: 70 }, (_, i) => `+ "w${i}": "${'x'.repeat(i * 3)}"`).join('\n');
+  // interactive-mode.js showExtensionConfirm: showExtensionSelector(`${title}\n${message}`, ["Yes", "No"], ...)
+  const src = readFileSync(new URL(`${base}/interactive-mode.js`, import.meta.url), 'utf8');
+  assert.match(src, /showExtensionSelector\(`\$\{title\}\\n\$\{message\}`, \["Yes", "No"\]/);
+  for (const width of [40, 80, 200]) {
+    const c = new ExtensionSelectorComponent(`mina host: change the host policy\n${prompt}`, ['Yes', 'No'], () => {}, () => {});
+    const lines = c.render(width).map((l) => l.replace(/\x1b\[[0-9;]*m/g, ''));
+    assert.ok(lines.every((l) => [...l].length <= width), `width ${width}`);
+    assert.ok(lines.join('').replace(/\s/g, '').includes(prompt.replace(/\s/g, '')), `width ${width}: the whole prompt`);
+  }
+});
+
+test('openHostSession: an unregistered project gets a session only from a policy-capable broker; MINA_HOST=0 is off', async () => {
+  const runtime = mkdtempSync(join(tmpdir(), 'mina-runtime-'));
+  let result = { registered: false, grant: 'G1', session: 's1', policy_protocol: POLICY_PROTOCOL };
+  const b = await fakeBroker((req) => (req.op === 'session_open' ? { ok: true, result } : { ok: false, error: { code: 'INVALID', message: 'x' } }));
+  const env = { MINA_HOSTD_RUNTIME: b.dir, XDG_RUNTIME_DIR: runtime, MINA_HOST_CONFIG: join(runtime, 'none.json') };
+  try {
+    const host = await openHostSession('/home/you/work/new', env, { uid: 4242 });
+    assert.equal(host.session, 's1');
+    assert.equal(readFileSync(host.grantFile, 'utf8'), 'G1\n');
+    assert.deepEqual(b.seen.at(-1).op, 'session_open');
+    result = { registered: false, grant: 'G2', session: 's2' };                    // an older broker
+    assert.equal(await openHostSession('/home/you/work/new', env, { uid: 4242 }), null);
+    assert.equal((await openHostSession('/home/you/work/new', { ...env, MINA_HOST: '1' }, { uid: 4242 })).session, 's2');
+    const n = b.seen.length;
+    assert.equal(await openHostSession('/home/you/work/new', { ...env, MINA_HOST: '0' }, { uid: 4242 }), null);
+    assert.equal(b.seen.length, n, 'MINA_HOST=0 sends nothing');
+  } finally { await b.close(); rmSync(runtime, { recursive: true, force: true }); }
+});
+
+test('the host policy folder is never writable for the agent: not in the outer layer\'s binds, read-only in a real sandbox', { skip: needsSandbox }, () => {
+  // Read-only checks of the real path: the bind list, and access(2) through `test -w`. Nothing is written there.
+  const home = homedir();
+  const policyDir = join(home, '.config', 'mina');
+  const project = mkdtempSync(join(tmpdir(), 'mina-policy-sandbox-'));
+  try {
+    const scratch = mkdtempSync(join(tmpdir(), 'mina-rt-'));
+    const env = { XDG_RUNTIME_DIR: scratch, PI_CODING_AGENT_DIR: join(scratch, 'agent') };
+    const s = settings({ cwd: project, env, config: {} });
+    const args = outerArgs(s, { env });
+    const binds = args.flatMap((a, i) => (a === '--bind' ? [args[i + 1]] : []));
+    const under = (root, p) => p === root || p.startsWith(`${root}/`);
+    assert.ok(!binds.some((b) => under(b, join(policyDir, 'host.json'))), `writable binds: ${binds.join(' ')}`);
+    assert.ok(!s.writable.some((w) => under(w, policyDir)));
+    let probe = policyDir;
+    while (!existsSync(probe)) probe = dirname(probe);              // the nearest folder that exists
+    const r = spawnSync(BWRAP_PATH, [...args, '--', '/bin/sh', '-c', 'for d; do if test -w "$d"; then echo "$d writable"; else echo "$d read-only"; fi; done', 'sh', probe, project],
+      { encoding: 'utf8', timeout: 20_000 });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout, `${probe} read-only\n${project} writable\n`);
+  } finally { rmSync(project, { recursive: true, force: true }); }
 });

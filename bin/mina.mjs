@@ -227,7 +227,10 @@ export function layerEnv(p, env = process.env, { home = homedir(), repoKeys = jo
 
 // The engineering-host profile (docs/host-profile.md): when mina-hostd runs and the project is registered in
 // ~/.config/mina/host.json, the launcher (outside the sandbox) opens a host session and gets a grant that only its own Pi
-// process can use. Off when the broker is not installed or the project is not registered; MINA_HOST=0 turns it off.
+// process can use. Off when the broker is not installed; MINA_HOST=0 turns it off. For a project that is not registered,
+// a broker that speaks the policy protocol still gets a session: the agent can see the machine (inventory) and propose a
+// registration that the user approves (policy_propose); everything else stays refused. An older broker: off, as before.
+export const POLICY_PROTOCOL = 'mina-policy-v1';
 export async function openHostSession(project, env = process.env, { uid = process.getuid() } = {}) {
   if (env.MINA_HOST === '0') return null;
   const hp = sandbox.hostPaths({ uid, env });
@@ -236,7 +239,7 @@ export async function openHostSession(project, env = process.env, { uid = proces
   if (!existsSync(socket)) return configured ? { unavailable: `mina-hostd is not running (no ${socket})` } : null;
   const out = await hostRequest(socket, { op: 'session_open', project, label: `mina ${process.pid}` }, { timeoutMs: 5000 });
   if (!out.ok) return { unavailable: `${out.error.code}: ${out.error.message}` };
-  if (!out.result.registered && env.MINA_HOST !== '1') return null;
+  if (!out.result.registered && env.MINA_HOST !== '1' && out.result.policy_protocol !== POLICY_PROTOCOL) return null;
   const dir = mkdtempSync(join(env.XDG_RUNTIME_DIR || `/run/user/${uid}`, 'mina-grant-'));
   chmodSync(dir, 0o700);
   const grantFile = join(dir, 'grant');

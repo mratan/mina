@@ -5,6 +5,8 @@
 //   .mina/host-capabilities.json, so the agent neither retries what it cannot do nor asks the user to do what it can;
 // - alarm delivery: the broker's monitors run on the host, independent of this session; their alarms are put into the
 //   conversation here and acknowledged only after that, so an alarm raised during a handoff reaches the successor.
+// - policy proposals: the agent can propose a change to host.json for its own project (policy_propose); the broker
+//   computes the diff and the risk flags, and the user approves the exact change in the dialog, every time.
 // The broker accepts the session grant only from this Pi process, never from a command the agent runs, and a subagent's
 // copy of this extension (loaded while the parent's is live) registers nothing: subagents get no host operations.
 import { connect } from 'node:net';
@@ -19,9 +21,15 @@ const POLL_MS = 10_000;
 const CONFIRMATION_PROTOCOL = 'mina-confirmation-v1';
 const MUTATION_PROTOCOL = 'mutate_v2';
 const REQUEST_PROTOCOL = 'mina-workload-request-v1';
-const MUTATIONS = new Set(['service_restart', 'reserve', 'release', 'workload_run', 'workload_stop', 'monitor_add', 'monitor_remove']);
-const ACTIONS = ['capabilities', 'service_status', 'service_logs', 'service_restart', 'reserve', 'release', 'workload_run',
-  'workload_status', 'workload_budget', 'workload_output', 'workload_stop', 'monitor_add', 'monitor_list', 'monitor_remove', 'alarms'];
+const POLICY_PROTOCOL = 'mina-policy-v1';
+const MUTATIONS = new Set(['service_restart', 'reserve', 'release', 'workload_run', 'workload_stop', 'monitor_add', 'monitor_remove',
+  'policy_propose']);
+const ACTIONS = ['capabilities', 'inventory', 'service_status', 'service_logs', 'service_restart', 'reserve', 'release', 'workload_run',
+  'workload_status', 'workload_budget', 'workload_output', 'workload_stop', 'monitor_add', 'monitor_list', 'monitor_remove', 'alarms',
+  'policy_propose'];
+// The whole manifest of a project that is not registered: one line in the system prompt of every turn.
+export const UNREGISTERED_MANIFEST = 'Host broker: this project is not registered. If you need GPUs or host jobs, mina_host inventory '
+  + 'shows the machine, and mina_host policy_propose asks the user to approve a registration.\n';
 
 // One request, one connection, one JSON line each way.
 export function request(socket, req, { timeoutMs = 120_000 } = {}) {
@@ -48,7 +56,7 @@ const UPGRADE = 'The operator must upgrade mina-hostd at a safe boundary; this c
 function clientCapabilities(caps) {
   if (caps.confirmation_protocol === CONFIRMATION_PROTOCOL && caps.mutation_protocol === MUTATION_PROTOCOL) return caps;
   return { ...caps, client_mutations: 'BLOCKED: unsupported mutation or confirmation protocol', capabilities: caps.capabilities.map((c) =>
-    /^(resource:|workload:|process_containment$|monitoring$)|^service:.*:restart$/.test(c.capability)
+    /^(resource:|workload:|process_containment$|monitoring$|policy_propose$)|^service:.*:restart$/.test(c.capability)
       ? { ...c, broker_status: c.broker_status ?? c.status, status: 'BLOCKED', remediation: UPGRADE } : c) };
 }
 
@@ -62,6 +70,7 @@ export function manifestText(caps, unavailable = null) {
   }
   // Facts only, short: it is in the system prompt of every turn (it was 3.5K characters with full details and advice).
   // The details are one mina_host capabilities call away.
+  if (caps.registered === false && caps.policy_protocol === POLICY_PROTOCOL) return UNREGISTERED_MANIFEST;
   caps = clientCapabilities(caps);
   const by = (s) => caps.capabilities.filter((c) => c.status === s);
   const params = (c) => {
@@ -91,7 +100,24 @@ const text = (out) => {
   return submission + charge + (s.length > 12_000 ? `${s.slice(0, 12_000)}\n... (truncated)` : s);
 };
 
-export default function minaHost(pi, { env = process.env, pollMs = POLL_MS } = {}) {
+// The dialog: Pi shows the whole message (it wraps long lines and cuts nothing), in the editor slot under the chat. A
+// message taller than the terminal pushes its start (the header, the agent's reason, the risk flags) into the
+// scrollback, so a long one is first also put into the chat in full, and the title says so.
+export const DIALOG_CHROME_LINES = 10;   // the borders, spacers, Yes/No and the key hint of Pi's selector
+export function wrappedLines(message, columns) {
+  const width = Math.max(10, (columns || 80) - 2);
+  return message.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil([...line].length / width)), 0);
+}
+async function confirmPrompt(ctx, action, prompt, terminal) {
+  const title = action === 'policy_propose' ? 'mina host: change the host policy' : 'mina host operation';
+  const rows = terminal.rows, tall = rows > 0 && wrappedLines(prompt, terminal.columns) + 1 + DIALOG_CHROME_LINES > rows;
+  if (tall) {
+    try { ctx.ui.notify?.(`${title} (the full text of the dialog below)\n${prompt}`, 'warning'); } catch { /* the dialog has it too */ }
+  }
+  return ctx.ui.confirm(tall ? `${title} (long: scroll up for its start; the full text is also in the chat above)` : title, prompt);
+}
+
+export default function minaHost(pi, { env = process.env, pollMs = POLL_MS, terminal = process.stdout } = {}) {
   const socket = env.MINA_HOST_SOCKET;
   if (!socket && !env.MINA_HOST_UNAVAILABLE) return; // the profile is off
   // At most one live instance per process holds the session: the top-level one. A handoff shuts the old instance down
@@ -162,7 +188,11 @@ export default function minaHost(pi, { env = process.env, pollMs = POLL_MS } = {
       + '(restart verifies the new deployment: new process, fresh code, health), reserve / release (exclusive host-wide '
       + 'resource locks shared with the campaign runners), workload_run / workload_status / workload_stop (registered commands '
       + 'in their own contained unit, holding their resources), workload_output (read retained job output by id with byte offset/limit; use this instead of rerunning a job or asking for journal recovery; data_base64 preserves exact bytes), workload_budget (native per-instance admission counts and reserved runtime ceilings, not measured usage or scientific attempt counts), monitor_add / monitor_list / monitor_remove (host-side monitors '
-      + 'that outlive this session; their alarms arrive here), alarms. Refusals say BLOCKED, CONFLICT or REQUIRES_AUTHORIZATION '
+      + 'that outlive this session; their alarms arrive here), alarms, inventory (read-only: the GPUs of this machine, which '
+      + 'resources cover them, their lock files with holders, and lockouts), policy_propose (propose a change to the host policy '
+      + 'for this project, or a new machine resource, with changes and reason; the broker shows the user the exact diff and '
+      + 'its risks, and writes it only if the user approves; other projects, defaults and machine-wide settings are for the '
+      + 'owner, with mina host apply). Refusals say BLOCKED, CONFLICT or REQUIRES_AUTHORIZATION '
       + 'with the evidence and the narrowest remediation.',
     parameters: {
       type: 'object',
@@ -186,6 +216,13 @@ export default function minaHost(pi, { env = process.env, pollMs = POLL_MS } = {
         command: { type: 'array', items: { type: 'string' }, description: 'workload_run, for a workload that takes a command: the argv to run in its sandbox (no shell unless you call one, e.g. ["bash","-c","..."]).' },
         max_s: { type: 'integer', minimum: 1, description: 'workload_run: integer seconds, at most the registered max_s. Admission reserves this ceiling plus queue_s against instance budgets.' },
         refresh: { type: 'boolean', description: 'capabilities: check again now instead of the cached answer.' },
+        changes: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'object' }, description: 'policy_propose: the change list. '
+          + 'Each item has "kind": project_register {entry?}, workload_set {name, workload}, workload_remove {name}, '
+          + 'resource_set {scope: "project"|"machine", name, resource} (machine: a new name only), resource_remove {scope: "project", name}, '
+          + 'classes_set {classes} (not "policy"), monitor_paths_set {paths}. "project" defaults to this project; '
+          + 'the schema is in docs/host-profile.md (Change the host policy).' },
+        reason: { type: 'string', maxLength: 500, description: 'policy_propose: why this project needs the change, in one or two '
+          + 'sentences. The user sees it labeled as your words.' },
       },
       required: ['action'],
       additionalProperties: false,
@@ -216,7 +253,7 @@ export default function minaHost(pi, { env = process.env, pollMs = POLL_MS } = {
           out = { ok: false, error: { code: 'BLOCKED', message: 'The broker lacks request-bound confirmation. The operator must upgrade it at a safe boundary; no legacy approval was sent.' } };
         } else if (!ctx?.hasUI) {
           out.error.message += '. No one can confirm in this session (no interactive UI): ask the user to approve it in an interactive session, or to set it to "allow" in host.json.';
-        } else if (await oneDialog(() => ctx.ui.confirm('mina host operation', out.error.approval_prompt)) === true) {
+        } else if (await oneDialog(() => confirmPrompt(ctx, action, out.error.approval_prompt, terminal)) === true) {
           out = !claim.live || _signal?.aborted
             ? { ok: false, error: { code: 'BLOCKED', message: 'Agreement was received, but no mutation retry was sent: the session ended or the request was aborted.' } }
             : await call(action, { ...args, approval: { granted: true, challenge: challenge.challenge, by: 'user', via: 'mina confirm', at: new Date().toISOString() } });
@@ -232,7 +269,7 @@ export default function minaHost(pi, { env = process.env, pollMs = POLL_MS } = {
       }
       if (action === 'workload_run' && !out.ok) out.error.request_id = args.request_id;
       if (out.error?.approval_request) delete out.error.approval_request.challenge; // control-plane token, not model data
-      if (['service_restart', 'reserve', 'release', 'workload_run'].includes(action)) refresh(ctx).catch(() => {});
+      if (['service_restart', 'reserve', 'release', 'workload_run', 'policy_propose'].includes(action)) refresh(ctx).catch(() => {});
       if (action === 'capabilities' && out.ok) manifest = manifestText(out.result);
       return { content: [{ type: 'text', text: `${out.ok ? 'OK' : out.error?.code ?? 'FAILED'}: ${text(out)}` }], details: out, isError: !out.ok };
     },

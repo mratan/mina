@@ -46,9 +46,36 @@ The host profile adds one narrow, audited route out of the sandbox. The sandbox 
 
    This command writes `~/.config/systemd/user/mina-hostd.service` and starts the service.
 
-2. Write the resources of the machine at the top level of `~/.config/mina/host.json`.
+2. Find the GPUs and the lock files of the machine:
+
+   ```bash
+   mina host discover
+   ```
+
+   The command shows each GPU with its bus ID and the resource that covers it.
+   It also shows the lock files of the policy with their holders, and the lockouts.
+   For each GPU that no resource covers, it prints a suggested change list. It does not change a file.
+
+3. Write the resources of the machine at the top level of `~/.config/mina/host.json`.
    A resource is a set of lock files that your host runners use, plus the conditions for its use.
-   All projects on this machine use these resources. The example that follows has two GPU groups, a host-quiet lock for timed measurements, and a `BUILD` resource:
+   All projects on this machine use these resources.
+   The normal procedure is a change list that you apply with `mina host apply` (see [change the host policy](#change-the-host-policy)):
+
+   ```bash
+   mina host apply resources.json --dry-run    # shows the diff and the risk flags only
+   mina host apply resources.json              # writes the change after you confirm
+   ```
+
+   A change list for one resource:
+
+   ```json
+   [{"kind": "resource_set", "scope": "machine", "name": "GPU_A",
+     "resource": {"locks": [{"path": "/tmp/gpu-locks/GPU_A.lock", "turnstile": "/tmp/gpu-locks/GPU_A.turn"}],
+                  "device": {"nvidia": ["00000000:01:00.0"]}}}]
+   ```
+
+   As an alternative, `mina host edit` opens a copy of the file in `$VISUAL` or `$EDITOR`. You can also edit the file directly and then run `mina host validate`.
+   The example that follows shows the resources in the file: two GPU groups, a host-quiet lock for timed measurements, and a `BUILD` resource:
 
    ```json
    {
@@ -70,7 +97,8 @@ The host profile adds one narrow, audited route out of the sandbox. The sandbox 
    `QUIET` holds the host-quiet lock exclusively, for a timed measurement. `BUILD` holds the same lock shared.
    Thus, builds can run at the same time as other builds, but not during a timed measurement. See [resource coordination](#resource-coordination).
 
-3. Register the project under `projects`. The example that follows registers one service, two workloads, and its own version of `GPU_A`:
+4. Register the project under `projects`. Use a change list with `project_register`, or `mina host edit`.
+   The example that follows shows the entry in the file. It registers one service, two workloads, and its own version of `GPU_A`:
 
    ```json
    "projects": {
@@ -107,14 +135,19 @@ The host profile adds one narrow, audited route out of the sandbox. The sandbox 
    The two entries are not merged. Thus, the project's `GPU_A` repeats the lock and the device, and adds a lockout and a supervisor.
    `capabilities` shows the source of each resource: `machine` or `project`.
 
-4. Show what the agent can do in the project:
+5. Show what the agent can do in the project:
 
    ```bash
    cd /home/you/work/myproject
-   python3 <mina>/host/hostd.py status
+   mina host show                        # the effective policy of the project
+   python3 <mina>/host/hostd.py status   # the capabilities, from the running broker
    ```
 
-A project that is not registered gets a host session only if `defaults` applies to it (see the next section). Otherwise, it gets no host session.
+The broker reads `host.json` for each request. After a change, you do not restart it.
+
+A project that is not registered gets a full host session if `defaults` applies to it (see the next section).
+Otherwise, it gets a limited session: the agent can see the machine with `inventory` and propose a registration with `policy_propose` (see [proposals from the agent](#proposals-from-the-agent)).
+An older broker that does not support proposals gives such a project no host session.
 `MINA_HOST=0` turns off the profile for one launch.
 
 The broker keeps its state in `~/.local/state/mina/hostd/`. This folder and its audit log are private to your user (modes 0700 and 0600).
@@ -155,15 +188,135 @@ A remediation for such a project names a change to `defaults`, which changes all
 
 Review the defaults as carefully as a project entry. With `ask`, you confirm each operation, but the workloads apply to every project under the roots.
 
+## Change the host policy
+
+There are two procedures to change `host.json`. Both use the same code (`host/policy.py`) for validation, changes, the diff, the risk flags, and the write.
+
+- **You, in a terminal:** the `mina host` commands.
+- **The agent, with your approval:** `mina_host policy_propose`. The broker shows you the diff in a dialog. It writes the change only if you approve it.
+
+The broker reads the policy for each request. After a change, you do not restart it.
+
+### The `mina host` commands
+
+| Command | What it does |
+|---|---|
+| `mina host discover [--json]` | Shows the GPUs (bus IDs), the resources that cover them, the lock files with their holders, the lockouts, and suggested resources. It changes nothing. |
+| `mina host show [PROJECT] [--json]` | Shows the effective policy of a project: its source (`project` or `defaults`), the classes, the resources, and the workloads. The default is the project of the current folder. |
+| `mina host validate` | Shows the errors and the warnings of `host.json`. |
+| `mina host apply FILE\|- [--project DIR] [--dry-run] [--yes]` | Applies a change list from a file or from standard input. |
+| `mina host edit [--yes]` | Opens a copy of `host.json` in `$VISUAL`, `$EDITOR`, or `vi`. Then it examines the copy and applies it. |
+
+The exit status is 0 for success, 1 for a refusal or a failure, and 2 for a usage error.
+`MINA_HOST_CONFIG` selects another policy file, for example for a test.
+
+`apply` and `edit` show the diff and the risk flags before they write. Then they ask you to confirm.
+Without a terminal, they refuse, unless you add `--yes`. `--dry-run` shows the diff and writes nothing.
+`edit` records the SHA-256 of the file when it starts. If another change writes the file before you finish, `edit` refuses and writes nothing.
+After a write, the commands show the backup file and tell you that no restart is necessary.
+
+The agent cannot use these commands. Its sandbox cannot write `~/.config/mina`.
+
+### Change lists
+
+A change list is a JSON list. Each change has a `kind`:
+
+| Kind | Fields | The agent can propose it |
+|---|---|---|
+| `resource_set` | `scope` (`machine` or `project`), `name`, `resource` | `machine`: only a new name. `project`: only its own project. |
+| `resource_remove` | `scope`, `name` | `project` only, for its own project |
+| `project_register` | `project`, `entry` (optional) | Only its own project |
+| `project_remove` | `project` | No |
+| `workload_set`, `workload_remove` | `project`, `name`, `workload` | Only its own project |
+| `classes_set` | `project`, `classes` (merged into the current classes) | Only its own project, and not the `policy` class |
+| `monitor_paths_set` | `project`, `paths` | Only its own project |
+| `defaults_set`, `defaults_remove` | `defaults` | No |
+| `raw_set`, `raw_remove` | `path` (a list of keys), `value` | No |
+
+`project` is an absolute path. Without `project`, a change applies to the project of the current folder (`mina host apply`) or of the session (`policy_propose`).
+`raw_set` and `raw_remove` change any key, for example `alarm_command`, `version`, or a limit. Only you can use them.
+
+`project_register` without `entry` registers the project with a copy of the defaults (without `roots`).
+A project-scoped change to a project that gets the defaults first registers the project with a copy of the defaults. The defaults do not change.
+The diff tells you about this registration. After it, the project's own entry replaces the defaults for that project.
+
+An example change list for the project of the current folder:
+
+```json
+[{"kind": "workload_set", "name": "gpu-smoke",
+  "workload": {"argv": ["/usr/bin/nvidia-smi"], "resources": ["GPU_A"], "max_s": 60}},
+ {"kind": "classes_set", "classes": {"workload": "ask"}}]
+```
+
+### What each change does
+
+1. The tool applies the changes to a copy of the policy.
+2. It validates the complete result. An error refuses the change. An unknown key is only a warning.
+   The broker uses the same rules when it reads the policy, so the two cannot disagree.
+3. It shows a line-based diff. Keys are sorted, so the same change always gives the same diff.
+4. It shows the risk flags:
+   - a workload that runs any command (`{command}`);
+   - a workload with network `open`, or with write access outside `{project}`;
+   - a workload without the broker's sandbox;
+   - a class that becomes `allow`;
+   - a new or changed `alarm_command`;
+   - changed or removed defaults, with their `roots`;
+   - a changed or removed machine resource, with the projects that use it;
+   - a project resource that replaces a machine resource of the same name.
+     The flag names the locks, lockouts, `requires_active` units, and device checks that the project then does not use;
+   - a resource that loses a lockout or a `requires_active` unit;
+   - a workload that loses a pin, or that pins a new version of a file.
+5. It writes the file only if the file did not change after step 1 (the SHA-256 is the same). Otherwise, it refuses and writes nothing.
+6. It copies the old file to `host.json.bak-<UTC time>`, for example `host.json.bak-20261029T170000Z`. It keeps the 10 newest backups.
+7. It writes a temporary file, syncs it, and renames it to `host.json`. The policy file and the backups have mode 0600.
+   If `host.json` does not exist, the tool makes it, with its folder (mode 0700). A new file starts with `{"version": 1}`.
+8. It adds a `policy_change` record to the audit log (`~/.local/state/mina/hostd/audit.jsonl`), if that folder exists.
+
+### Proposals from the agent
+
+The agent can propose a change with `mina_host policy_propose`, with `changes` (a change list) and `reason` (at most 500 characters).
+It is a mutation in the `policy` class. Thus, it uses the same request-bound confirmation as the other mutations.
+
+- The default level of the `policy` class is `ask`. This also applies to a project that gets the defaults, and to a project that is not registered.
+- The broker handles `allow` as `ask`: you approve each proposal in the dialog. With `deny`, the broker refuses all proposals.
+- The agent can propose changes only to its own project, and a machine resource only with a new name.
+  It cannot set the `policy` class. The broker refuses other changes and gives the `mina host apply` procedure for you.
+
+The broker applies the changes, validates the result, and computes the diff and the risk flags itself.
+The dialog shows a header, the reason labeled as the agent's words, the risk flags, and the diff.
+Pi shows the complete text. If the text is taller than the terminal, Mina also puts it into the chat, so you can scroll up to read it.
+If the diff has more than 60 lines, or the text has more than 4000 characters, the broker refuses with `INVALID`.
+Then the agent can split the change, or write a change file in the project for you to apply with `mina host apply`.
+
+The confirmation is bound to the request, the session, and the revision of the policy.
+If the policy changes after the dialog opens, the approval does not apply. The broker then refuses, and it writes nothing.
+After a write, the broker returns the new revision, the SHA-256 of the diff, and the risk flags.
+The audit record contains the project, the session, the change kinds, and the SHA-256 values before and after.
+It also contains the flags, the backup, and the SHA-256 of the diff.
+The next `capabilities` call reads the new policy.
+
+`mina_host inventory` (class `observe`) shows the agent the GPUs of the machine and the resources that cover them.
+It also shows the lock files and the lockouts of the machine resources and of the project's resources.
+For each lock file, it shows the holder processes (PID and the first two arguments).
+It does not show the resources of other projects.
+
+### Projects that are not registered
+
+When the broker supports proposals (`policy_protocol: "mina-policy-v1"`), the launcher opens a host session also for a project that is not registered.
+In such a session, `capabilities` shows only `inventory` and `policy_propose` (REQUIRES AUTHORIZATION). The broker refuses all other operations.
+The manifest in the system prompt is one line. It tells the agent that it can see the machine and propose a registration.
+As before, only the launcher can open a session (`session_open`) for a project that is not registered. `MINA_HOST=0` turns off the profile.
+
 ## Operations and approval
 
 | Class | Operations | Default |
 |---|---|---|
-| observe | `capabilities`, `service_status`, `service_logs`, `workload_status`, `workload_budget`, `workload_output`, `monitor_list`, `alarms` | `allow` |
+| observe | `capabilities`, `inventory`, `service_status`, `service_logs`, `workload_status`, `workload_budget`, `workload_output`, `monitor_list`, `alarms` | `allow` |
 | reserve | `reserve`, `release` | `deny` |
 | workload | `workload_run`, `workload_stop` | `deny` |
 | restart | `service_restart` | `deny` |
 | monitor | `monitor_add`, `monitor_remove` | `deny` |
+| policy | `policy_propose` | `ask` (`allow` is handled as `ask`) |
 
 Each class is `allow`, `ask`, or `deny`. A service also has its own `restart` level. The lower of the two levels applies.
 
@@ -507,11 +660,23 @@ The broker appends each request, decision, verification, and alarm delivery to `
   - Workloads: completion, a conflict that runs nothing, a leader exit with a surviving child, a stop, the systemd deadline, an interrupted launch, and a broker restart during a run.
   - Monitors: alarms across sessions, log matching, TTL expiry, and the path allowlist.
   - The audit log never contains grants.
+- `python3 host/test_policy.py` covers the host policy and proposals. It uses temporary policy files and fixture GPUs:
+  - Validation: each field error at its path, unknown keys as warnings, and the same rules in the broker.
+  - Each change kind, the registration with a copy of the defaults, and the agent's limits.
+  - Each risk flag, the stable diff, and escaped control characters.
+  - The write: a new private file with `version` 1, backups and their pruning, and a refusal after a concurrent change.
+  - The inventory, and `policy_propose` with a real broker: the dialog, a write after approval, the audit record, and unregistered projects.
 - `node --test test/host.test.mjs` covers the capability text, the exclusion of subagents, the handoff successor, delivery before acknowledgement, approval that the model cannot forge, and the sandbox binds.
+  It also covers `policy_propose`, `inventory`, the one-line manifest of a project that is not registered, and the complete dialog text.
+  A test with a real sandbox shows that the agent cannot write `~/.config/mina`.
+- `node --test test/host-policy-cli.test.mjs` covers the `mina host` commands: exit codes, `apply`, `--dry-run`, the refusal without a terminal, `discover` with fixtures, and `edit`.
 
 ## Limits
 
-- **Your decisions.** Only you approve a class, register a service, resource, workload, or monitor path, set `defaults`, or set `alarm_command`. These are edits to `host.json`.
+- **Your decisions.** Only you approve a class, register a service, resource, workload, or monitor path, set `defaults`, or set `alarm_command`.
+  These are changes to `host.json`, through `mina host` or an approved proposal, or by hand.
+- **Proposals.** The broker computes the diff and the risk flags, but the reason is the agent's text. An approved proposal has the same effect as your own edit.
+  A new machine resource from a proposal applies to all projects. The risk flags do not find every risk: read the diff.
 - **One machine.** Locks coordinate only the jobs of this machine. Brokers on other machines, also on the same tailnet, do not coordinate with this one.
 - **Lock order.** A workload that waits holds the locks that come earlier in its list. If its order is different from the order of a host runner, both wait until `queue_s` ends.
 - **Defaults.** The defaults apply to every project under `roots`, also to a project that you did not expect. They cannot give services.

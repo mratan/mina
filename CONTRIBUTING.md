@@ -56,6 +56,7 @@ npm ci
 | `npm run test:mina` | Mina's own tests in `test/`. |
 | `npm test` | All Node tests: Mina, the research search adapter, and the literature broker. |
 | `python3 host/test_hostd.py` | The host broker, with an isolated broker, real systemd units, cgroups, and file locks. |
+| `python3 host/test_policy.py` | The host policy: validation, changes, risk flags, the atomic write, and agent proposals with an isolated broker. |
 | `python3 host/test_git_push_gate.py` | The push gate, with real git repositories and gitleaks. |
 | `npm run test:e2e` | Real sessions with real models and research services. |
 

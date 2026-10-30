@@ -50,6 +50,7 @@ Pi's built-in `mcp`, `codemode`, `tool-search`, and `llama.cpp` extensions stay 
 | `mina install`, `remove`, `update`, `list`, `config`, `auth`, `mcp` | Pi's own subcommands. They run as in Pi. |
 | `mina status`, `mina status ID`, `mina stop ID` | Show and stop Mina instances ([the sandbox](#limits-and-instances)). |
 | `mina sandbox unlink-git-objects [--dry-run] DIR` | Gives each hard-linked git object of a local clone its own copy ([the sandbox](#what-the-agent-can-see)). |
+| `mina host discover\|show\|validate\|apply\|edit` | Shows and changes the host policy ([host operations](#host-operations)). |
 | `MINA_MODEL=provider/id` | The model for new sessions. |
 | `MINA_MODE=full\|fast\|lean` | The default mode. |
 | `MINA_SANDBOX=0` | The same as `--nosandbox`. |
@@ -439,13 +440,29 @@ python3 host/hostd.py install         # once: installs and starts mina-hostd
 python3 host/hostd.py status          # in a project: what the agent can do there
 ```
 
+Use the `mina host` commands in your terminal to examine and change `host.json`:
+
+```bash
+mina host discover                    # the GPUs, their bus IDs, lock files, and lockouts; changes nothing
+mina host show                        # the effective policy of the project in this folder
+mina host validate                    # the errors (exit status 1) and the warnings of host.json
+mina host apply change.json --dry-run # the diff and the risk flags of a change list; writes nothing
+mina host apply change.json           # writes the change after you confirm (--yes: no question)
+mina host edit                        # edits a copy in $VISUAL or $EDITOR, then examines and writes it
+```
+
+Each write makes a backup of `host.json` and tells you its name. You do not restart the broker after a change.
+The agent can also propose a change for its own project with `policy_propose`. You approve the exact diff in a dialog, every time.
+See [change the host policy](host-profile.md#change-the-host-policy).
+
 | Group | Operations | Default |
 |---|---|---|
-| observe | `capabilities`, `service_status`, `service_logs`, `workload_status`, `workload_budget`, `workload_output`, `monitor_list`, `alarms` | allow |
+| observe | `capabilities`, `inventory`, `service_status`, `service_logs`, `workload_status`, `workload_budget`, `workload_output`, `monitor_list`, `alarms` | allow |
 | reserve | `reserve`, `release` | deny |
 | workload | `workload_run`, `workload_stop` | deny |
 | restart | `service_restart` | deny |
 | monitor | `monitor_add`, `monitor_remove` | deny |
+| policy | `policy_propose` | ask (`allow` is handled as `ask`) |
 
 You can set each group to `allow`, `ask`, or `deny`. With `ask`, Mina shows a confirmation dialog. The broker refuses a group at `deny` with `REQUIRES_AUTHORIZATION`, and it tells you the `host.json` change that approves it.
 Monitor alarms go into the conversation. During a handoff, they wait for the new session.
@@ -462,7 +479,8 @@ See [pushing](host-profile.md#pushing).
 
 Resources at the top level of `host.json` are for all projects on the machine. Thus, GPU and host jobs from different projects use the same lock files and do not overlap. This coordination is only for one machine.
 A workload can wait for its locks for a maximum of `queue_s` seconds. While it waits, its state is `queued`.
-A project that is not registered gets the `defaults` of `host.json` if it is in a folder of `defaults.roots`. Otherwise, it has no host access.
+A project that is not registered gets the `defaults` of `host.json` if it is in a folder of `defaults.roots`.
+Otherwise, the agent can only see the machine (`inventory`) and propose a registration (`policy_propose`).
 For the configuration, see [the host profile](host-profile.md).
 
 ## The footer

@@ -213,6 +213,7 @@ Some engineering work needs the host: a service restart, a GPU job, a monitor th
 The host broker `mina-hostd` is a small user service outside the sandbox.
 It does only the actions that you register for each project, or for all projects in folders that you name, and it logs each action.
 GPU and host jobs from all projects on one machine use the same lock files, so they do not overlap.
+You change the registrations with `mina host` in your terminal. The agent can propose a change, and you approve the exact diff in a dialog.
 The agent cannot push to git directly. A push goes through a gate that refuses force pushes and leaked secrets.
 Read [host operations](docs/usage.md#host-operations) and [the host profile](docs/host-profile.md).
 

@@ -265,6 +265,97 @@ class ChangesTest(Tmp):
         self.assertEqual(new['projects'][f'{self.tmp}/other'], {})
 
 
+class WorkloadUpdateTest(Tmp):
+    """workload_update: change keys of an existing workload, and pin files at their current content."""
+
+    def setUp(self):
+        super().setUp()
+        self.p1 = f'{self.tmp}/p1'
+        with open(f'{self.p1}/run.py', 'w') as f:
+            f.write('print(2)\n')
+        self.now = hashlib.sha256(b'print(2)\n').hexdigest()
+
+    def test_set_unset_and_repin(self):
+        new, notes = P.apply_changes(self.cfg, [{'kind': 'workload_update', 'name': 'smoke', 'set': {'max_s': 30},
+                                                 'unset': ['resources'], 'repin': True}], self.p1)
+        w = new['projects'][self.p1]['workloads']['smoke']
+        self.assertEqual((w['max_s'], 'resources' in w, w['pin']), (30, False, {'{project}/run.py': self.now}))
+        self.assertEqual(w['argv'], ['/usr/bin/true'], 'other keys stay')
+        self.assertTrue(any('pinned at its current content' in n for n in notes), notes)
+        self.assertEqual(self.cfg['projects'][self.p1]['workloads']['smoke']['pin']['{project}/run.py'], SHA, 'a copy changes')
+        # A list pins only the named files, and can add a file.
+        with open(f'{self.p1}/extra.sh', 'w') as f:
+            f.write('x')
+        new, _ = P.apply_changes(self.cfg, [{'kind': 'workload_update', 'name': 'smoke', 'repin': ['{project}/extra.sh']}], self.p1)
+        self.assertEqual(new['projects'][self.p1]['workloads']['smoke']['pin'],
+                         {'{project}/run.py': SHA, '{project}/extra.sh': hashlib.sha256(b'x').hexdigest()})
+
+    def test_refusals(self):
+        bad = [({'name': 'nope', 'repin': True}, 'no workload "nope"'),
+               ({'name': 'smoke'}, 'needs "set", "unset" or "repin"'),
+               ({'name': 'smoke', 'set': {'a': 1}, 'unset': ['a']}, 'in both'),
+               ({'name': 'smoke', 'unset': ['queue_s']}, 'no "queue_s" to unset'),
+               ({'name': 'smoke', 'repin': []}, 'nonempty list'),
+               ({'name': 'smoke', 'repin': ['{project}/missing.py']}, 'cannot read'),
+               ({'name': 'smoke', 'repin': ['relative.py']}, 'absolute path')]
+        for change, msg in bad:
+            with self.subTest(change=change):
+                with self.assertRaises(P.PolicyError) as e:
+                    P.apply_changes(self.cfg, [{'kind': 'workload_update', **change}], self.p1)
+                self.assertIn(msg, str(e.exception))
+
+    def test_the_agent_may_update_only_its_own_workloads(self):
+        ch = [{'kind': 'workload_update', 'name': 'smoke', 'repin': True}]
+        self.assertEqual(P.agent_refusals(self.cfg, ch, self.p1), [])
+        other = f'{self.tmp}/work/q'
+        self.assertTrue(P.agent_refusals(self.cfg, [{**ch[0], 'project': self.p1}], other))
+
+    def git(self, *args):
+        subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', '-C', self.p1, *args],
+                       check=True, capture_output=True)
+
+    def test_the_pin_flag_names_the_commits_to_review(self):
+        self.git('init', '-q')
+        with open(f'{self.p1}/run.py', 'w') as f:
+            f.write('print(1)\n')
+        self.git('add', 'run.py'); self.git('commit', '-qm', 'first version')
+        old = hashlib.sha256(b'print(1)\n').hexdigest()
+        cfg = json.loads(json.dumps(self.cfg))
+        cfg['projects'][self.p1]['workloads']['smoke']['pin'] = {'{project}/run.py': old}
+        with open(f'{self.p1}/run.py', 'w') as f:
+            f.write('print(2)\n')
+        ch = [{'kind': 'workload_update', 'name': 'smoke', 'repin': True}]
+        new, _ = P.apply_changes(cfg, ch, self.p1)
+        flag = [f for f in P.flags(cfg, new) if 'pins a new version' in f][0]
+        self.assertIn('the new hash matches the file now', flag)
+        self.assertIn('the file has changes that are not committed', flag)
+        self.assertIn('the old pin is the newest commit of the file', flag)
+        self.git('commit', '-qam', 'second version')
+        flag = [f for f in P.flags(cfg, new) if 'pins a new version' in f][0]
+        self.assertIn('the file is committed (HEAD)', flag)
+        self.assertRegex(flag, r'the old pin is commit [0-9a-f]+; 1 commit\(s\) changed the file since: [0-9a-f]+ second version\. '
+                               r'Review: git -C \S+ diff [0-9a-f]+ -- run\.py')
+        # A hash that is not the file's (a stale or wrong proposal) is named.
+        cfg2 = json.loads(json.dumps(new)); cfg2['projects'][self.p1]['workloads']['smoke']['pin']['{project}/run.py'] = 'a' * 64
+        flag = [f for f in P.flags(new, cfg2) if 'pins a new version' in f][0]
+        self.assertIn('does NOT match the file now', flag)
+
+    def test_the_review_runs_no_repository_programs(self):
+        self.git('init', '-q')
+        with open(f'{self.p1}/run.py', 'w') as f:
+            f.write('print(1)\n')
+        self.git('add', 'run.py'); self.git('commit', '-qm', 'v1')
+        mark = f'{self.tmp}/ran'
+        hook = f'{self.tmp}/hook.sh'
+        with open(hook, 'w') as f:
+            f.write(f'#!/bin/sh\ntouch {mark}\n')
+        os.chmod(hook, 0o755)
+        for k, v in (('core.fsmonitor', hook), ('log.showSignature', 'true'), ('gpg.program', hook), ('core.pager', hook)):
+            self.git('config', k, v)
+        P.pin_review(f'{self.p1}/run.py', 'b' * 64, self.now)
+        self.assertFalse(os.path.exists(mark))
+
+
 class FlagsTest(Tmp):
     def flags(self, changes, project=None, base=None):
         base = base or self.cfg

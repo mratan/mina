@@ -1646,7 +1646,9 @@ def capabilities(project, refresh=False):
                if '{command}' in w['argv'] else '')
             + (f', requires fresh {w["requires_fresh"]}' if w.get('requires_fresh') else ''),
             (f'pinned files changed since approval: {changed}' if changed else None) or (None if lvl == 'allow' else 'workload approval'),
-            ('The user reviews the change and updates the pin in host.json.' if changed else None)
+            (f'Propose the new pin with mina_host policy_propose: {{"kind": "workload_update", "name": "{name}", "repin": true}} '
+             '(also "set" for other keys that must change with it). The user reviews the files and approves the diff. '
+             'Or the user runs the same change with `mina host apply -`.' if changed else None)
             or (None if lvl == 'allow' else snippet(project, 'classes.workload', 'allow')))
     # Monitoring.
     hb = os.path.join(STATE, 'heartbeat')

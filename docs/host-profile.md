@@ -356,6 +356,7 @@ A change list is a JSON list. Each change has a `kind`:
 | `project_register` | `project`, `entry` (optional) | Only its own project |
 | `project_remove` | `project` | No |
 | `workload_set`, `workload_remove` | `project`, `name`, `workload` | Only its own project |
+| `workload_update` | `project`, `name`, and one or more of `set`, `unset`, `repin` | Only its own project |
 | `classes_set` | `project`, `classes` (merged into the current classes) | Only its own project, and not the `policy` class |
 | `monitor_paths_set` | `project`, `paths` | Only its own project |
 | `defaults_set`, `defaults_remove` | `defaults` | No |
@@ -375,6 +376,23 @@ An example change list for the project of the current folder:
   "workload": {"argv": ["/usr/bin/nvidia-smi"], "resources": ["GPU_A"], "max_s": 60}},
  {"kind": "classes_set", "classes": {"workload": "ask"}}]
 ```
+
+`workload_update` changes an existing workload. The other keys of the workload stay as they are.
+
+- `set`: an object of keys and values. Each value replaces the value of its key, for example `{"argv": [...]}`.
+- `unset`: a list of keys to remove.
+- `repin`: `true` pins every file in the workload's `pin` at its current content. A list pins only the files in the list, and can add a file.
+  The broker, or `mina host apply` in your terminal, reads each file and calculates its SHA-256. The agent does not supply the hash.
+
+When a pinned file changed, `capabilities` shows the workload as BLOCKED and gives the change that fixes it.
+For example, the agent of the project changed its guard script and asks you to approve the new version:
+
+```json
+{"kind": "workload_update", "name": "gpu-cell", "repin": true}
+```
+
+The agent sends this change with `policy_propose`, or you apply it in the project folder with `mina host apply -`.
+Add `set` when another key must change at the same time, for example a device address in `argv`.
 
 ### What each change does
 
@@ -396,6 +414,9 @@ An example change list for the project of the current folder:
      The flag names the locks, lockouts, `requires_active` units, and device checks that the project then does not use;
    - a resource that loses a lockout or a `requires_active` unit;
    - a workload that loses a pin, or that pins a new version of a file.
+     For a new version, the flag also tells you if the new hash is the hash of the file now, and if the file is committed.
+     If the file is in a git repository, the flag names the commit of the old pin, the commits that changed the file since, and the `git diff` command that shows the change.
+     The broker reads the repository without hooks, the fsmonitor, signature checks, or external diff programs, because the agent can write to it.
 5. It writes the file only if the file did not change after step 1 (the SHA-256 is the same). Otherwise, it refuses and writes nothing.
 6. It copies the old file to `host.json.bak-<UTC time>`, for example `host.json.bak-20261029T170000Z`. It keeps the 10 newest backups.
 7. It writes a temporary file, syncs it, and renames it to `host.json`. The policy file and the backups have mode 0600.
@@ -704,7 +725,7 @@ Thus, a workload can take arguments, with these controls:
 
   With `command_sandbox: false`, the broker gives the command to a launcher that runs it in its own sandbox, for example a podman container.
 - **`pin`:** the SHA-256 of each file that runs on the host side. The agent can edit project files, so the broker refuses a pinned file that changed.
-  The result is BLOCKED, with the new hash for you to approve after a review.
+  The result is BLOCKED. The remediation gives a `workload_update` change with `repin`. You review the file and approve the new pin (see [change lists](#change-lists)).
 - **`delegate`:** cgroup delegation for the unit. Then `podman --cgroups=split` keeps the container inside the unit, and a stop of the unit stops the container.
 - **`cleanup`:** a registered host command that runs after each workload ends.
 - **`requires_fresh`:** services that must be FRESH (see the next section) before the workload can start.

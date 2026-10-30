@@ -1704,6 +1704,21 @@ class MachineResourceTest(unittest.TestCase):
         unreg = self.b.raw({'op': 'capabilities', 'grant': opened['grant'], 'refresh': True})['result']
         self.assertEqual((unreg['registered'], unreg['machine_resources']), (False, caps['machine_resources']))
 
+    def test_a_changed_pin_names_the_proposal_that_fixes_it(self):
+        pinned = os.path.join(self.b.project, 'guard.sh')
+        with open(pinned, 'w') as f:
+            f.write('v1')
+        self.cfg['projects'][self.b.project]['workloads']['quick']['pin'] = {pinned: hashlib.sha256(b'v1').hexdigest()}
+        self.write()
+        with open(pinned, 'w') as f:
+            f.write('v2')
+        caps = {c['capability']: c for c in self.ok(self.grant_a, 'capabilities', refresh=True)['capabilities']}
+        c = caps['workload:quick']
+        self.assertEqual(c['status'], 'BLOCKED')
+        self.assertIn('pinned files changed since approval', c['missing'])
+        self.assertIn('{"kind": "workload_update", "name": "quick", "repin": true}', c['remediation'])
+        self.assertIn('policy_propose', c['remediation'])
+
     def test_project_resource_with_the_same_name_replaces_the_machine_one(self):
         self.cfg['projects'][self.other]['resources'] = {'GPU': {'locks': [{'path': self.own}]}}
         self.write()

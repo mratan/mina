@@ -245,6 +245,8 @@ export default function minaHost(pi, { env = process.env, pollMs = POLL_MS, term
         refresh: { type: 'boolean', description: 'capabilities: check again now instead of the cached answer.' },
         changes: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'object' }, description: 'policy_propose: the change list. '
           + 'Each item has "kind": project_register {entry?}, workload_set {name, workload}, workload_remove {name}, '
+          + 'workload_update {name, set?: {key: value}, unset?: [keys], repin?: true | [files]} (changes keys of an existing workload; '
+          + 'repin: the broker pins the files at their current content, after the user reviews them), '
           + 'resource_set {scope: "project"|"machine", name, resource} (machine: a new name only), resource_remove {scope: "project", name}, '
           + 'classes_set {classes} (not "policy"), monitor_paths_set {paths}. "project" defaults to this project; '
           + 'the schema is in docs/host-profile.md (Change the host policy).' },

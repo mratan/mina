@@ -579,14 +579,16 @@ def validate(cfg):
 
 # --- changes --------------------------------------------------------------------------------------------------------
 
-KINDS = ('resource_set', 'resource_remove', 'project_register', 'project_remove', 'workload_set', 'workload_remove',
-         'classes_set', 'defaults_set', 'defaults_remove', 'monitor_paths_set', 'raw_set', 'raw_remove')
+KINDS = ('resource_set', 'resource_remove', 'project_register', 'project_remove', 'workload_set', 'workload_update',
+         'workload_remove', 'classes_set', 'defaults_set', 'defaults_remove', 'monitor_paths_set', 'raw_set', 'raw_remove')
 CHANGE_KEYS = {'resource_set': {'scope', 'project', 'name', 'resource'}, 'resource_remove': {'scope', 'project', 'name'},
                'project_register': {'project', 'entry'}, 'project_remove': {'project'},
                'workload_set': {'project', 'name', 'workload'}, 'workload_remove': {'project', 'name'},
+               'workload_update': {'project', 'name', 'set', 'unset', 'repin'},
                'classes_set': {'project', 'classes'}, 'defaults_set': {'defaults'}, 'defaults_remove': set(),
                'monitor_paths_set': {'project', 'paths'}, 'raw_set': {'path', 'value'}, 'raw_remove': {'path'}}
-PROJECT_SCOPED = ('resource_set', 'resource_remove', 'workload_set', 'workload_remove', 'classes_set', 'monitor_paths_set')
+PROJECT_SCOPED = ('resource_set', 'resource_remove', 'workload_set', 'workload_update', 'workload_remove', 'classes_set',
+                  'monitor_paths_set')
 
 
 def parse_changes(data):
@@ -692,6 +694,40 @@ def apply_changes(cfg, changes, project=None):
                     del ws[c['name']]
                 else:
                     raise PolicyError(f'no workload {q(c["name"])}')
+            elif kind == 'workload_update':
+                if not isinstance(c.get('name'), str) or not c['name']:
+                    raise PolicyError('needs "name"')
+                target = _target(c, project)
+                if not any(k in c for k in ('set', 'unset', 'repin')):
+                    raise PolicyError('needs "set", "unset" or "repin"')
+                entry = _register(new, target, notes)
+                w = _obj(entry.get('workloads')).get(c['name'])
+                if not isinstance(w, dict):
+                    raise PolicyError(f'no workload {q(c["name"])}: use workload_set for a new workload')
+                sets, unset = c.get('set', {}), c.get('unset', [])
+                if not isinstance(sets, dict) or not isinstance(unset, list) or not all(isinstance(k, str) for k in unset):
+                    raise PolicyError('"set" must be an object {key: value}, and "unset" a list of keys')
+                if set(sets) & set(unset):
+                    raise PolicyError(f'a key is in both "set" and "unset": {sorted(set(sets) & set(unset))}')
+                for k, v in sets.items():
+                    w[k] = copy.deepcopy(v)
+                for k in unset:
+                    if k not in w:
+                        raise PolicyError(f'workload {q(c["name"])} has no {q(k)} to unset')
+                    del w[k]
+                repin = c.get('repin')
+                if repin is not None:
+                    pin = w.get('pin') if isinstance(w.get('pin'), dict) else {}
+                    files = sorted(pin) if repin is True else repin
+                    if not (isinstance(files, list) and files and all(isinstance(f, str) and f for f in files)):
+                        raise PolicyError('"repin" must be true (every pinned file) or a nonempty list of files')
+                    pin = dict(pin)
+                    for f in files:
+                        sha = file_sha256(f.replace('{project}', target))
+                        if pin.get(f) != sha:
+                            notes.append(f'{q(f)} is pinned at its current content (SHA-256 {sha[:12]}).')
+                        pin[f] = sha
+                    w['pin'] = pin
             elif kind == 'classes_set':
                 if not isinstance(c.get('classes'), dict) or not c['classes']:
                     raise PolicyError('needs "classes", a nonempty object {class: level}')
@@ -780,7 +816,7 @@ def agent_refusals(cfg, changes, project):
         if target != project:
             out.append(head + f'it changes another project ({q(target)}); a session changes only its own project. ' + owner)
             continue
-        if kind in ('resource_set', 'workload_set') and not (isinstance(c.get('name'), str) and NAME.match(c['name'])):
+        if kind in ('resource_set', 'workload_set', 'workload_update') and not (isinstance(c.get('name'), str) and NAME.match(c['name'])):
             out.append(head + 'a name must be 1-64 letters, digits, "_", "." or "-".')
             continue
         classes = c.get('classes') if kind == 'classes_set' else ((c.get('entry') or {}).get('classes') if kind == 'project_register' else None)
@@ -833,6 +869,12 @@ def _scopes(cfg_old, cfg_new):
         out.append((f'project {q(p)}', oe, ne, os_, ns))
     out.append(('the defaults', template(cfg_old), template(cfg_new), 'defaults', 'defaults'))
     return out
+
+
+def _scope_project(label):
+    """The project path of a _scopes label (None for the defaults)."""
+    m = re.fullmatch(r'project "(.*)"', label)
+    return json.loads(f'"{m.group(1)}"') if m else None
 
 
 def _uses(entry, name):
@@ -892,6 +934,69 @@ def _shadows(cfg, entry):
     return {name: _shadow_loss(machine[name], r) for name, r in own.items() if name in machine}
 
 
+def file_sha256(path):
+    """The SHA-256 of a file now. The broker or the owner's terminal computes it, never the agent."""
+    if not os.path.isabs(path):
+        raise PolicyError(f'a pinned file must be an absolute path or start with {{project}}, not {path!r}')
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError as e:
+        raise PolicyError(f'cannot read {q(path)} to pin it: {e.strerror}') from e
+
+
+def _git(root, *args, binary=False):
+    """A read-only git command in the project's repository. The repository is writable for the agent, so no command
+    here reads the index or runs hooks, the fsmonitor, a pager, signature checks, or external diff and textconv drivers."""
+    try:
+        r = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'log.showSignature=false',
+                            '-c', 'gpg.program=/bin/false', '--no-pager', '-C', root,
+                            *args], capture_output=True, timeout=10, env={'PATH': '/usr/bin:/bin', 'HOME': os.path.expanduser('~'),
+                            'GIT_CONFIG_NOSYSTEM': '1', 'GIT_OPTIONAL_LOCKS': '0'})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout if binary else r.stdout.decode('utf-8', 'replace').strip()
+
+
+def pin_review(path, old_sha, new_sha):
+    """What a reviewer needs to know about a new pin, in one line: does the new hash match the file now, is the file
+    committed, and which commits changed it since the old pin. Facts only; the owner reads the diff."""
+    out = []
+    try:
+        with open(path, 'rb') as f:
+            now = hashlib.sha256(f.read()).hexdigest()
+        out.append('the new hash matches the file now' if now == new_sha else 'the new hash does NOT match the file now')
+    except OSError:
+        return 'the file cannot be read'
+    root = _git(os.path.dirname(path), 'rev-parse', '--show-toplevel')
+    if not root:
+        return '; '.join(out + ['the file is not in a git repository'])
+    rel = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
+    head = _git(root, 'cat-file', 'blob', f'HEAD:{rel}', binary=True)
+    out.append('the file has changes that are not committed' if head is None or hashlib.sha256(head).hexdigest() != now
+               else 'the file is committed (HEAD)')
+    log = _git(root, 'log', '--no-ext-diff', '--no-textconv', '-n', '50', '--format=%h %s', '--', rel) or ''
+    commits = [line for line in log.splitlines() if line]
+    old_at = None
+    for i, line in enumerate(commits):
+        blob = _git(root, 'cat-file', 'blob', f'{line.split()[0]}:{rel}', binary=True)
+        if blob is not None and hashlib.sha256(blob).hexdigest() == old_sha:
+            old_at = i
+            break
+    if old_at is None:
+        out.append('the old pin matches none of the last 50 commits of the file')
+    elif old_at == 0:
+        out.append(f'the old pin is the newest commit of the file ({commits[0].split()[0]})')
+    else:
+        since = [c if len(c) <= 70 else c[:69] + '…' for c in commits[:old_at]]
+        out.append(f'the old pin is commit {commits[old_at].split()[0]}; {old_at} commit(s) changed the file since: '
+                   + ' | '.join(since[:3]) + (' | ...' if len(since) > 3 else '')
+                   + f'. Review: git -C {root} diff {commits[old_at].split()[0]} -- {rel}')
+    return '; '.join(out)
+
+
 def flags(old, new):
     """Risk flags for the dialog and the terminal, from the new effective policy compared to the old."""
     old, new = (old if isinstance(old, dict) else {}), (new if isinstance(new, dict) else {})
@@ -911,6 +1016,7 @@ def flags(old, new):
     for label, oe, ne, osrc, nsrc in _scopes(old, new):
         if not isinstance(ne, dict):
             continue
+        project = _scope_project(label)
         # Workloads.
         ow = _obj(_obj(oe).get('workloads'))
         for name, w in sorted(_obj(ne.get('workloads')).items()):
@@ -937,7 +1043,8 @@ def flags(old, new):
                 if now is None:
                     out.append(f'{wl} loses its pin of {q(f)}')
                 elif now != pin[f]:
-                    out.append(f'{wl} pins a new version of {q(f)}: review the file')
+                    review = pin_review(f.replace('{project}', project), pin[f], now) if project and f.startswith(('{project}', '/')) else ''
+                    out.append(f'{wl} pins a new version of {q(f)}: review the file' + (f' ({review})' if review else ''))
         # Classes.
         for cls in CLASSES:
             if cls == 'policy':

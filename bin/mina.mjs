@@ -19,7 +19,10 @@
 // Pi's subcommands (install, list, config, mcp, ...) pass through unchanged, without the sandbox.
 // mina sandbox unlink-git-objects [--dry-run] DIR   gives each hard-linked git object of the clone DIR its own copy
 //   (sandbox/git-objects.mjs), for a clone that the startup check refuses.
-import { spawn, execFileSync } from 'node:child_process';
+// mina host discover|show [PROJECT]|validate|apply FILE|- [--dry-run] [--yes]|edit [--yes]
+//   shows and changes the host policy (~/.config/mina/host.json, or $MINA_HOST_CONFIG) in your terminal: host/policy.py.
+//   Exit status: 0 done, 1 refused or failed, 2 usage error. The agent's sandbox cannot write the policy file.
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { hotCompactConfig } from '../extensions/handoff/policy.mjs';
@@ -250,6 +253,25 @@ export function hostEnv(host, { sandboxed, uid = process.getuid(), env = process
     : { MINA_HOST_SOCKET: join(host.brokerDir, 'sock'), MINA_HOST_GRANT_FILE: host.grantFile };
 }
 
+// `mina host ...`: the owner's terminal commands for the host policy. One implementation (host/policy.py) with the
+// broker's policy_propose: the same validation, change kinds, diff, risk flags and atomic write with a backup.
+export const POLICY_PY = join(REPO, 'host', 'policy.py');
+export const HOST_USAGE = 'usage: mina host discover [--json] | show [PROJECT] [--json] | validate | apply FILE|- [--project DIR] [--dry-run] [--yes] | edit [--yes]\n'
+  + '  Shows and changes the host policy (MINA_HOST_CONFIG, else ~/.config/mina/host.json). See docs/host-profile.md, "Change the host policy".\n';
+
+export function hostCommand(args, env = process.env, { cwd = env.MINA_CWD || process.cwd(), python = 'python3' } = {}) {
+  if (!args.length || ['-h', '--help', 'help'].includes(args[0]) && args.length === 1) {
+    (args.length ? process.stdout : process.stderr).write(HOST_USAGE);
+    return args.length ? 0 : 2;
+  }
+  // -I: no user site packages, no PYTHON* variables, no script folder from the environment. The environment itself
+  // (MINA_HOST_CONFIG, MINA_HOST_STATE, VISUAL/EDITOR, the fixture variables of the tests) passes through.
+  const r = spawnSync(python, ['-I', POLICY_PY, ...args], { stdio: 'inherit', env, cwd });
+  if (r.error) { process.stderr.write(`mina: cannot run ${python}: ${r.error.message}\n`); return 1; }
+  if (r.signal) return 1;
+  return r.status === 0 || r.status === 2 ? r.status : 1;
+}
+
 function sandboxCommand(args) {
   const dryRun = args.includes('--dry-run'), rest = args.filter((a) => a !== '--dry-run');
   if (rest[0] !== 'unlink-git-objects' || rest.length !== 2) {
@@ -265,6 +287,7 @@ function sandboxCommand(args) {
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
   if (argv[0] === 'sandbox') return sandboxCommand(argv.slice(1));
+  if (argv[0] === 'host') return hostCommand(argv.slice(1), env);
   if (argv[0] === 'status' && !argv[1]) {
     const dir = instanceDirectory(env);
     const instances = (existsSync(dir) ? readdirSync(dir) : []).filter(name => /^[a-f0-9-]{36}\.json$/.test(name)).sort().map(name => {

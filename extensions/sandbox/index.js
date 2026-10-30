@@ -13,6 +13,8 @@ export function sandboxSettings(env = process.env) {
 
 // How long the dialog for a read request waits before mina queues it for /mina-sandbox (the user may be away).
 export const GRANT_WAIT_MS = 5 * 60 * 1000;
+// How often the tool shows the progress of the scan before the dialog. A scan that ends sooner shows nothing.
+export const SCAN_UPDATE_MS = 500;
 const ALLOW = 'Allow read-only access until mina exits';
 const DENY = 'Deny';
 
@@ -27,7 +29,16 @@ export function sandboxNote(s, readable) {
     + '--sandbox-write PATH: say which path and why.';
 }
 
-export default function minaSandbox(pi, { env = process.env, available = bwrapAvailable(), makeProxy = createEgressProxy, grantWaitMs = GRANT_WAIT_MS } = {}) {
+const count = (n, one) => `${n.toLocaleString('en-US')} ${one}${n === 1 ? '' : 's'}`;
+const clock = (ms) => { const s = Math.floor(ms / 1000); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
+export function scanLine(path, { folders, files, current }, ms) {
+  const where = current && current !== path && current.startsWith(`${path}/`) ? ` · now in ${current.slice(path.length + 1)}` : '';
+  return `Checking ${path} for Unix sockets and special files before asking the user · ${count(folders, 'folder')} · `
+    + `${count(files, 'file')} · ${clock(ms)}${where} · Esc cancels`;
+}
+
+export default function minaSandbox(pi, { env = process.env, available = bwrapAvailable(), makeProxy = createEgressProxy, grantWaitMs = GRANT_WAIT_MS,
+  scanUpdateMs = SCAN_UPDATE_MS } = {}) {
   const s = sandboxSettings(env);
   if (!s.on) return;
   // Read grants. Every command and file operation builds its sandbox from env (sandbox/worker-client.mjs), and subagents
@@ -35,6 +46,7 @@ export default function minaSandbox(pi, { env = process.env, available = bwrapAv
   const readable = () => sandboxSettingsFromEnv(env).readable;
   const privateRoots = () => { try { return JSON.parse(env.MINA_SANDBOX_PRIVATE ?? '[]'); } catch { return []; } };
   const pending = [];
+  const scanned = [];                                                                  // paths whose scan passed in this session
   const grant = (path) => { env.MINA_SANDBOX_READ = JSON.stringify([...readable(), path]); };
   const keep = (p) => `To keep it for later sessions: mina --sandbox-read ${p}, or add it to "read" in ~/.config/mina/sandbox.json.`;
   const ask = (ctx, req, options) => ctx.ui.select(`The agent asks to read ${req.path} (read-only).\nReason: ${req.reason}\n`
@@ -58,11 +70,22 @@ export default function minaSandbox(pi, { env = process.env, available = bwrapAv
       + 'Write access outside the writable folders cannot be granted here.',
     parameters: { type: 'object', additionalProperties: false, required: ['path', 'reason'],
       properties: { path: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } } },
-    async execute(_id, params, signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, onUpdate, ctx) {
       const asked = resolve(ctx?.cwd ?? s.project, String(params.path).replace(/^~(?=$|\/)/, homedir()));
+      // The scan of a large folder on a network mount can take many minutes: show what mina does meanwhile.
+      const t0 = Date.now();
+      let progress = null;
+      const show = () => { if (progress) onUpdate?.({ content: [{ type: 'text', text: scanLine(progress.root, progress, Date.now() - t0) }] }); };
+      const timer = onUpdate ? setInterval(show, scanUpdateMs) : null;
       let checked;
-      try { checked = checkReadGrant(asked, { readable: readable(), writable: s.writable, hidden: s.hidden, privateRoots: privateRoots() }); }
-      catch (error) { return { content: [{ type: 'text', text: `${error.message}. The request was not shown to the user.` }], isError: true }; }
+      try {
+        checked = await checkReadGrant(asked, { readable: readable(), writable: s.writable, hidden: s.hidden, privateRoots: privateRoots(), scanned,
+          signal: signal ?? undefined, onProgress: (p) => { progress = { ...p }; } });
+      } catch (error) {
+        if (signal?.aborted) return { content: [{ type: 'text', text: `The request was cancelled while mina checked ${asked}. Nothing changed.` }] };
+        return { content: [{ type: 'text', text: `${error.message}. The request was not shown to the user.` }], isError: true };
+      } finally { if (timer) clearInterval(timer); }
+      if (checked.scan && !scanned.includes(checked.path)) scanned.push(checked.path);
       if (checked.already) return { content: [{ type: 'text', text: `${checked.path} is already visible to your commands and file tools.` }] };
       const req = { path: checked.path, reason: String(params.reason).trim() };
       if (!ctx?.hasUI || typeof ctx.ui?.select !== 'function') return { content: [{ type: 'text', text: queue(ctx, req, 'There is no interactive user.') }] };

@@ -1,6 +1,7 @@
 // Trusted outer control plane, positive-mount inner command/file workers.
 // No source-hiding rule is a security boundary. The kernel mount/PID/network namespaces are.
 import { existsSync, lstatSync, readFileSync, realpathSync, statSync, readdirSync, readlinkSync } from 'node:fs';
+import { lstat, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -235,17 +236,79 @@ export function validateWritableRoots(roots, { trustedRoots = [], readable = [],
   if (outside.length) throw new Error(gitDataMessage(outside));
   return true;
 }
+// A read-only mount does not stop connect(2) to a Unix socket or a write to a FIFO, so either one in a data root is a channel
+// to a process outside the sandbox. Device nodes are refused too. `st` is a Stats or a Dirent: both have these methods.
+function refuseSpecial(p, st) {
+  if (st.isSocket()) throw new Error(`mina sandbox: Unix socket in declared root; remove it or choose a narrower root: ${p}`);
+  if (st.isBlockDevice() || st.isCharacterDevice() || st.isFIFO()) throw new Error(`mina sandbox: unsupported special file in declared root: ${p}`);
+}
 function scanRoot(root, writable, found = null) {
-  const visit = (p) => {
-    const st = lstatSync(p); // Errors (including permissions) fail closed.
+  const visit = (p, entry = null) => {
+    // A readable root needs only the type of each entry, which the folder listing gives (Node runs lstat for an entry
+    // whose filesystem does not report the type). A writable root also needs the link count, so lstat.
+    const st = entry && !writable ? entry : lstatSync(p); // Errors (including permissions) fail closed.
     if (st.isSymbolicLink()) return;
-    if (st.isSocket()) throw new Error(`mina sandbox: Unix socket in declared root; remove it or choose a narrower root: ${p}`);
-    if (st.isBlockDevice() || st.isCharacterDevice() || st.isFIFO()) throw new Error(`mina sandbox: unsupported special file in declared root: ${p}`);
+    refuseSpecial(p, st);
     if (writable && st.isFile() && st.nlink > 1) addHardlink(found, p, st.nlink);
     if (writable && found && st.isFile() && (basename(p) === '.git' || p.endsWith(`${sep}objects${sep}info${sep}alternates`))) found.gitRefs.push(p);
-    if (st.isDirectory()) for (const entry of readdirSync(p)) visit(join(p, entry));
+    if (st.isDirectory()) for (const e of readdirSync(p, { withFileTypes: true })) visit(join(p, e.name), e);
   };
   visit(root);
+}
+
+// The scan of a read grant during a session (checkReadGrant): the refusals of scanRoot for a readable root, without blocking
+// Pi. On a network mount (rclone, sshfs) each folder listing waits for the remote, so several listings run at once. They
+// use the libuv thread pool (4 threads unless UV_THREADPOOL_SIZE), which Pi also needs for files and DNS: all scans together
+// hold at most LISTING_SLOTS threads. No size or time limit: onProgress reports the counts, and the signal stops the scan.
+const LISTING_SLOTS = 3;
+let listingsActive = 0;
+const listingWaiters = [];
+async function listFolder(dir) {
+  if (listingsActive < LISTING_SLOTS) listingsActive++;
+  else await new Promise((r) => listingWaiters.push(r));                       // the slot passes directly to a waiter
+  try { return await readdir(dir, { withFileTypes: true }); } finally {
+    const next = listingWaiters.shift();
+    if (next) next(); else listingsActive--;
+  }
+}
+export async function scanReadableRoot(root, { signal, onProgress = () => {} } = {}) {
+  signal?.throwIfAborted();
+  const progress = { root, folders: 0, files: 0, current: root };
+  onProgress(progress);
+  const st = await lstat(root);                                                  // Errors (including permissions) fail closed.
+  refuseSpecial(root, st);
+  if (!st.isDirectory()) { progress.files = 1; onProgress(progress); return progress; }
+  const folders = [root];
+  let active = 0, failure = null;
+  const list = async (dir) => {
+    progress.current = dir;
+    for (const e of await listFolder(dir)) {
+      if (failure) return;
+      const p = join(dir, e.name);
+      if (e.isSymbolicLink()) continue;
+      refuseSpecial(p, e);
+      if (e.isDirectory()) folders.push(p); else progress.files++;
+    }
+    progress.folders++;
+    onProgress(progress);
+  };
+  await new Promise((done, fail) => {
+    // On abort or a refusal, return at once; a listing still waiting for the remote finishes in the background and is ignored.
+    const finish = (error) => { signal?.removeEventListener('abort', stop); if (error) fail(error); else done(); };
+    const stop = () => { failure ??= signal.reason; finish(failure); };
+    if (signal?.aborted) return stop();
+    signal?.addEventListener('abort', stop, { once: true });
+    const pump = () => {
+      if (failure) return finish(failure);
+      if (!folders.length && !active) return finish();
+      while (active < LISTING_SLOTS && folders.length) {
+        active++;
+        list(folders.pop()).then(() => { active--; pump(); }, (error) => { active--; failure ??= error; pump(); });
+      }
+    };
+    pump();
+  });
+  return progress;
 }
 
 export const UNLINK_GIT_OBJECTS = 'mina sandbox unlink-git-objects';
@@ -350,10 +413,13 @@ export function hardlinkDetails(found) {
 // Positive command environment. In particular, no ambient application variables,
 // credentials, shell startup hooks, dynamic-loader hooks, or Node/Python options.
 export const COMMAND_ENV = /^(PATH|HOME|USER|LOGNAME|LANG|LANGUAGE|LC_[A-Z_]+|TERM|COLORTERM|TZ|CC|CXX|CPP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|AR|AS|LD|FC|MAKEFLAGS|CMAKE_BUILD_PARALLEL_LEVEL|SOURCE_DATE_EPOCH|GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL))$/;
+function refusePrivateOverlap(p, trustedRoots) {
+  if (trustedRoots.map(canonical).some((r) => contains(p, r) || contains(r, p))) throw new Error(`mina sandbox: readable root overlaps private controller state: ${p}`);
+}
 export function validateReadableRoots(roots, { trustedRoots = [] } = {}) {
   for (const root of roots) {
     const p = canonical(root);
-    if (trustedRoots.map(canonical).some((r) => contains(p, r) || contains(r, p))) throw new Error(`mina sandbox: readable root overlaps private controller state: ${p}`);
+    refusePrivateOverlap(p, trustedRoots);
     scanRoot(p, false);
   }
   return true;
@@ -361,8 +427,12 @@ export function validateReadableRoots(roots, { trustedRoots = [] } = {}) {
 
 // Read access the owner grants during a session (mina_sandbox_request in extensions/sandbox): the rules of --sandbox-read
 // at launch, plus no broad roots and no hidden credential path. Returns { path } (canonical) and whether it is already
-// visible; throws with the reason otherwise. Write access cannot be granted this way: the outer layer's mounts are fixed.
-export function checkReadGrant(path, { readable = [], writable = [], hidden = [], privateRoots = [], home = homedir() } = {}) {
+// visible; rejects with the reason otherwise. Write access cannot be granted this way: the outer layer's mounts are fixed.
+// The scan (scanReadableRoot) reports through onProgress and stops at the signal. A path inside one in `scanned` (a scan
+// that passed earlier in the session) is not scanned again: like the launch scan, a scan covers the moment it ran.
+// The result's `scan` is the counts of the scan, or null without one.
+export async function checkReadGrant(path, { readable = [], writable = [], hidden = [], privateRoots = [], home = homedir(),
+  scanned = [], signal, onProgress } = {}) {
   const p = canonical(path);
   if (!existsSync(p)) throw new Error(`mina sandbox: ${p} does not exist as mina sees the host`);
   if ([...writable, ...readable].some((r) => contains(canonical(r), p))) return { path: p, already: true };
@@ -370,8 +440,9 @@ export function checkReadGrant(path, { readable = [], writable = [], hidden = []
   if (broad) throw new Error(`mina sandbox: ${p} is too broad: it is or contains ${broad}`);
   // Hidden paths inside p stay masked by innerArgs; p inside one is refused.
   if (hidden.some((h) => contains(canonical(h), p))) throw new Error(`mina sandbox: ${p} is inside a hidden credential path`);
-  validateReadableRoots([p], { trustedRoots: privateRoots });
-  return { path: p, already: false };
+  refusePrivateOverlap(p, privateRoots);
+  if (scanned.some((r) => contains(canonical(r), p))) return { path: p, already: false, scan: null };
+  return { path: p, already: false, scan: await scanReadableRoot(p, { signal, onProgress }) };
 }
 
 export function scrubEnv(env = {}) {

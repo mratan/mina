@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { outerArgs, innerArgs, wrapCommand, scrubEnv, insideAny, projectProblem, settings, loadConfig, claudeState, defaultWritable, defaultHidden, REPO, minaCode, validateTrustedResources, validateWritableRoots, validateReadableRoots, projectRoot, checkReadGrant } from '../sandbox/sandbox.mjs';
-import minaSandbox, { sandboxNote } from '../extensions/sandbox/index.js';
+import { outerArgs, innerArgs, wrapCommand, scrubEnv, insideAny, projectProblem, settings, loadConfig, claudeState, defaultWritable, defaultHidden, REPO, minaCode, validateTrustedResources, validateWritableRoots, validateReadableRoots, projectRoot, checkReadGrant, scanReadableRoot } from '../sandbox/sandbox.mjs';
+import minaSandbox, { sandboxNote, scanLine } from '../extensions/sandbox/index.js';
+import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { runWorker } from '../sandbox/worker-client.mjs';
 import minaIdentity from '../extensions/identity/index.js';
@@ -359,16 +360,58 @@ test('read grants: the --sandbox-read rules, no broad roots, no hidden credentia
   const priv = join(home, '.pi', 'agent'); mkdirSync(priv, { recursive: true });
   symlinkSync(data, join(home, 'seq-link'));
   const opts = { writable: [join(home, 'project')], hidden: [ssh], privateRoots: [priv], home };
-  assert.deepEqual(checkReadGrant(join(home, 'seq-link'), opts), { path: data, already: false });      // symlink resolved
-  assert.equal(checkReadGrant(join(data, 'bin'), { ...opts, readable: [data] }).already, true);
+  assert.deepEqual(await checkReadGrant(join(home, 'seq-link'), opts),                                // symlink resolved
+    { path: data, already: false, scan: { root: data, folders: 2, files: 0, current: join(data, 'bin') } });
+  assert.equal((await checkReadGrant(join(data, 'bin'), { ...opts, readable: [data] })).already, true);
   for (const [path, why] of [[join(home, 'missing'), /does not exist/], ['/', /too broad/], [home, /too broad/],
     [join(home, '..'), /too broad/], ['/proc', /too broad/], [join(ssh), /hidden credential/], [priv, /private controller state/]]) {
-    assert.throws(() => checkReadGrant(path, opts), why, path);
+    await assert.rejects(checkReadGrant(path, opts), why, path);
   }
   const sock = join(data, 'agent.sock');
   const server = createServer().listen(sock);
   await new Promise((r) => server.once('listening', r));
-  try { assert.throws(() => checkReadGrant(data, opts), /Unix socket/); } finally { server.close(); }
+  try { await assert.rejects(checkReadGrant(data, opts), /Unix socket/); } finally { server.close(); }
+});
+
+test('read grants: the scan refuses a socket or FIFO at any depth, at launch and in a session, and passes a plain tree', async () => {
+  const deep = (root) => join(root, 'a', 'b', 'c');
+  const plain = mkdtempSync(join(tmpdir(), 'mina-scan-'));
+  for (const d of ['a/b/c', 'a/x', 'y']) mkdirSync(join(plain, d), { recursive: true });
+  writeFileSync(join(plain, 'a', 'b', 'c', 'counts.tsv'), 'x'); writeFileSync(join(plain, 'top.txt'), 'x');
+  symlinkSync('/run', join(plain, 'a', 'run-link'));                                         // links are not followed
+  const seen = [];
+  const r = await scanReadableRoot(plain, { onProgress: (p) => seen.push(p.folders) });
+  assert.deepEqual([r.folders, r.files], [6, 2]);
+  assert.equal(seen[0], 0); assert.equal(seen.at(-1), 6);
+  assert.equal(validateReadableRoots([plain]), true);
+  assert.deepEqual(await scanReadableRoot(join(plain, 'top.txt')), { root: join(plain, 'top.txt'), folders: 0, files: 1, current: join(plain, 'top.txt') });
+
+  const fifoRoot = mkdtempSync(join(tmpdir(), 'mina-scan-fifo-')); mkdirSync(deep(fifoRoot), { recursive: true });
+  assert.equal(spawnSync('mkfifo', [join(deep(fifoRoot), 'pipe')]).status, 0);
+  await assert.rejects(scanReadableRoot(fifoRoot), /special file[^]*pipe/);
+  assert.throws(() => validateReadableRoots([fifoRoot]), /special file[^]*pipe/);
+
+  const sockRoot = mkdtempSync(join(tmpdir(), 'mina-scan-sock-')); mkdirSync(deep(sockRoot), { recursive: true });
+  const server = createServer().listen(join(deep(sockRoot), 'agent.sock'));
+  await new Promise((r) => server.once('listening', r));
+  try {
+    await assert.rejects(scanReadableRoot(sockRoot), /Unix socket[^]*agent\.sock/);
+    assert.throws(() => validateReadableRoots([sockRoot]), /Unix socket[^]*agent\.sock/);
+  } finally { server.close(); }
+});
+
+test('read grants: the scan does not block the event loop and stops at the abort signal', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'mina-scan-wide-'));
+  for (let i = 0; i < 300; i++) mkdirSync(join(root, `d${i}`, 'sub'), { recursive: true });
+  let ticks = 0;
+  const timer = setInterval(() => ticks++, 0);
+  try { assert.equal((await scanReadableRoot(root)).folders, 601); } finally { clearInterval(timer); }
+  assert.ok(ticks > 0, 'timers ran during the scan');
+  const ac = new AbortController();
+  let last = 0;
+  await assert.rejects(scanReadableRoot(root, { signal: ac.signal, onProgress: (p) => { last = p.folders; if (p.folders === 10) ac.abort(); } }), { name: 'AbortError' });
+  assert.ok(last < 601, `stopped early (${last})`);
+  await assert.rejects(scanReadableRoot(root, { signal: AbortSignal.abort() }), { name: 'AbortError' });
 });
 
 function grantPi() {
@@ -466,6 +509,35 @@ test('mina_sandbox_request: parallel requests and /mina-sandbox show one dialog 
   ac.abort();
   assert.match((await pending).content[0].text, /cancelled[^]*Nothing changed/);
   assert.deepEqual(JSON.parse(env.MINA_SANDBOX_READ), [a, b, d]);
+});
+
+test('mina_sandbox_request: shows the progress of a long scan, can be cancelled during it, and does not scan a checked path again', async () => {
+  const project = mkdtempSync(join(tmpdir(), 'mina-grant-project-'));
+  const data = mkdtempSync(join(tmpdir(), 'mina-grant-data-'));
+  for (let i = 0; i < 400; i++) mkdirSync(join(data, `run${i}`, 'images'), { recursive: true });
+  const env = grantEnv(project);
+  const f = grantPi(); minaSandbox(f.pi, { env, available: true, scanUpdateMs: 1 });
+  const asked = [], updates = [];
+  const ctx = { cwd: project, hasUI: true, ui: { notify: () => {}, select: async (title) => { asked.push(title); return 'Deny'; } } };
+  const call = (signal) => f.tools.mina_sandbox_request.execute('id', { path: data, reason: 'r' }, signal, (u) => updates.push(u.content[0].text), ctx);
+  const ac = new AbortController();
+  let aborting = false;
+  const cancelled = f.tools.mina_sandbox_request.execute('id', { path: data, reason: 'r' }, ac.signal,
+    () => { if (!aborting) { aborting = true; ac.abort(); } }, ctx);
+  assert.match((await cancelled).content[0].text, /cancelled while mina checked[^]*Nothing changed/);
+  assert.equal(asked.length, 0);
+  assert.match((await call()).content[0].text, /denied/);
+  assert.ok(updates.length > 0, 'progress shown during the scan');
+  assert.match(updates.at(-1), new RegExp(`^Checking ${data} for Unix sockets and special files before asking the user · [\\d,]+ folders? · [\\d,]+ files? · \\d+s`));
+  // The scan passed: a later request for the same path or a folder inside it asks the user without a new scan.
+  updates.length = 0;
+  const sock = join(data, 'run0', 'later.sock');
+  const server = createServer().listen(sock);
+  await new Promise((r) => server.once('listening', r));
+  try { assert.match((await call()).content[0].text, /denied/); } finally { server.close(); }
+  assert.equal(asked.length, 2); assert.equal(updates.length, 0);
+  assert.equal(scanLine('/d', { folders: 1, files: 1234, current: '/d/run7/images' }, 75000),
+    'Checking /d for Unix sockets and special files before asking the user · 1 folder · 1,234 files · 1m15s · now in run7/images · Esc cancels');
 });
 
 test('real worker: a read grant applies to the next command without a restart', { skip: needsSandbox }, async () => {

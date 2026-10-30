@@ -329,6 +329,12 @@ The system prompt of the agent lists what its commands can see.
 If the agent needs a host folder that it cannot see, it asks with `mina_sandbox_request` and gives a reason.
 Mina applies the rules of `--sandbox-read`, and you select **Allow** or **Deny**.
 
+Before the dialog shows, Mina examines each entry in the folder, because a Unix socket or a FIFO in it would let commands reach a process outside the sandbox.
+On a network mount such as an rclone mount of OneDrive, a large folder can take many minutes.
+During the scan, the request shows the number of folders and files, the time, and the current folder.
+To cancel the scan, push Esc.
+After a scan passes, a new request for the same folder, or for a folder in it, does not scan again until Mina stops.
+
 An allowed path is read-only. It applies from the next command of the agent, also for subagents and checks, until Mina stops.
 No restart is necessary.
 If nobody answers within 5 minutes, or if there is no terminal, the request waits.

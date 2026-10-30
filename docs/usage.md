@@ -452,6 +452,10 @@ mina host edit                        # edits a copy in $VISUAL or $EDITOR, then
 ```
 
 Each write makes a backup of `host.json` and tells you its name. You do not restart the broker after a change.
+
+To share the GPUs of a machine between projects, give each GPU a machine resource. Then all projects use the same lock files.
+The system prompt tells the agent which resources are machine-wide or for its project only, which are exclusive or shared, and what it cannot do.
+See [share the GPUs of a machine](host-profile.md#share-the-gpus-of-a-machine).
 The agent can also propose a change for its own project with `policy_propose`. You approve the exact diff in a dialog, every time.
 See [change the host policy](host-profile.md#change-the-host-policy).
 

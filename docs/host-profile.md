@@ -12,6 +12,8 @@ The host profile adds one narrow, audited route out of the sandbox. The sandbox 
 - [The parts](#the-parts)
 - [Install and register a project](#install-and-register-a-project)
 - [Defaults for unregistered projects](#defaults-for-unregistered-projects)
+- [Share the GPUs of a machine](#share-the-gpus-of-a-machine)
+- [Change the host policy](#change-the-host-policy)
 - [Operations and approval](#operations-and-approval)
 - [Admission budgets](#admission-budgets)
 - [Capability preflight](#capability-preflight)
@@ -188,6 +190,132 @@ A remediation for such a project names a change to `defaults`, which changes all
 
 Review the defaults as carefully as a project entry. With `ask`, you confirm each operation, but the workloads apply to every project under the roots.
 
+## Share the GPUs of a machine
+
+Use this procedure when more than one project on a machine uses the GPUs.
+Each GPU gets one machine resource. All projects on the machine then use the same lock files, so their jobs wait for each other.
+The coordination is only for one machine. A machine on the same tailnet or LAN has its own broker and its own locks.
+
+### Decide how jobs can overlap
+
+Each resource has a list of lock files. Each lock is `exclusive` (the default) or `shared`.
+A job holds all the locks of its resources while it runs.
+
+| You want | Give the resource these locks |
+|---|---|
+| Jobs on different GPUs run at the same time. | A lock for the GPU, and no other exclusive lock. |
+| A job on one GPU does not run during a timed measurement. | Also a host-quiet lock in `shared` mode. |
+| A timed measurement has the host to itself. | A resource, for example `QUIET`, with the host-quiet lock in `exclusive` mode. The job lists it with its GPU. |
+| A group of GPUs is always used together. | One resource for the group, with one lock. |
+
+### Procedure
+
+1. Find the GPUs and their bus IDs:
+
+   ```bash
+   mina host discover
+   ```
+
+   A GPU that no resource covers is shown as not covered. The command also prints a suggested change list.
+
+2. Write a change list with one resource for each GPU, and the `QUIET` resource.
+   Put a `description` on each resource. Its first sentence goes into the system prompt of the agent, so start with the device and its bus ID:
+
+   ```json
+   [{"kind": "resource_set", "scope": "machine", "name": "GPU_0", "resource": {
+      "description": "GPU 0 at 01:00.0. Runs beside jobs on other GPUs, never during a timed measurement.",
+      "locks": [{"path": "/tmp/gpu-locks/HOST_QUIET.lock", "turnstile": "/tmp/gpu-locks/HOST_QUIET.turn", "mode": "shared"},
+                {"path": "/tmp/gpu-locks/GPU_0.lock"}],
+      "device": {"nvidia": ["00000000:01:00.0"]}}},
+    {"kind": "resource_set", "scope": "machine", "name": "GPU_1", "resource": {
+      "description": "GPU 1 at 02:00.0. Runs beside jobs on other GPUs, never during a timed measurement.",
+      "locks": [{"path": "/tmp/gpu-locks/HOST_QUIET.lock", "turnstile": "/tmp/gpu-locks/HOST_QUIET.turn", "mode": "shared"},
+                {"path": "/tmp/gpu-locks/GPU_1.lock"}],
+      "device": {"nvidia": ["00000000:02:00.0"]}}},
+    {"kind": "resource_set", "scope": "machine", "name": "QUIET", "resource": {
+      "description": "The host to itself for a timed measurement. List it before the GPU resources of the job.",
+      "locks": [{"path": "/tmp/gpu-locks/HOST_QUIET.lock", "turnstile": "/tmp/gpu-locks/HOST_QUIET.turn"}]}}]
+   ```
+
+   If a safety watchdog guards the GPUs, add `"requires_active": ["<watchdog>.service"]` and the lockout files of the watchdog to each GPU resource.
+   Add them only if the watchdog really watches these devices. If it does not, the check gives false protection.
+   An AMD GPU uses `"device": {"kfd": true}` in place of `nvidia`.
+
+3. Examine the change, then apply it:
+
+   ```bash
+   mina host apply gpus.json --dry-run
+   mina host apply gpus.json
+   mina host discover        # each GPU now shows "covered by machine:<name>"
+   ```
+
+4. Give the projects access. Use one of these procedures:
+   - Register each project with workloads that use the resources (see [install and register a project](#install-and-register-a-project)).
+   - Give all projects in a folder the same workloads with [`defaults`](#defaults-for-unregistered-projects).
+   - Start Mina in the project and let the agent propose its registration. You approve the diff in a dialog (see [proposals from the agent](#proposals-from-the-agent)).
+
+   A workload has a fixed list of resources. Thus, register one workload for each set of GPUs that the project needs, for example:
+
+   ```json
+   "gpu0-cell":  {"argv": ["{command}"], "resources": ["GPU_0"], "max_s": 3600, "queue_s": 900,
+                  "sandbox": {"write": ["{project}"], "network": "offline"}},
+   "gpu0-timed": {"argv": ["{command}"], "resources": ["QUIET", "GPU_0"], "max_s": 3600, "queue_s": 900,
+                  "sandbox": {"write": ["{project}"], "network": "offline"}}
+   ```
+
+### Rules that you must keep
+
+- **Lock order.** Every runner that uses the same lock files must take them in the same order: exclusive host locks first, then the GPU locks.
+  In a workload, list `QUIET` before the GPU resources. If the order is different, two jobs can each hold a lock that the other waits for. They then block each other until `queue_s` ends.
+  Nothing enforces the order. The agent gets this rule in its prompt.
+- **Host runners outside Mina.** A script that uses the GPUs without the broker must take the same lock files, in the same order. If it does not, the broker cannot protect its jobs, and its jobs cannot protect the broker's jobs.
+  Set `protocol_source` on a resource to the script, and `capabilities` makes sure that the script names the same lock files.
+- **Bus IDs can change.** If you move a card, its bus ID can change. `mina host discover` then shows the GPU as not covered. Update the resource, and the configuration of your watchdog.
+- **A project resource replaces a machine resource** with the same name completely. The project then stops using the machine locks and checks. `mina host apply` shows a risk flag for this.
+
+### What the agent sees
+
+The system prompt of each session lists the host capabilities of the project.
+Each resource line tells the agent:
+
+- **machine-wide** or **this project only**;
+- **exclusive**, or which locks it **shares**;
+- the first sentence of the `description`.
+
+For the example above, the resource lines are:
+
+```text
+- resource:GPU_0 (machine-wide; shares HOST_QUIET; GPU 0 at 01:00.0)
+- resource:GPU_1 (machine-wide; shares HOST_QUIET; GPU 1 at 02:00.0)
+- resource:QUIET (machine-wide; exclusive; The host to itself for a timed measurement)
+```
+
+A section with the boundaries follows. It is the same in each session:
+
+```text
+Boundaries:
+- A machine-wide resource is shared with the other Mina projects on this machine: their jobs wait for each other through the same host locks. Other machines are not coordinated. A project resource is for this project only.
+- Your commands run without GPU devices. Use a GPU only through a mina_host workload: it holds the locks of its resources.
+- A workload gets the broker resources of its registration. Its params cannot add resources.
+- Reserve a resource only for the time that you use it. Only the operator clears a lockout.
+- policy_propose can change this project's entry or add a new machine resource, not an existing machine resource, another project, or the defaults. In a proposed workload, list exclusive resources before shared ones.
+```
+
+A project that is not registered gets a short note, the list of machine-wide resources, and the same boundaries.
+Thus, its agent knows what it can propose before it calls `inventory`.
+The text has no timestamps, so the prompt cache of a local model stays valid. An older broker gives the resource names only, and no boundaries.
+
+The boundaries are not only text. The broker and the sandbox enforce them:
+
+| Boundary | Enforced by |
+|---|---|
+| No GPU devices for the agent's commands | The sandbox gives each worker a minimal `/dev`, without GPU, KFD, or DRI devices. |
+| A workload gets only the resources of its registration | The broker takes the locks from `host.json`, not from the request. |
+| Lockouts | The broker refuses a resource while a lockout file exists. It never deletes a lockout. |
+| What `policy_propose` can change | The broker refuses other changes, and you approve each allowed change in a dialog. |
+| The agent cannot change `host.json` | The sandbox never makes `~/.config/mina` writable. |
+| Lock order | Not enforced. The agent gets the rule as text. |
+
 ## Change the host policy
 
 There are two procedures to change `host.json`. Both use the same code (`host/policy.py`) for validation, changes, the diff, the risk flags, and the write.
@@ -306,7 +434,8 @@ It does not show the resources of other projects.
 
 When the broker supports proposals (`policy_protocol: "mina-policy-v1"`), the launcher opens a host session also for a project that is not registered.
 In such a session, `capabilities` shows only `inventory` and `policy_propose` (REQUIRES AUTHORIZATION). The broker refuses all other operations.
-The manifest in the system prompt is one line. It tells the agent that it can see the machine and propose a registration.
+The manifest in the system prompt tells the agent that it can see the machine and propose a registration.
+It also lists the machine-wide resources and the boundaries (see [what the agent sees](#what-the-agent-sees)).
 As before, only the launcher can open a session (`session_open`) for a project that is not registered. `MINA_HOST=0` turns off the profile.
 
 ## Operations and approval
@@ -426,9 +555,7 @@ Each entry has its evidence, what is missing, and the smallest change that fixes
 
 The broker caches the result until a fingerprint changes. The fingerprint covers the registry, the boot, the state and main PID of the services, the source files, the lock files, and the lockouts.
 The system prompt shows the result as stable text without timestamps, so the prompt cache of a local model stays valid.
-Each resource line tells the agent whether the resource is machine-wide or for this project only, whether its locks are exclusive or shared, and the first sentence of its `description`.
-A short "Boundaries" section follows: machine-wide resources are shared with the other projects on this machine, commands get no GPU devices outside a workload, and `policy_propose` cannot change an existing machine resource.
-An unregistered project sees the list of machine-wide resources and the same boundaries.
+Each resource line shows its scope, its lock mode, and its description. A section with the boundaries follows. See [what the agent sees](#what-the-agent-sees).
 The agent does AVAILABLE operations itself, does not try BLOCKED ones, and gives you the remediation once.
 
 ## Retained workload output
@@ -493,6 +620,8 @@ A resource has a `locks` list. Each entry has these fields:
 - `path`: the lock file.
 - `turnstile` (optional): the lock file that runners hold while they wait in the queue for `path`.
 - `mode` (optional): `exclusive` (the default) or `shared`. Shared holders can hold the lock at the same time. An exclusive holder excludes all others.
+
+A resource can also have a `description`. The first sentence goes into the system prompt of the agent.
 
 The broker takes the locks in the order of the list, and in the order of the resources in the request.
 When two requested resources contain the same path, the broker takes it once, at its first position.

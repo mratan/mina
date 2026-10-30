@@ -212,10 +212,11 @@ Read [privacy and network](docs/usage.md#privacy-and-network) for what each serv
 Some engineering work needs the host: a service restart, a GPU job, a monitor that runs after the session.
 The host broker `mina-hostd` is a small user service outside the sandbox.
 It does only the actions that you register for each project, or for all projects in folders that you name, and it logs each action.
-GPU and host jobs from all projects on one machine use the same lock files, so they do not overlap.
+GPU and host jobs from all projects on one machine use the same lock files, so they do not overlap. Machines on the same network do not coordinate.
+The agent's commands get no GPU devices. The agent uses a GPU only through a registered job, and its system prompt tells it which resources it shares and what it cannot change.
 You change the registrations with `mina host` in your terminal. The agent can propose a change, and you approve the exact diff in a dialog.
 The agent cannot push to git directly. A push goes through a gate that refuses force pushes and leaked secrets.
-Read [host operations](docs/usage.md#host-operations) and [the host profile](docs/host-profile.md).
+Read [host operations](docs/usage.md#host-operations), [the host profile](docs/host-profile.md), and [share the GPUs of a machine](docs/host-profile.md#share-the-gpus-of-a-machine).
 
 ### Subagents
 

@@ -426,6 +426,9 @@ Each entry has its evidence, what is missing, and the smallest change that fixes
 
 The broker caches the result until a fingerprint changes. The fingerprint covers the registry, the boot, the state and main PID of the services, the source files, the lock files, and the lockouts.
 The system prompt shows the result as stable text without timestamps, so the prompt cache of a local model stays valid.
+Each resource line tells the agent whether the resource is machine-wide or for this project only, whether its locks are exclusive or shared, and the first sentence of its `description`.
+A short "Boundaries" section follows: machine-wide resources are shared with the other projects on this machine, commands get no GPU devices outside a workload, and `policy_propose` cannot change an existing machine resource.
+An unregistered project sees the list of machine-wide resources and the same boundaries.
 The agent does AVAILABLE operations itself, does not try BLOCKED ones, and gives you the remediation once.
 
 ## Retained workload output

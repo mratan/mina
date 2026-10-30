@@ -1687,6 +1687,23 @@ class MachineResourceTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.ran))
         self.assertTrue(free(self.gpu))
 
+    def test_capabilities_say_which_resources_are_shared_and_exclusive(self):
+        self.machine['GPU']['description'] = 'Card 0 at 01:00.0. Long details that the prompt does not need.'
+        self.machine['SIDE'] = {'locks': [{'path': self.first, 'mode': 'shared'}, {'path': self.own}]}
+        self.write()
+        caps = self.ok(self.grant_a, 'capabilities', refresh=True)
+        by = {c['capability']: c for c in caps['capabilities']}
+        self.assertEqual((by['resource:GPU']['exclusive'], by['resource:GPU']['summary']), (True, 'Card 0 at 01:00.0'))
+        self.assertEqual((by['resource:SIDE']['exclusive'], by['resource:SIDE']['shared_locks']), (False, ['FIRST']))
+        self.assertNotIn('summary', by['resource:PAIR'])
+        self.assertEqual([r['name'] for r in caps['machine_resources']], ['GPU', 'PAIR', 'SIDE'])
+        # An unregistered project sees the same machine list in its session, before it proposes a registration.
+        new = os.path.join(self.b.tmp, 'new-project')
+        os.makedirs(new)
+        opened = self.b.open_session(new, full=True)
+        unreg = self.b.raw({'op': 'capabilities', 'grant': opened['grant'], 'refresh': True})['result']
+        self.assertEqual((unreg['registered'], unreg['machine_resources']), (False, caps['machine_resources']))
+
     def test_project_resource_with_the_same_name_replaces_the_machine_one(self):
         self.cfg['projects'][self.other]['resources'] = {'GPU': {'locks': [{'path': self.own}]}}
         self.write()

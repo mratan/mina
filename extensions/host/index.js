@@ -31,6 +31,29 @@ const ACTIONS = ['capabilities', 'inventory', 'service_status', 'service_logs', 
 export const UNREGISTERED_MANIFEST = 'Host broker: this project is not registered. If you need GPUs or host jobs, mina_host inventory '
   + 'shows the machine, and mina_host policy_propose asks the user to approve a registration.\n';
 
+// The rules for host resources, in the prompt of every session that has the host profile: short, and the same text each turn.
+export const BOUNDARIES = 'Boundaries:\n'
+  + '- A machine-wide resource is shared with the other Mina projects on this machine: their jobs wait for each other '
+  + 'through the same host locks. Other machines are not coordinated. A project resource is for this project only.\n'
+  + '- Your commands run without GPU devices. Use a GPU only through a mina_host workload: it holds the locks of its resources.\n'
+  + '- A workload gets the broker resources of its registration. Its params cannot add resources.\n'
+  + '- Reserve a resource only for the time that you use it. Only the operator clears a lockout.\n'
+  + '- policy_propose can change this project\'s entry or add a new machine resource, not an existing machine resource, another '
+  + 'project, or the defaults. In a proposed workload, list exclusive resources before shared ones.\n';
+
+// One resource: where it comes from, whether its locks are exclusive, and the owner's one-line description.
+function resourceTags(c) {
+  const tags = [c.source === 'machine' ? 'machine-wide' : c.source ? 'this project only' : null,
+    c.exclusive === true ? 'exclusive' : c.exclusive === false ? `shares ${(c.shared_locks ?? []).join(', ')}` : null,
+    c.summary ?? null].filter(Boolean);
+  return tags.length ? ` (${tags.join('; ')})` : '';
+}
+
+function machineList(caps) {
+  const list = (caps.machine_resources ?? []).map((r) => `- ${r.name}${resourceTags({ ...r, source: 'machine' })}`);
+  return list.length ? `Machine-wide resources:\n${list.join('\n')}\n` : '';
+}
+
 // One request, one connection, one JSON line each way.
 export function request(socket, req, { timeoutMs = 120_000 } = {}) {
   return new Promise((resolve) => {
@@ -70,7 +93,9 @@ export function manifestText(caps, unavailable = null) {
   }
   // Facts only, short: it is in the system prompt of every turn (it was 3.5K characters with full details and advice).
   // The details are one mina_host capabilities call away.
-  if (caps.registered === false && caps.policy_protocol === POLICY_PROTOCOL) return UNREGISTERED_MANIFEST;
+  if (caps.registered === false && caps.policy_protocol === POLICY_PROTOCOL) {
+    return caps.machine_resources ? `${UNREGISTERED_MANIFEST}${machineList(caps)}${BOUNDARIES}` : UNREGISTERED_MANIFEST;
+  }
   caps = clientCapabilities(caps);
   const by = (s) => caps.capabilities.filter((c) => c.status === s);
   const params = (c) => {
@@ -81,12 +106,14 @@ export function manifestText(caps, unavailable = null) {
     const values = [...(c.detail ?? '').matchAll(/; (\w+) from ([A-Z0-9_|]+)/g)].map((v) => `; ${v[1]}: comma list of ${v[2]}`).join('');
     return ` (${max ? `max ${max[1]}s; ` : ''}params ${m[1].replace(/'/g, '')}${values}${/takes command/.test(c.detail) ? '; takes a command' : ''})`;
   };
-  const line = (c) => `- ${c.capability}${params(c)}${c.status !== 'AVAILABLE' && c.remediation ? `: ${c.remediation}` : ''}`;
+  const line = (c) => `- ${c.capability}${c.capability.startsWith('resource:') ? resourceTags(c) : params(c)}`
+    + `${c.status !== 'AVAILABLE' && c.remediation ? `: ${c.remediation}` : ''}`;
+  const boundaries = caps.machine_resources ? BOUNDARIES : '';
   return `${head}AVAILABLE: you can do it with mina_host. REQUIRES AUTHORIZATION: it needs the user (mina_host asks where it can). `
     + 'BLOCKED: not possible now. mina_host capabilities gives the details. Subagents cannot use mina_host.\n'
     + `AVAILABLE:\n${by('AVAILABLE').map(line).join('\n') || '- none'}\n`
     + `REQUIRES AUTHORIZATION:\n${by('REQUIRES_AUTHORIZATION').map(line).join('\n') || '- none'}\n`
-    + `BLOCKED:\n${by('BLOCKED').map(line).join('\n') || '- none'}\n`;
+    + `BLOCKED:\n${by('BLOCKED').map(line).join('\n') || '- none'}\n` + boundaries;
 }
 
 const text = (out) => {

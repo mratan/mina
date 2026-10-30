@@ -4,7 +4,7 @@ import { createServer } from 'node:net';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, symlinkSync, unlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import minaHost, { manifestText, request, UNREGISTERED_MANIFEST, wrappedLines, DIALOG_CHROME_LINES } from '../extensions/host/index.js';
+import minaHost, { manifestText, request, UNREGISTERED_MANIFEST, BOUNDARIES, wrappedLines, DIALOG_CHROME_LINES } from '../extensions/host/index.js';
 import { outerArgs, innerArgs, settings, hostPaths, BWRAP_PATH } from '../sandbox/sandbox.mjs';
 import { hostEnv, openHostSession, POLICY_PROTOCOL } from '../bin/mina.mjs';
 import { needsSandbox } from './capabilities.mjs';
@@ -556,6 +556,27 @@ test('mina_host lists inventory and policy_propose; policy_propose is a mutation
     const sent = b.seen.find((r) => r.action === 'policy_propose');
     assert.deepEqual(sent, { op: WIRE, action: 'policy_propose', grant: 'G', args: { changes: [{ kind: 'project_register' }], reason: 'GPUs' } });
   } finally { await pi.emit('session_shutdown'); await b.close(); }
+});
+
+test('the manifest states the resource boundaries: machine-wide or project, exclusive or shared', () => {
+  const caps = { ...POLICY_CAPS, machine_resources: [{ name: 'GPU_A', exclusive: true, summary: 'Card A at 01:00.0' }], capabilities: [
+    { capability: 'resource:GPU_A', status: 'AVAILABLE', detail: 'host locks', source: 'machine', exclusive: true, summary: 'Card A at 01:00.0' },
+    { capability: 'resource:GPU_B', status: 'AVAILABLE', detail: 'host locks', source: 'machine', exclusive: false, shared_locks: ['measure'] },
+    { capability: 'resource:MINE', status: 'AVAILABLE', detail: 'host locks', source: 'project', exclusive: true }] };
+  const m = manifestText(caps);
+  assert.match(m, /^- resource:GPU_A \(machine-wide; exclusive; Card A at 01:00\.0\)$/m);
+  assert.match(m, /^- resource:GPU_B \(machine-wide; shares measure\)$/m);
+  assert.match(m, /^- resource:MINE \(this project only; exclusive\)$/m);
+  assert.ok(m.endsWith(BOUNDARIES));
+  assert.match(BOUNDARIES, /other Mina projects on this machine.*Other machines are not coordinated/s);
+  assert.match(BOUNDARIES, /without GPU devices/);
+  assert.equal(manifestText(caps), m, 'stable text for the prompt cache');
+  const unreg = manifestText({ ...UNREG_CAPS, machine_resources: caps.machine_resources });
+  assert.ok(unreg.startsWith(UNREGISTERED_MANIFEST));
+  assert.match(unreg, /^Machine-wide resources:\n- GPU_A \(machine-wide; exclusive; Card A at 01:00\.0\)$/m);
+  assert.ok(unreg.endsWith(BOUNDARIES));
+  // An older broker sends no machine list: no boundary text that it cannot back.
+  assert.ok(!manifestText(POLICY_CAPS).includes('Boundaries:'));
 });
 
 test('an unregistered project with a policy-capable broker gets a one-line manifest; an older broker the full one', async () => {

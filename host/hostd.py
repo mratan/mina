@@ -1513,6 +1513,17 @@ def capabilities(project, refresh=False):
         return {**hit[1], 'cached': True}
     caps = []
 
+    def brief(r):
+        """What the system prompt says about a resource: which of its locks are shared (none: exclusive), and the
+        first sentence of the owner's description (for example the device and its bus ID)."""
+        shared = [os.path.basename(e.get('path', '')).removesuffix('.lock') for e in r.get('locks', []) if e.get('mode') == 'shared']
+        desc = r.get('description') if isinstance(r.get('description'), str) else ''
+        first = desc.split('. ')[0].strip().rstrip('.')
+        return {'exclusive': not shared, 'shared_locks': shared or None, 'summary': (first[:117] + '...' if len(first) > 120 else first) or None}
+
+    machine = [{k: v for k, v in {'name': n, **brief(r)}.items() if v is not None}
+               for n, r in sorted(machine_resources().items()) if isinstance(r, dict)]
+
     def cap(name, status, detail, missing=None, remediation=None, **extra):
         caps.append({k: v for k, v in {'capability': name, 'status': status, 'detail': detail, 'missing': missing,
                                        'remediation': remediation, **extra}.items() if v is not None})
@@ -1527,7 +1538,7 @@ def capabilities(project, refresh=False):
             'resource); the user approves the exact change in a dialog, every time')
         result = {'project': project, 'broker': VERSION, 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP,
                   'policy_protocol': POLICY_PROTOCOL, 'registered': False, 'checked_at': iso(), 'fingerprint': fp,
-                  'policy_source': None, 'capabilities': caps}
+                  'policy_source': None, 'machine_resources': machine, 'capabilities': caps}
         cap_cache[project] = (fp, result)
         return result
     classes = p.get('classes') or {}
@@ -1607,7 +1618,7 @@ def capabilities(project, refresh=False):
             ('An operator clears lockouts after investigating; mina never does.' if any('lockout' in x for x in problems) else
              'The operator corrects the lock mode in host.json.' if any('mode must be' in x for x in problems) else
              'Start the supervisor unit.' if problems else None if lvl == 'allow' else snippet(project, 'classes.reserve', 'allow')),
-            source=origins.get(name, 'project'))
+            source=origins.get(name, 'project'), **brief(r))
     # Containment.
     app = show('app.slice', ['ControlGroup']).get('ControlGroup', '')
     delegated = app.startswith(f'/user.slice/user-{UID}.slice/user@{UID}.service/')
@@ -1659,7 +1670,7 @@ def capabilities(project, refresh=False):
         None if ext else f'Set "alarm_command": ["<notifier>", ...] in {CONFIG}; it receives each alarm as JSON on stdin.')
     result = {'project': project, 'broker': VERSION, 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP,
               'policy_protocol': POLICY_PROTOCOL, 'registered': True, 'checked_at': iso(), 'fingerprint': fp,
-              'policy_source': policy_source(project), 'capabilities': caps}
+              'policy_source': policy_source(project), 'machine_resources': machine, 'capabilities': caps}
     cap_cache[project] = (fp, result)
     hostlib.write_json(os.path.join(STATE, 'capabilities', f'{tag(project)}.json'), result)
     return result

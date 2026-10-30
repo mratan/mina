@@ -254,7 +254,16 @@ class _Report:
 
     def unknown(self, path, obj, known):
         for k in sorted(set(obj) - known, key=str):
+            if is_comment(k):
+                continue
             self.warn(path + [k], 'unknown key (ignored by this broker)')
+
+
+def is_comment(key):
+    """A key that starts with "_" (for example "_comment") is a note for people. JSON has no comments, so an object with
+    fixed setting keys accepts such keys, and the broker ignores them. Not in a map of names (projects, resources,
+    workloads, services): there each key is a name."""
+    return isinstance(key, str) and key.startswith('_')
 
 
 def _strings(v):
@@ -476,6 +485,8 @@ def _entry(rep, path, entry, cfg, is_defaults=False):
         rep.err(path + ['classes'], 'must be an object {class: level}')
     else:
         for cls, lvl in classes.items():
+            if is_comment(cls):
+                continue
             if cls not in CLASSES:
                 rep.warn(path + ['classes', cls], f'unknown class (known: {list(CLASSES)})')
             if lvl not in LEVELS:

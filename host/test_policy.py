@@ -149,6 +149,13 @@ class ValidateTest(Tmp):
         self.assertIn('classes.future_class: unknown class', joined)
         self.assertIn('"allow" is treated as "ask"', joined)
 
+    def test_keys_that_start_with_an_underscore_are_comments(self):
+        cfg = json.loads(json.dumps(self.cfg))
+        cfg['_comment'] = 'a note for people'
+        cfg['projects'][f'{self.tmp}/p1']['workloads']['smoke']['_comment'] = 'why this workload exists'
+        cfg['projects'][f'{self.tmp}/p1']['classes']['_why'] = 'reserve stays ask'
+        self.assertEqual(P.check(cfg), ([], []))
+
     def test_the_broker_and_the_check_use_the_same_rules(self):
         """One truth: the broker's run-time refusals and the schema check come from the same functions."""
         with self.assertRaises(hostd.Refusal) as e:

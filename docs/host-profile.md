@@ -252,6 +252,8 @@ An example change list for the project of the current folder:
 
 1. The tool applies the changes to a copy of the policy.
 2. It validates the complete result. An error refuses the change. An unknown key is only a warning.
+   A key that starts with `_`, for example `"_comment"`, is a note for people: no warning, and the broker ignores it.
+   Use it in an object of settings, not in a map of names such as `projects`, `resources`, or `workloads`.
    The broker uses the same rules when it reads the policy, so the two cannot disagree.
 3. It shows a line-based diff. Keys are sorted, so the same change always gives the same diff.
 4. It shows the risk flags:

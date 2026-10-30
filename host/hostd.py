@@ -174,8 +174,41 @@ def with_policy(fn):
     return invoke
 
 
+def machine_resources():
+    """The top-level "resources" of host.json: the lock protocol of this machine, shared by every project on it."""
+    r = config().get('resources')
+    return r if isinstance(r, dict) else {}
+
+
+def policy_entry(project):
+    """(entry, source): the project's own entry in "projects" (source 'project'), or (None, None)."""
+    entry = (config().get('projects') or {}).get(project)
+    if entry is not None:
+        return entry, 'project'
+    return None, None
+
+
+def policy_source(project):
+    """'project', or None when no policy applies."""
+    return policy_entry(project)[1]
+
+
 def project_config(project):
-    return (config().get('projects') or {}).get(project)
+    """The effective policy of a project, or None. Its resources are the machine resources overlaid by the policy's own
+    "resources": an entry of the policy with the same name replaces the machine entry as a whole."""
+    entry, _source = policy_entry(project)
+    if entry is None:
+        return None
+    return {**entry, 'resources': {**machine_resources(), **(entry.get('resources') or {})}}
+
+
+def resource_origins(project):
+    """{resource name: 'machine' or the policy source} for the effective resources of a project."""
+    entry, source = policy_entry(project)
+    if entry is None:
+        return {}
+    own = entry.get('resources') or {}
+    return {**{n: 'machine' for n in machine_resources()}, **{n: source for n in own}}
 
 
 def snippet(project, path, value):
@@ -1436,15 +1469,15 @@ def capabilities(project, refresh=False):
         return {**hit[1], 'cached': True}
     caps = []
 
-    def cap(name, status, detail, missing=None, remediation=None):
+    def cap(name, status, detail, missing=None, remediation=None, **extra):
         caps.append({k: v for k, v in {'capability': name, 'status': status, 'detail': detail, 'missing': missing,
-                                       'remediation': remediation}.items() if v is not None})
+                                       'remediation': remediation, **extra}.items() if v is not None})
 
     p = project_config(project)
     if p is None:
         cap('project', 'REQUIRES_AUTHORIZATION', f'{project} is not registered with the host broker', 'a project entry in host.json',
             f'Add "{project}" under "projects" in {CONFIG} (docs/host-profile.md has an example).')
-        result = {'project': project, 'broker': VERSION, 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP, 'checked_at': iso(), 'fingerprint': fp, 'capabilities': caps}
+        result = {'project': project, 'broker': VERSION, 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP, 'checked_at': iso(), 'fingerprint': fp, 'policy_source': None, 'capabilities': caps}
         cap_cache[project] = (fp, result)
         return result
     classes = p.get('classes') or {}
@@ -1479,7 +1512,8 @@ def capabilities(project, refresh=False):
             f'verdict {dep["verdict"]}' + (f': changed after start {dep["sources_changed_after_start"]}' if dep['verdict'] == 'STALE' else '')
             + (f'; git {dep["git"]["head"]}, uncommitted {dep["git"]["sources_uncommitted"]}' if dep.get('git') else ''),
             dep['sources_unreadable'] or None)
-    # Resources.
+    # Resources: the machine's own and the policy's (a policy entry replaces a machine entry of the same name).
+    origins = resource_origins(project)
     for name, r in sorted((p.get('resources') or {}).items()):
         problems = []
         for lo in r.get('lockouts', []):
@@ -1512,7 +1546,8 @@ def capabilities(project, refresh=False):
         cap(f'resource:{name}', status, f'host locks {[e["path"] for e in r.get("locks", [])]}; production runner participation: '
             f'{participation}; lock universe shared with {shared or "no supervisor checked"}', problems or (None if lvl == 'allow' else 'reserve approval'),
             ('An operator clears lockouts after investigating; mina never does.' if any('lockout' in x for x in problems) else
-             'Start the supervisor unit.' if problems else None if lvl == 'allow' else snippet(project, 'classes.reserve', 'allow')))
+             'Start the supervisor unit.' if problems else None if lvl == 'allow' else snippet(project, 'classes.reserve', 'allow')),
+            source=origins.get(name, 'project'))
     # Containment.
     app = show('app.slice', ['ControlGroup']).get('ControlGroup', '')
     delegated = app.startswith(f'/user.slice/user-{UID}.slice/user@{UID}.service/')
@@ -1555,7 +1590,7 @@ def capabilities(project, refresh=False):
         f'command {ext[0]}' if ext else 'no external channel: with no live Mina session an alarm waits in the broker (and '
         'its journal) until one connects', None if ext else 'an alarm_command in host.json',
         None if ext else f'Set "alarm_command": ["<notifier>", ...] in {CONFIG}; it receives each alarm as JSON on stdin.')
-    result = {'project': project, 'broker': VERSION, 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP, 'checked_at': iso(), 'fingerprint': fp, 'capabilities': caps}
+    result = {'project': project, 'broker': VERSION, 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP, 'checked_at': iso(), 'fingerprint': fp, 'policy_source': policy_source(project), 'capabilities': caps}
     cap_cache[project] = (fp, result)
     hostlib.write_json(os.path.join(STATE, 'capabilities', f'{tag(project)}.json'), result)
     return result

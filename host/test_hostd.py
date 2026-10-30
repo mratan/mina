@@ -117,17 +117,18 @@ class Broker:
         assert r.stdout, r.stderr
         return json.loads(r.stdout)
 
-    def open_session(self):
+    def open_session(self, project=None, full=False):
         # This test process is the launcher: outside any sandbox, in the broker's mount namespace.
         s = __import__('socket').socket(__import__('socket').AF_UNIX)
         s.connect(self.sock)
-        s.sendall((json.dumps({'op': 'session_open', 'project': self.project}) + '\n').encode())
+        s.sendall((json.dumps({'op': 'session_open', 'project': project or self.project}) + '\n').encode())
         data = b''
         while not data.endswith(b'\n'):
             data += s.recv(65536)
+        s.close()
         out = json.loads(data)
         assert out['ok'], out
-        return out['result']['grant']
+        return out['result'] if full else out['result']['grant']
 
     def cleanup(self):
         self.stop()
@@ -1540,6 +1541,88 @@ for line in sys.stdin:
         self.assertNotIn(self.grant, text)
         self.assertNotIn(token, text)
         self.assertIn(hashlib.sha256(token.encode()).hexdigest()[:24], text)
+
+
+@unittest.skipUnless(SYSTEMD_USER, NEEDS_SYSTEMD)
+class MachineResourceTest(unittest.TestCase):
+    """Machine-level resources: one lock protocol for every project on this machine. Temporary lock files only."""
+
+    def setUp(self):
+        self.b = b = Broker()
+        self.addCleanup(b.cleanup)
+        self.other = os.path.join(b.tmp, 'other-project')
+        os.makedirs(self.other)
+        L = b.locks
+        self.gpu = f'{L}/GPU_M.lock'
+        self.own = f'{L}/OWN_GPU.lock'
+        self.machine = {'GPU': {'locks': [{'path': self.gpu, 'turnstile': f'{L}/GPU_M.turn'}]}}
+        classes = {'observe': 'allow', 'reserve': 'allow', 'workload': 'allow'}
+        self.cfg = {'version': 1, 'resources': self.machine, 'projects': {
+            b.project: {'classes': classes, 'workloads': {
+                'hold': {'argv': ['sleep', '300'], 'resources': ['GPU'], 'max_s': 300},
+                'quick': {'argv': ['true'], 'resources': ['GPU'], 'max_s': 30}}},
+            self.other: {'classes': classes, 'workloads': {
+                'quick': {'argv': ['true'], 'resources': ['GPU'], 'max_s': 30}}}}}
+        self.write()
+        b.start()
+        self.grant_a = b.open_session()
+        self.grant_b = b.open_session(self.other)
+
+    def write(self):
+        hostlib.write_json(self.b.env['MINA_HOST_CONFIG'], self.cfg)
+
+    def call(self, grant, op, **kw):
+        return self.b.raw({'op': op, 'grant': grant, **kw})
+
+    def ok(self, grant, op, **kw):
+        out = self.call(grant, op, **kw)
+        self.assertTrue(out['ok'], out)
+        return out['result']
+
+    def end(self, grant, wid, timeout=30):
+        live = ('launching', 'starting', 'queued', 'running')
+        return wait_for(lambda: (lambda s: s if s['state'] not in live else None)(self.ok(grant, 'workload_status', id=wid)), timeout=timeout)
+
+    def test_machine_resource_is_shared_by_two_projects(self):
+        for grant in (self.grant_a, self.grant_b):
+            caps = {c['capability']: c for c in self.ok(grant, 'capabilities', refresh=True)['capabilities']}
+            self.assertEqual(caps['resource:GPU']['status'], 'AVAILABLE')
+            self.assertEqual(caps['resource:GPU']['source'], 'machine')
+        w = self.ok(self.grant_a, 'workload_run', workload='hold')
+        self.assertTrue(wait_for(lambda: self.ok(self.grant_a, 'workload_status', id=w['id'])['state'] == 'running'))
+        try:
+            e = self.call(self.grant_b, 'reserve', resources=['GPU'])['error']
+            self.assertEqual(e['code'], 'CONFLICT', e)
+            self.assertEqual(e['evidence']['lock'], self.gpu)
+            self.assertTrue(any('lockrun.py' in ' '.join(h['argv']) for h in e['evidence']['holders']), e)
+            b_run = self.ok(self.grant_b, 'workload_run', workload='quick')                           # queue_s 0: no wait
+            self.assertEqual(self.end(self.grant_b, b_run['id'])['state'], 'conflict')
+        finally:
+            self.ok(self.grant_a, 'workload_stop', id=w['id'])
+        self.assertTrue(free(self.gpu))
+        r = self.ok(self.grant_b, 'reserve', resources=['GPU'], ttl_s=30)
+        self.assertFalse(free(self.gpu))
+        self.ok(self.grant_b, 'release', reservation=r['reservation'])
+        self.assertTrue(free(self.gpu))
+
+    def test_project_resource_with_the_same_name_replaces_the_machine_one(self):
+        self.cfg['projects'][self.other]['resources'] = {'GPU': {'locks': [{'path': self.own}]}}
+        self.write()
+        caps = {c['capability']: c for c in self.ok(self.grant_b, 'capabilities', refresh=True)['capabilities']}
+        self.assertEqual(caps['resource:GPU']['source'], 'project')
+        self.assertIn(self.own, caps['resource:GPU']['detail'])
+        self.assertNotIn(self.gpu, caps['resource:GPU']['detail'])
+        holder = flock_holder(self.gpu)                                    # the machine lock is busy
+        try:
+            r = self.ok(self.grant_b, 'reserve', resources=['GPU'], ttl_s=30)    # the project's own lock is not
+            self.assertEqual(r['locks'], [self.own])
+            self.assertFalse(free(self.own))
+            self.ok(self.grant_b, 'release', reservation=r['reservation'])
+            self.assertEqual(self.call(self.grant_a, 'reserve', resources=['GPU'])['error']['code'], 'CONFLICT')
+        finally:
+            holder.kill(); holder.wait()
+        caps = {c['capability']: c for c in self.ok(self.grant_a, 'capabilities', refresh=True)['capabilities']}
+        self.assertEqual(caps['resource:GPU']['source'], 'machine')
 
 
 class WorkloadSandboxPolicyTest(unittest.TestCase):

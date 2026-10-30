@@ -1554,15 +1554,24 @@ class MachineResourceTest(unittest.TestCase):
         os.makedirs(self.other)
         L = b.locks
         self.gpu = f'{L}/GPU_M.lock'
+        self.turn = f'{L}/GPU_M.turn'
+        self.first = f'{L}/FIRST.lock'
         self.own = f'{L}/OWN_GPU.lock'
-        self.machine = {'GPU': {'locks': [{'path': self.gpu, 'turnstile': f'{L}/GPU_M.turn'}]}}
-        classes = {'observe': 'allow', 'reserve': 'allow', 'workload': 'allow'}
+        self.lockout = f'{b.tmp}/lockout/GPU_M'
+        self.ran = os.path.join(b.tmp, 'waiter-ran')
+        gpu_entry = {'path': self.gpu, 'turnstile': self.turn}
+        self.machine = {'GPU': {'locks': [gpu_entry], 'lockouts': [self.lockout]},
+                        'PAIR': {'locks': [{'path': self.first}, gpu_entry]}}
+        classes = {'observe': 'allow', 'reserve': 'allow', 'workload': 'allow', 'monitor': 'allow'}
         self.cfg = {'version': 1, 'resources': self.machine, 'projects': {
             b.project: {'classes': classes, 'workloads': {
                 'hold': {'argv': ['sleep', '300'], 'resources': ['GPU'], 'max_s': 300},
                 'quick': {'argv': ['true'], 'resources': ['GPU'], 'max_s': 30}}},
             self.other: {'classes': classes, 'workloads': {
-                'quick': {'argv': ['true'], 'resources': ['GPU'], 'max_s': 30}}}}}
+                'quick': {'argv': ['true'], 'resources': ['GPU'], 'max_s': 30},
+                'wait': {'argv': ['touch', self.ran], 'resources': ['GPU'], 'max_s': 30, 'queue_s': 60},
+                'wait-pair': {'argv': ['true'], 'resources': ['PAIR'], 'max_s': 30, 'queue_s': 60},
+                'short-wait': {'argv': ['touch', self.ran], 'resources': ['PAIR'], 'max_s': 30, 'queue_s': 2}}}}}
         self.write()
         b.start()
         self.grant_a = b.open_session()
@@ -1603,6 +1612,77 @@ class MachineResourceTest(unittest.TestCase):
         r = self.ok(self.grant_b, 'reserve', resources=['GPU'], ttl_s=30)
         self.assertFalse(free(self.gpu))
         self.ok(self.grant_b, 'release', reservation=r['reservation'])
+        self.assertTrue(free(self.gpu))
+
+    def queued(self, grant, wid):
+        return wait_for(lambda: (lambda s: s if s['state'] == 'queued' else None)(self.ok(grant, 'workload_status', id=wid)))
+
+    def test_a_waiting_workload_holds_its_place_and_runs_after_the_release(self):
+        w = self.ok(self.grant_a, 'workload_run', workload='hold')
+        self.assertTrue(wait_for(lambda: self.ok(self.grant_a, 'workload_status', id=w['id'])['state'] == 'running'))
+        try:
+            waiter = self.ok(self.grant_b, 'workload_run', workload='wait')
+            q = self.queued(self.grant_b, waiter['id'])
+            self.assertTrue(q, 'workload_status shows queued')
+            self.assertEqual(q['waiting_for']['lock'], self.gpu)
+            self.assertTrue(any('lockrun.py' in ' '.join(h['argv']) and not h['waiting'] for h in q['waiting_for']['holders']), q)
+            self.assertFalse(free(self.turn), 'the waiter holds the turnstile while it waits')
+            self.assertEqual(self.call(self.grant_a, 'reserve', resources=['GPU'])['error']['code'], 'CONFLICT')   # no jumping the queue
+            time.sleep(1.5)                                                                     # several broker ticks
+            self.assertEqual(self.ok(self.grant_b, 'workload_status', id=waiter['id'])['state'], 'queued')
+            self.assertFalse([a for a in self.ok(self.grant_b, 'alarms')['pending'] if a['monitor'] == waiter['monitor']],
+                             'a queued workload has not ended')
+            self.assertFalse(os.path.exists(self.ran))
+        finally:
+            self.ok(self.grant_a, 'workload_stop', id=w['id'])
+        end = self.end(self.grant_b, waiter['id'])
+        self.assertEqual(end['state'], 'exited', end)
+        self.assertTrue(end['verification']['verified_exit'])
+        self.assertTrue(os.path.exists(self.ran))
+        self.assertTrue(free(self.gpu) and free(self.turn))
+
+    def test_the_end_of_queue_s_is_a_conflict_that_releases_every_lock(self):
+        holder = flock_holder(self.gpu)
+        try:
+            w = self.ok(self.grant_b, 'workload_run', workload='short-wait')
+            end = self.end(self.grant_b, w['id'])
+            self.assertEqual(end['state'], 'conflict', end)
+            evidence = end['result']['evidence']
+            self.assertEqual(evidence['lock'], self.gpu)
+            self.assertIn(holder.pid, [h['pid'] for h in evidence['holders']])
+            self.assertGreaterEqual(evidence['waited_s'], 1.5)
+            self.assertIn('queue_s', evidence['why'])
+            self.assertFalse(os.path.exists(self.ran))
+            self.assertTrue(free(self.first), 'the lock taken before the wait is released')
+            self.assertTrue(free(self.turn), 'the turnstile is released')
+        finally:
+            holder.kill(); holder.wait()
+
+    def test_workload_stop_stops_a_queued_job_and_releases_what_it_holds(self):
+        holder = flock_holder(self.gpu)
+        try:
+            w = self.ok(self.grant_b, 'workload_run', workload='wait-pair')
+            self.assertTrue(self.queued(self.grant_b, w['id']))
+            self.assertFalse(free(self.first))
+            s = self.ok(self.grant_b, 'workload_stop', id=w['id'])
+            self.assertEqual(s['state'], 'stopped', s)
+            self.assertTrue(s['verification']['verified_exit'])
+            self.assertTrue(free(self.first) and free(self.turn))
+        finally:
+            holder.kill(); holder.wait()
+
+    def test_the_recheck_runs_after_a_wait(self):
+        holder = flock_holder(self.gpu)
+        try:
+            w = self.ok(self.grant_b, 'workload_run', workload='wait')
+            self.assertTrue(self.queued(self.grant_b, w['id']))
+            put(self.lockout, 'fault while queued')
+        finally:
+            holder.kill(); holder.wait()
+        end = self.end(self.grant_b, w['id'])
+        self.assertEqual(end['state'], 'blocked', end)
+        self.assertEqual(end['result']['problems'][0]['kind'], 'lockout')
+        self.assertFalse(os.path.exists(self.ran))
         self.assertTrue(free(self.gpu))
 
     def test_project_resource_with_the_same_name_replaces_the_machine_one(self):

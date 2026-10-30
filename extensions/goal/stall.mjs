@@ -8,7 +8,7 @@
 import { createHash } from 'node:crypto';
 
 export const DEFAULT_STALL_RUNS = 3;
-export const LIVE_WORKLOAD = new Set(['launching', 'starting', 'running', 'containment_unknown']);
+export const LIVE_WORKLOAD = new Set(['launching', 'starting', 'queued', 'running', 'containment_unknown']);
 const KEEP_WORKLOADS = 50;
 
 // A broker workload record seen in a mina_host result. Returns the updated map and whether a live job was seen to end.

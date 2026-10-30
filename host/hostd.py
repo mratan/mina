@@ -692,6 +692,8 @@ def op_release(project, sess, req):
 # --- workloads -------------------------------------------------------------------------------------------------------
 
 WL = os.path.join(STATE, 'workloads')
+# A workload in one of these states can still hold locks or run processes. 'queued': its unit waits for its locks.
+LIVE = ('launching', 'starting', 'queued', 'running')
 
 
 def tag(project):
@@ -1036,7 +1038,7 @@ def launch_workload(project, sess, req):
     admission = check_workload_budget(project, sess, name, max_s + queue_s, wid)
     os.makedirs(d, exist_ok=True)
     spec = {'argv': argv, 'cwd': w.get('cwd', project), 'env': env, 'result': os.path.join(d, 'result.json'),
-            'log': os.path.join(d, 'output.log'), 'locks': hostlib.lock_entries(resources, names),
+            'log': os.path.join(d, 'output.log'), 'locks': hostlib.lock_entries(resources, names), 'queue_s': queue_s,
             'resources': {n: resources[n] for n in names}, 'resource_names': names}
     hostlib.write_json(os.path.join(d, 'spec.json'), spec)
     rec = {'id': wid, 'workload': name, 'project': project, 'policy_source': policy_source(project), 'session': sess, 'unit': unit, 'resources': names,
@@ -1106,7 +1108,12 @@ def reconcile_workload(rec):
         members = hostlib.cgroup_members(f'/sys/fs/cgroup{rec.get("cgroup", "")}') if rec.get('cgroup') else None
         seen = {(m['pid'], m['start']) for m in rec['members_seen']}
         rec['members_seen'] += [m for m in (members or []) if (m['pid'], m['start']) not in seen][:200]
-        rec['state'] = 'running' if res.get('state') == 'running' else 'starting'
+        rec['state'] = res.get('state') if res.get('state') in ('running', 'queued') else 'starting'
+        if rec['state'] == 'queued':
+            rec['waiting_for'] = res.get('waiting_for')
+            rec['queue_deadline'] = res.get('queue_deadline')
+        else:
+            rec.pop('waiting_for', None)
     else:
         # The unit has ended (collected units vanish). Every process ever seen in it, and any left in its cgroup, must be gone.
         left = hostlib.cgroup_members(f'/sys/fs/cgroup{rec["cgroup"]}') if rec.get('cgroup') else None
@@ -1121,10 +1128,11 @@ def reconcile_workload(rec):
             rec['state'] = 'stopped'
         elif st in ('exited', 'conflict', 'blocked'):
             rec['state'] = st
-        elif st in ('running', 'terminated'):
+        elif st in ('running', 'terminated', 'queued'):
             rec['state'] = 'deadline' if now() >= rec['deadline'] - 1 else 'terminated'
         else:
             rec['state'] = 'launch_failed'
+        rec.pop('waiting_for', None)
         rec['verification'] = {'unit_ended': True, 'cgroup_remaining': left, 'recorded_processes': len(known),
                                'still_alive': living, 'verified_exit': not living, 'checked_at': iso()}
         rec['result'] = {k: v for k, v in res.items() if k in ('rc', 'state', 'evidence', 'problems', 'signal', 'survivors')}
@@ -1144,6 +1152,8 @@ def reconcile_workload(rec):
 
 def describe_workload(rec):
     out = {k: rec.get(k) for k in ('id', 'request_id', 'workload', 'unit', 'state', 'resources', 'max_s', 'params', 'command', 'admission', 'result', 'verification', 'cleanup')}
+    if rec.get('state') == 'queued':   # what it waits for, and who holds that lock now
+        out.update(waiting_for=rec.get('waiting_for'), queue_deadline_at=iso(rec['queue_deadline']) if rec.get('queue_deadline') else None)
     out['launched_at'] = iso(rec['launched'])
     out['output_tail'] = tail(os.path.join(WL, rec['id'], 'output.log'), 20)
     return out
@@ -1211,7 +1221,7 @@ def op_workload_stop(project, sess, req):
                          f'Stop workload {req.get("id")} and its contained processes for {project}?')
     with state_lock:
         rec = reconcile_workload(load_workload(project, req.get('id')))
-        if rec['state'] not in ('launching', 'starting', 'running', 'containment_unknown'):
+        if rec['state'] not in (*LIVE, 'containment_unknown'):
             return describe_workload(rec)
         rec['stop_requested'] = now()
         hostlib.write_json(os.path.join(WL, rec['id'], 'record.json'), rec)
@@ -1220,7 +1230,7 @@ def op_workload_stop(project, sess, req):
     for _ in range(50):
         with state_lock:
             rec = reconcile_workload(load_workload(project, rec['id']))
-        if rec['state'] not in ('launching', 'starting', 'running'):
+        if rec['state'] not in LIVE:
             break
         time.sleep(0.1)
     audit({'op': 'workload_stop', 'id': rec['id'], 'project': project, 'session': sess, 'systemctl_rc': r.returncode, 'state': rec['state']})
@@ -1375,7 +1385,7 @@ def evaluate(m, initial=False):
     elif k == 'workload':
         rec = hostlib.read_json(os.path.join(WL, p['id'], 'record.json'), {})
         value = rec.get('state')
-        if value and value not in ('launching', 'starting', 'running'):
+        if value and value not in LIVE:
             if s.get('reported'):
                 return finish(m, value, None, None)
             # A short run's end is held for AUTO_HOLD_S and dropped only if the agent read the result itself
@@ -1695,7 +1705,7 @@ def loop():
                     # meanwhile, and would then record the stopped workload as terminated.
                     with state_lock:
                         rec = hostlib.read_json(os.path.join(WL, wid, 'record.json'))
-                        if rec and rec['state'] in ('launching', 'starting', 'running', 'containment_unknown'):
+                        if rec and rec['state'] in (*LIVE, 'containment_unknown'):
                             reconcile_workload(rec)
             fired = []
             with state_lock:

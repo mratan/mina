@@ -1138,6 +1138,12 @@ test('no-effect guard helpers: a workload seen to end, liveness bounded by the b
   assert.equal(w.finished, true);
   assert.equal(observeWorkload(w.workloads, { id: 'a', state: 'exited' }).finished, false); // seen ended again: nothing new
   assert.equal(observeWorkload(w.workloads, { kind: 'workload_output' }).workloads, w.workloads);
+  // A job that waits for its locks (queue_s) is live: queued -> running is not an end, queued -> conflict is.
+  let q = observeWorkload(null, { id: 'q', state: 'queued' });
+  assert.equal(liveWorkload(q.workloads, 1000), true);
+  q = observeWorkload(q.workloads, { id: 'q', state: 'running' });
+  assert.equal(q.finished, false);
+  assert.equal(observeWorkload(observeWorkload(null, { id: 'q', state: 'queued' }).workloads, { id: 'q', state: 'conflict' }).finished, true);
   let many = null;
   for (let i = 0; i < 60; i++) many = observeWorkload(many, { id: `j${i}`, state: i === 0 ? 'running' : 'exited' }).workloads;
   assert.equal(Object.keys(many).length, 50);

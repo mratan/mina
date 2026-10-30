@@ -3,7 +3,9 @@
 
 usage: lockrun.py SPEC.json
 
-1. Takes the workload's resource locks, non-blocking (a conflict exits 75 with the holders recorded).
+1. Takes the workload's resource locks. With queue_s 0, non-blocking. With queue_s > 0, it waits up to queue_s seconds
+   in total, in the queue protocol of the host runner (hostlib.acquire), and records the state 'queued' with what it
+   waits for. A conflict, or the end of queue_s, exits 75 with the holders recorded and every lock released.
 2. Checks again, with the locks held, that no lockout, stopped supervisor or foreign GPU user forbids the run
    (a campaign runner should do the same re-check; a fault can arrive while the locks are being taken).
 3. Runs the registered command with the lock descriptors inherited: the locks stay held while any process of the
@@ -39,15 +41,25 @@ def on_term(signum, _frame):
 signal.signal(signal.SIGTERM, on_term)
 signal.signal(signal.SIGHUP, on_term)
 
+queue_s = spec.get('queue_s', 0)
+queued_since = time.time()
+
+
+def on_wait(path, holders):
+    write('queued', waiting_for={'lock': path, 'holders': holders}, queue_s=queue_s, queued_since=queued_since,
+          queue_deadline=queued_since + queue_s)
+
+
 try:
-    fds = hostlib.acquire(spec['locks'])
+    fds = hostlib.acquire(spec['locks'], wait_s=queue_s, on_wait=on_wait)
 except hostlib.LockConflict as e:
-    write('conflict', evidence=e.evidence)
+    write('conflict', evidence={**e.evidence, 'waited_s': round(time.time() - queued_since, 1)} if queue_s else e.evidence)
     sys.exit(75)
 problems = hostlib.resource_problems(spec['resources'], spec['resource_names'])
 if problems:
     write('blocked', problems=problems)
     sys.exit(75)
+record.pop('waiting_for', None)   # no longer waiting: queued_since stays as evidence of the wait
 for fd in fds:
     os.set_inheritable(fd, True)
 env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': os.environ.get('HOME', '/'), 'LANG': 'C.UTF-8', **spec.get('env', {})}

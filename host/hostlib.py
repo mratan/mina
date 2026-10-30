@@ -1,13 +1,16 @@
 """Shared helpers of mina's host broker (host/hostd.py) and its workload lock holder (host/lockrun.py).
 
-Process identity is (pid, kernel start ticks), never a pid alone. Locks are the host's own flock files, taken
-non-blocking: a conflict is reported with the holders' evidence, never waited on. Standard library only.
+Process identity is (pid, kernel start ticks), never a pid alone. Locks are the host's own flock files. The broker
+takes them non-blocking: a conflict is reported with the holders' evidence. A workload with queue_s > 0 waits for them
+in its lock holder (lockrun.py), in the queue of the host runner that shares them. Standard library only.
 """
 import fcntl
 import json
 import os
+import signal
 import subprocess
 import tempfile
+import time
 
 # --- processes -------------------------------------------------------------------------------------------------------
 
@@ -143,12 +146,76 @@ def lock_holders(path):
     return out
 
 
-def acquire(entries):
-    """Take each lock exclusively, in order, without waiting. An entry is {path, turnstile?}: a turnstile is the file that
-    a waiting campaign runner holds while it queues for the lock (for example an MTURN or TURNSTILE file). A held turnstile means
-    someone is queued ahead, so it is a conflict too: the broker never jumps a queue. Returns the open descriptors; on a
-    conflict, closes what it took and raises LockConflict with the holders."""
+class _Expired(Exception):
+    pass
+
+
+def _flock(fd, op, deadline):
+    """Take a flock. Without a deadline: non-blocking, BlockingIOError when it is held. With a deadline (time.monotonic):
+    a blocking flock that SIGALRM interrupts at the deadline, then BlockingIOError. The wait needs the main thread (a
+    signal handler); only lockrun.py waits. If the alarm comes in the same instant as the lock, the caller still gets
+    BlockingIOError and closes the descriptor, which releases the lock: a lock is never kept without the caller knowing."""
+    try:
+        fcntl.flock(fd, op | fcntl.LOCK_NB)
+        return
+    except BlockingIOError:
+        if deadline is None:
+            raise
+    armed = [True]
+
+    def on_alarm(_signum, _frame):
+        if armed[0]:
+            raise _Expired()
+
+    old = signal.signal(signal.SIGALRM, on_alarm)
+    got = False
+    try:
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                signal.setitimer(signal.ITIMER_REAL, remaining)
+                fcntl.flock(fd, op)
+                got = True
+        finally:
+            armed[0] = False
+    except _Expired:
+        got = False
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+    if not got:
+        raise BlockingIOError('still held at the deadline')
+
+
+def acquire(entries, wait_s=0, on_wait=None):
+    """Take each lock exclusively, in order. An entry is {path, turnstile?}: a turnstile is the file that a waiting
+    campaign runner holds while it queues for the lock (for example an MTURN or TURNSTILE file).
+
+    wait_s 0 (the broker, and a workload without queue_s): no wait. A held turnstile means someone is queued ahead, so it
+    is a conflict too: the broker never jumps a queue.
+    wait_s > 0 (lockrun.py): wait up to wait_s seconds in total, with the queue protocol of the campaign runner: take the
+    turnstile (waiting), wait for the lock while holding the turnstile, then release the turnstile. So the waiter holds
+    its place in the queue, and nobody that arrives later gets ahead of it. Before each wait, on_wait(path, holders) is
+    called.
+
+    Returns the open descriptors; on a conflict, closes everything it took and raises LockConflict with the holders."""
+    deadline = time.monotonic() + wait_s if wait_s and wait_s > 0 else None
     fds = []
+
+    def take(fd, path, op, why):
+        try:
+            fcntl.flock(fd, op | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if deadline is None:
+                raise LockConflict(path, why, lock_holders(path))
+        if on_wait:
+            on_wait(path, lock_holders(path))
+        try:
+            _flock(fd, op, deadline)
+        except BlockingIOError:
+            raise LockConflict(path, f'{why}; still so after waiting {wait_s} s (queue_s)', lock_holders(path))
+
     try:
         for e in entries:
             os.makedirs(os.path.dirname(e['path']), exist_ok=True)
@@ -156,16 +223,13 @@ def acquire(entries):
             try:
                 if e.get('turnstile'):
                     turn = os.open(e['turnstile'], os.O_RDWR | os.O_CREAT, 0o664)
-                    try:
-                        fcntl.flock(turn, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        raise LockConflict(e['turnstile'], 'a campaign runner is queued for this lock', lock_holders(e['turnstile']))
+                    take(turn, e['turnstile'], fcntl.LOCK_EX, 'a campaign runner is queued for this lock')
                 fd = os.open(e['path'], os.O_RDWR | os.O_CREAT, 0o664)
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
+                    take(fd, e['path'], fcntl.LOCK_EX, 'held by another process')
+                except BaseException:
                     os.close(fd)
-                    raise LockConflict(e['path'], 'held by another process', lock_holders(e['path']))
+                    raise
                 fds.append(fd)
             finally:
                 if turn is not None:

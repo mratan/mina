@@ -9,6 +9,7 @@ operations over a Unix socket, only on what the user registered for a project in
   workload  run a registered command in its own systemd unit, holding its resources; stop it; verify every process exits
   restart   restart a registered service while its resources are idle, then verify the new deployment
   monitor   register a bounded, host-side monitor whose alarms survive the Mina session and its handoffs
+  policy    propose a change to host.json; the user approves the exact diff in a dialog, always (policy.py)
 
 The fixed operations target registered capabilities, not an unrestricted host API. A workload registration can grant
 broad command authority; registration itself is not a safety review. The broker runs with its user's Unix authority.
@@ -44,6 +45,7 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import hostlib  # noqa: E402
+import policy as hostpolicy  # noqa: E402
 from confirmations import Confirmations, PROTOCOL, MUTATION_OP  # noqa: E402
 from budgets import AdmissionBudgets, BudgetExceeded, BudgetUnknown, limits as budget_limits  # noqa: E402
 
@@ -58,7 +60,8 @@ UNIT_PREFIX = os.environ.get('MINA_HOST_UNIT_PREFIX', 'mina-wl')
 LOCKRUN = os.path.join(HERE, 'lockrun.py')
 LOCKRUN_ENV = ('MINA_HOST_KFD_PROC',)   # broker settings that lockrun.py (hostlib) reads too
 TICK_S = float(os.environ.get('MINA_HOST_TICK_S', '2'))
-CLASSES = ('observe', 'reserve', 'workload', 'restart', 'monitor')
+CLASSES = hostpolicy.CLASSES
+POLICY_PROTOCOL = hostpolicy.POLICY_PROTOCOL
 LEVEL = {'deny': 0, 'ask': 1, 'allow': 2}
 MAX_RESERVE_S = 3600
 AUTO_QUIET_S = int(os.environ.get('MINA_HOST_AUTO_QUIET_S', '120'))
@@ -133,7 +136,7 @@ def read_policy():
             after = os.fstat(f.fileno())
     except OSError:
         _config['sha'] = None
-        return {'data': {}, 'sha': None, 'revision': None}
+        return {'data': {}, 'sha': None, 'sha256': None, 'revision': None}
     def identity(st):
         return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
     if identity(before) != identity(after):
@@ -148,7 +151,7 @@ def read_policy():
         log(f'CONFIG_INVALID {CONFIG}: {e}')
         data = {'invalid': str(e)}
     _config['sha'] = sha[:16]
-    return {'data': data, 'sha': sha[:16], 'revision': revision}
+    return {'data': data, 'sha': sha[:16], 'sha256': sha, 'revision': revision}
 
 
 def config():
@@ -186,44 +189,16 @@ def machine_resources():
     return r if isinstance(r, dict) else {}
 
 
-# Folders that never get the defaults: credentials and mina's own configuration and state (relative to the home folder).
-NO_DEFAULTS = ['.ssh', '.gnupg', '.aws', '.docker', '.config/gh', '.config/mina', '.local/state/mina']
-
-
-def defaults_root(project, roots):
-    """The root of "defaults.roots" that holds this project strictly inside it, or None. Never for a root itself, for
-    /, for the home folder, or for a folder in NO_DEFAULTS. A root must be absolute (after ~); a root of / is ignored."""
-    if not isinstance(roots, list):
-        return None
-    home = os.path.realpath(os.path.expanduser('~'))
-    project = os.path.realpath(project)
-    if project in ('/', home):
-        return None
-    for p in NO_DEFAULTS:
-        guarded = os.path.join(home, p)
-        if project == guarded or project.startswith(guarded + '/'):
-            return None
-    for r in roots:
-        if not isinstance(r, str) or not os.path.isabs(os.path.expanduser(r)):
-            continue
-        root = os.path.realpath(os.path.expanduser(r))
-        if root != '/' and project.startswith(root.rstrip('/') + '/'):
-            return root
-    return None
+NO_DEFAULTS = hostpolicy.NO_DEFAULTS
+defaults_root = hostpolicy.defaults_root
 
 
 def policy_entry(project):
     """(entry, source): the project's own entry in "projects" (source 'project'); else the "defaults" template when the
     project is strictly inside one of its roots (source 'defaults'); else (None, None). A registered project never gets
-    the defaults: there is no merging. The template's "services" are ignored, because a service belongs to one project."""
-    cfg = config()
-    entry = (cfg.get('projects') or {}).get(project)
-    if entry is not None:
-        return entry, 'project'
-    d = cfg.get('defaults')
-    if isinstance(d, dict) and defaults_root(project, d.get('roots')):
-        return {k: v for k, v in d.items() if k not in ('roots', 'services')}, 'defaults'
-    return None, None
+    the defaults: there is no merging. The template's "services" are ignored, because a service belongs to one project.
+    One implementation for the broker and `mina host` (policy.entry_for)."""
+    return hostpolicy.entry_for(config(), project)
 
 
 def policy_source(project):
@@ -258,7 +233,9 @@ def snippet(project, path, value):
     return f'In {CONFIG}, set projects["{project}"].{path} = {json.dumps(value)}'
 
 
-UNREGISTERED = 'Add "{project}" under "projects" in {config}, or make it a subfolder of a folder in "defaults.roots" (see docs/host-profile.md).'
+UNREGISTERED = ('Add "{project}" under "projects" in {config} (mina host apply), or make it a subfolder of a folder in '
+                '"defaults.roots" (see docs/host-profile.md). The agent can propose a registration with mina_host policy_propose; '
+                'the user approves it.')
 
 
 def require_class(project, cls, target=None, level=None):
@@ -268,20 +245,21 @@ def require_class(project, cls, target=None, level=None):
     if p is None:
         raise Refusal('REQUIRES_AUTHORIZATION', f'project {project} is not registered with the host broker',
                       remediation=UNREGISTERED.format(project=project, config=CONFIG))
-    have = (p.get('classes') or {}).get(cls, 'allow' if cls == 'observe' else 'deny')
+    have = (p.get('classes') or {}).get(cls, hostpolicy.default_level(cls))
     if level is not None:
         have = min(have, level, key=lambda x: LEVEL.get(x, 0))
     if LEVEL.get(have, 0) == 0:
-        class_ok = LEVEL.get((p.get('classes') or {}).get(cls, 'allow' if cls == 'observe' else 'deny'), 0) > 0
+        class_ok = LEVEL.get((p.get('classes') or {}).get(cls, hostpolicy.default_level(cls)), 0) > 0
         where = f'services.{target}.restart' if class_ok else f'classes.{cls}'
         raise Refusal('REQUIRES_AUTHORIZATION', f'the "{cls}" operation class is not approved{f" for {target}" if target else ""} on {project}',
                       remediation=snippet(project, where, 'allow') + ' (or "ask": the user confirms each operation).')
     return have
 
 
-def require_confirmation(project, cls, sess, req, prompt, target=None, level=None):
-    """Bind a one-shot confirmation to the actual request, session, project and policy. UI remains trusted."""
-    have = require_class(project, cls, target, level)
+def require_confirmation(project, cls, sess, req, prompt, target=None, level=None, always_ask=False):
+    """Bind a one-shot confirmation to the actual request, session, project and policy. UI remains trusted.
+    always_ask: the caller has decided the class level already, and the user confirms even at "allow" (policy)."""
+    have = 'ask' if always_ask else require_class(project, cls, target, level)
     policy = _policy.get()
     if policy is not None and not policy.get('admitted') and read_policy()['revision'] != policy['revision']:
         raise Refusal('BLOCKED', 'Host policy changed before admission; no mutation was started.')
@@ -374,7 +352,8 @@ def op_session_open(req, pid):
     budgets.open((project, sid))
     audit({'op': 'session_open', 'session': sid, 'project': project, 'launcher': pid})
     source = policy_source(project)
-    return {'grant': grant, 'session': sid, 'project': project, 'registered': source is not None, 'policy_source': source}
+    return {'grant': grant, 'session': sid, 'project': project, 'registered': source is not None, 'policy_source': source,
+            'policy_protocol': POLICY_PROTOCOL}
 
 
 # --- systemd ---------------------------------------------------------------------------------------------------------
@@ -778,8 +757,8 @@ def command_sandbox(project, sb):
     only the registered folders writable, and the registered read-only folders inside them bound back read-only (the
     campaign's lockout and run records). No network unless the workload's sandbox says "network": "open"."""
     network = sb.get('network', 'offline')
-    if network not in ('offline', 'open'):
-        raise Refusal('INVALID', f'workload sandbox network must be "offline" (the default) or "open", not {network!r}')
+    if hostpolicy.network_problem(network):
+        raise Refusal('INVALID', hostpolicy.network_problem(network))
     try:
         hidden = default_hidden() + user_hidden() + [os.path.expanduser(p) for p in BROKER_HIDDEN]
     except ConfigError as e:
@@ -817,8 +796,8 @@ def workload_argv(project, name, w, req):
     because the host side of a workload runs outside every sandbox and the agent can edit project files."""
     max_cap = w.get('max_s', 600)
     max_s = req.get('max_s', max_cap)
-    if type(max_cap) is not int or max_cap < 1:
-        raise Refusal('INVALID', f'workload "{name}" max_s must be a positive integer.')
+    if hostpolicy.max_s_problem(max_cap):
+        raise Refusal('INVALID', f'workload "{name}" {hostpolicy.max_s_problem(max_cap)}')
     if type(max_s) is not int or not 1 <= max_s <= max_cap:
         raise Refusal('INVALID', f'max_s must be 1..{max_cap} for workload "{name}"')
     params = dict(req.get('params') or {})
@@ -1017,8 +996,8 @@ def launch_workload(project, sess, req):
                       remediation=snippet(project, f'workloads.{name}', {'argv': ['<command>', '<args>'], 'resources': [], 'max_s': 600}))
     argv, max_s, params, command, env = workload_argv(project, name, w, req)
     queue_s = w.get('queue_s', 0)
-    if type(queue_s) is not int or queue_s < 0:
-        raise Refusal('INVALID', 'queue_s must be a nonnegative integer.')
+    if hostpolicy.queue_s_problem(queue_s):
+        raise Refusal('INVALID', hostpolicy.queue_s_problem(queue_s))
     check_workload_budget(project, sess, name, max_s + queue_s)
     names = list(w.get('resources', []))
     resources = check_resources(project, names) if names else {}
@@ -1542,7 +1521,13 @@ def capabilities(project, refresh=False):
     if p is None:
         cap('project', 'REQUIRES_AUTHORIZATION', f'{project} is not registered with the host broker', 'a project entry in host.json',
             UNREGISTERED.format(project=project, config=CONFIG))
-        result = {'project': project, 'broker': VERSION, 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP, 'checked_at': iso(), 'fingerprint': fp, 'policy_source': None, 'capabilities': caps}
+        # What an unregistered project can still do: see the machine, and ask the user to approve a registration.
+        cap('inventory', 'AVAILABLE', 'the GPUs of this machine, the resources that cover them, and their lock files (read-only)')
+        cap('policy_propose', 'REQUIRES_AUTHORIZATION', 'propose a registration of this project (or a new machine '
+            'resource); the user approves the exact change in a dialog, every time')
+        result = {'project': project, 'broker': VERSION, 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP,
+                  'policy_protocol': POLICY_PROTOCOL, 'registered': False, 'checked_at': iso(), 'fingerprint': fp,
+                  'policy_source': None, 'capabilities': caps}
         cap_cache[project] = (fp, result)
         return result
     classes = p.get('classes') or {}
@@ -1551,7 +1536,7 @@ def capabilities(project, refresh=False):
             'one project', 'a registration of this project', f'Register "{project}" under "projects" with its services.')
 
     def approval(cls):
-        lvl = classes.get(cls, 'allow' if cls == 'observe' else 'deny')
+        lvl = classes.get(cls, hostpolicy.default_level(cls))
         return lvl
 
     # Host observation: the registered log and sensor paths.
@@ -1660,12 +1645,21 @@ def capabilities(project, refresh=False):
         'host-side monitors evaluated by the broker every few seconds, independent of the Mina session; alarms are kept '
         'until a Mina session of this project acknowledges them', None if fresh else 'the broker\'s monitor loop is not running',
         None if fresh else 'systemctl --user restart mina-hostd' if lvl == 'allow' else snippet(project, 'classes.monitor', 'allow'))
+    # Policy changes: never pre-approved. "allow" counts as "ask".
+    if approval('policy') == 'deny':
+        cap('policy_propose', 'REQUIRES_AUTHORIZATION', 'policy proposals are turned off for this project',
+            'classes.policy is "deny"', snippet(project, 'classes.policy', 'ask') + ', or the owner uses mina host apply.')
+    else:
+        cap('policy_propose', 'REQUIRES_AUTHORIZATION', 'propose a change to this project\'s host policy (or a new machine '
+            'resource); the user approves the exact change in a dialog, every time')
     ext = config().get('alarm_command')
     cap('alarm_delivery_external', 'AVAILABLE' if ext else 'BLOCKED',
         f'command {ext[0]}' if ext else 'no external channel: with no live Mina session an alarm waits in the broker (and '
         'its journal) until one connects', None if ext else 'an alarm_command in host.json',
         None if ext else f'Set "alarm_command": ["<notifier>", ...] in {CONFIG}; it receives each alarm as JSON on stdin.')
-    result = {'project': project, 'broker': VERSION, 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP, 'checked_at': iso(), 'fingerprint': fp, 'policy_source': policy_source(project), 'capabilities': caps}
+    result = {'project': project, 'broker': VERSION, 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP,
+              'policy_protocol': POLICY_PROTOCOL, 'registered': True, 'checked_at': iso(), 'fingerprint': fp,
+              'policy_source': policy_source(project), 'capabilities': caps}
     cap_cache[project] = (fp, result)
     hostlib.write_json(os.path.join(STATE, 'capabilities', f'{tag(project)}.json'), result)
     return result
@@ -1694,7 +1688,7 @@ def op_capabilities(project, sess, req):
         name = cap['capability'].removeprefix('workload:')
         w = ((project_config(project) or {}).get('workloads') or {}).get(name, {})
         queue_s = w.get('queue_s', 0)
-        if type(queue_s) is not int or queue_s < 0:
+        if hostpolicy.queue_s_problem(queue_s):
             cap.update(status='BLOCKED', remediation='The operator corrects queue_s to a nonnegative integer.')
             continue
         try:
@@ -1703,6 +1697,99 @@ def op_capabilities(project, sess, req):
             cap.update(status=e.code if e.code == 'REQUIRES_AUTHORIZATION' else 'BLOCKED',
                        remediation=e.message, budget_limited=True)
     return result
+
+
+# --- policy changes --------------------------------------------------------------------------------------------------
+
+PROMPT_MAX_CHARS = 4000     # the dialog shows the whole prompt (Pi wraps it and does not cut it); keep it readable
+PROMPT_MAX_DIFF_LINES = 60
+SPLIT = ('Split the change into smaller proposals, or write the change list to a file in the project (for example '
+         '.mina/host-change.json) and ask the owner to run `mina host apply .mina/host-change.json` in a terminal.')
+
+
+def op_inventory(project, sess, req):
+    """The machine as an agent may see it, read-only: GPU names and bus IDs and which resources cover them; the lock
+    files of the machine resources and of this project's effective resources, with their holders (pid, argv[0..1]);
+    and the lockouts of those resources. Other projects' resources are not shown."""
+    return {'project': project, 'registered': project_config(project) is not None,
+            **hostpolicy.inventory(config(), project=project)}
+
+
+def policy_prompt(project, reason, notes, fl, diff_text):
+    head = (f'Change the host policy ({CONFIG}) for the Mina session of {project}?\n'
+            'Mina\'s host broker computed this diff from the request. If you approve, it writes exactly this change.')
+    parts = [head, f'The agent\'s reason (the agent\'s words, not examined):\n  {hostpolicy.safe_text(reason)}']
+    if notes:
+        parts.append('Notes:\n' + '\n'.join(f'  - {n}' for n in notes))
+    parts.append(('Risk flags:\n' + '\n'.join(f'  ! {f}' for f in fl)) if fl else 'Risk flags: none')
+    parts.append('Diff:\n' + diff_text.rstrip('\n'))
+    return '\n\n'.join(parts)
+
+
+@with_policy
+def op_policy_propose(project, sess, req):
+    """A change to host.json that the agent proposes. The broker applies it to a copy, validates the whole result,
+    computes the diff and the risk flags itself (it never uses model text for them), and asks the user in the bound
+    confirmation dialog, always: "allow" counts as "ask". Only after approval, and only if host.json is still the file of
+    the proposal, it writes the change (policy.write: backup, atomic replacement)."""
+    if set(req) - {'op', 'grant', 'changes', 'reason', 'approval'}:
+        raise Refusal('INVALID', 'policy_propose accepts only changes and reason')
+    changes, reason = req.get('changes'), req.get('reason')
+    if not isinstance(changes, list) or not changes or len(changes) > 20 or not all(isinstance(c, dict) for c in changes):
+        raise Refusal('INVALID', 'changes must be a list of 1-20 change objects (see docs/host-profile.md, "Change the host policy")')
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+        raise Refusal('INVALID', 'reason must be a nonempty string of at most 500 characters: why this project needs the change')
+    snapshot = _policy.get()
+    cfg = config()
+    if 'invalid' in cfg and len(cfg) == 1:
+        raise Refusal('BLOCKED', f'{CONFIG} is not valid JSON, so no change can be proposed', remediation='The owner corrects it: mina host edit.')
+    entry, _source = policy_entry(project)
+    if hostpolicy.level_of(entry, 'policy') == 'deny':
+        raise Refusal('REQUIRES_AUTHORIZATION', f'policy proposals are turned off for {project} (classes.policy is "deny")',
+                      remediation=snippet(project, 'classes.policy', 'ask') + ', or the owner makes the change with mina host apply.')
+    refused = hostpolicy.agent_refusals(cfg, changes, project)
+    if refused:
+        raise Refusal('REQUIRES_AUTHORIZATION', 'the agent may not propose this change: ' + ' | '.join(refused), refused=refused,
+                      remediation='Propose only changes to this project, or a new machine resource. For anything else, '
+                      'write the change list to a file in the project and ask the owner to run `mina host apply FILE`.')
+    try:
+        new, notes = hostpolicy.apply_changes(cfg, changes, project)
+    except hostpolicy.PolicyError as e:
+        raise Refusal('INVALID', str(e)) from e
+    errors = hostpolicy.validate(new)
+    if errors:
+        before = set(hostpolicy.validate(cfg))
+        raise Refusal('INVALID', 'the policy after this change has errors; nothing was proposed', errors=[e for e in errors if e not in before],
+                      errors_already_in_host_json=[e for e in errors if e in before],
+                      remediation='Correct the change. Errors that are already in host.json: the owner corrects them (mina host edit).')
+    if hostpolicy.same(cfg, new):
+        raise Refusal('INVALID', 'this change does not change the host policy')
+    diff_text = hostpolicy.diff(cfg, new)
+    fl = hostpolicy.flags(cfg, new)
+    prompt = policy_prompt(project, reason, notes, fl, diff_text)
+    diff_lines = diff_text.count('\n')
+    if diff_lines > PROMPT_MAX_DIFF_LINES or len(prompt) > PROMPT_MAX_CHARS:
+        raise Refusal('INVALID', f'this change is too large for one confirmation dialog ({diff_lines} diff lines, '
+                      f'{len(prompt)} characters; the limits are {PROMPT_MAX_DIFF_LINES} lines and {PROMPT_MAX_CHARS} characters)',
+                      remediation=SPLIT)
+    require_confirmation(project, 'policy', sess, req, prompt, always_ask=True)
+    diff_sha = hashlib.sha256(diff_text.encode()).hexdigest()
+    try:
+        # Only onto the file of the proposal: a change made meanwhile (by the owner, or another approval) refuses this one.
+        written = hostpolicy.write(CONFIG, new, snapshot['sha256'] if snapshot else None)
+    except hostpolicy.PolicyConflict as e:
+        raise Refusal('CONFLICT', f'host.json changed after this proposal; nothing was written ({e})',
+                      remediation='Look at the new policy (mina_host capabilities) and propose the change again if it is still necessary.') from e
+    except (hostpolicy.PolicyError, OSError) as e:
+        raise Refusal('FAILED', f'the change was approved but not written: {e}') from e
+    cap_cache.clear()   # the next capabilities answer reads the new policy (a machine resource can change other projects)
+    audit({'op': 'policy_change', 'via': 'policy_propose', 'project': project, 'session': sess,
+           'kinds': [c['kind'] for c in changes], 'sha_before': written['sha_before'], 'sha_after': written['sha_after'],
+           'flags': fl, 'backup': written['backup'], 'diff_sha256': diff_sha, 'diff_lines': diff_lines,
+           'approval': public_confirmation(req.get('approval'))})
+    return {'written': True, 'policy_revision': read_policy()['revision'], 'sha256': written['sha_after'],
+            'diff_sha256': diff_sha, 'flags': fl, 'notes': notes,
+            'next': 'The broker uses the new policy for the next request: call mina_host capabilities.'}
 
 
 # --- the loop --------------------------------------------------------------------------------------------------------
@@ -1754,10 +1841,12 @@ OPS = {'capabilities': ('observe', op_capabilities), 'service_status': ('observe
        'workload_budget': ('observe', op_workload_budget), 'workload_output': ('observe', op_workload_output),
        'workload_stop': ('workload', op_workload_stop), 'monitor_add': ('monitor', op_monitor_add),
        'monitor_list': ('observe', op_monitor_list), 'monitor_remove': ('monitor', op_monitor_remove),
-       'alarms': ('observe', op_alarms)}
+       'alarms': ('observe', op_alarms), 'inventory': ('observe', op_inventory),
+       'policy_propose': ('policy', op_policy_propose)}
 REQUEST_PROTOCOL = 'mina-workload-request-v1'
 _request = threading.local()   # the project of the request in this handler thread, for its audit record
 MUTATIONS = frozenset(op for op, (cls, _fn) in OPS.items() if cls != 'observe')
+UNREGISTERED_OPS = ('capabilities', 'inventory', 'policy_propose')
 
 
 @with_policy
@@ -1777,7 +1866,8 @@ def handle(req, pid, uid):
         req = {**args, 'op': action, 'grant': req.get('grant')}
         op = action
     if op == 'ping':
-        return {'broker': VERSION, 'pid': os.getpid(), 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP}
+        return {'broker': VERSION, 'pid': os.getpid(), 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP,
+                'policy_protocol': POLICY_PROTOCOL}
     if op == 'session_open':
         return op_session_open(req, pid)
     if op not in OPS:
@@ -1792,7 +1882,8 @@ def handle(req, pid, uid):
     _request.project = project
     cls, fn = OPS[op]
     # Class admission here; mutation handlers also enforce per-operation ask, including service restart policy.
-    if not (op == 'capabilities' and project_config(project) is None):   # an unregistered project still learns what it lacks
+    # An unregistered project still learns what it lacks, sees the machine, and can propose its registration (always ask).
+    if not (op in UNREGISTERED_OPS and project_config(project) is None) and op != 'policy_propose':
         require_class(project, cls)
     return fn(project, sess, req)
 

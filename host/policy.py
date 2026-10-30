@@ -846,6 +846,41 @@ def _lost(old_r, new_r):
     return lost
 
 
+def _locks(r):
+    out = []
+    for lk in _obj(r).get('locks') if isinstance(_obj(r).get('locks'), list) else []:
+        if isinstance(lk, dict):
+            out += [lk.get(k) for k in ('path', 'turnstile') if isinstance(lk.get(k), str)]
+    return out
+
+
+def _shadow_loss(machine_r, project_r):
+    """What a project resource drops of the machine resource of the same name that it replaces for that project:
+    the machine's locks (and turnstiles), lockouts, requires_active and device checks the project then no longer uses."""
+    m, r = _obj(machine_r), _obj(project_r)
+    lost = []
+    locks = [x for x in _locks(m) if x not in _locks(r)]
+    if locks:
+        lost.append(f'locks {q(locks)}')
+    for k in ('lockouts', 'requires_active'):
+        was, now = m.get(k), r.get(k)
+        gone = [x for x in (was if isinstance(was, list) else []) if x not in (now if isinstance(now, list) else [])]
+        if gone:
+            lost.append(f'{k} {q(gone)}')
+    dev_m, dev_r = _obj(m.get('device')), _obj(r.get('device'))
+    gone = {k: v for k, v in sorted(dev_m.items()) if not same(dev_r.get(k), v)}
+    if gone:
+        lost.append(f'device checks {q(gone)}')
+    return lost
+
+
+def _shadows(cfg, entry):
+    """{name: what the project resource drops of the machine resource it replaces} for one effective entry."""
+    machine = machine_resources(cfg)
+    own = _obj(_obj(entry).get('resources'))
+    return {name: _shadow_loss(machine[name], r) for name, r in own.items() if name in machine}
+
+
 def flags(old, new):
     """Risk flags for the dialog and the terminal, from the new effective policy compared to the old."""
     old, new = (old if isinstance(old, dict) else {}), (new if isinstance(new, dict) else {})
@@ -898,11 +933,18 @@ def flags(old, new):
                 continue
             if level_of(ne, cls) == 'allow' and level_of(oe, cls) != 'allow':
                 out.append(f'class {q(cls)} becomes "allow" in {label}: no dialog for these operations')
-        # Lockouts and supervisors of the project's own resources (machine ones are flagged above).
+        # A project resource that replaces (shadows) the machine resource of the same name, for this project only.
+        old_shadows = _shadows(old, oe) if isinstance(oe, dict) else {}
+        for name, lost in sorted(_shadows(new, ne).items()):
+            if name in old_shadows and old_shadows[name] == lost:
+                continue
+            out.append(f'resource {q(name)} of {label} replaces the machine resource {q(name)} for this project'
+                       + (f'; the project no longer uses its {", ".join(lost)}' if lost else ' (with the same locks, lockouts and checks)'))
+        # Lockouts and supervisors of the project's own resources (machine ones are flagged above; shadowing just above).
         ors, nrs = effective_resources(old, oe), effective_resources(new, ne)
         osources, nsources = resource_sources(old, oe, osrc), resource_sources(new, ne, nsrc)
         for name in sorted(ors):
-            if osources.get(name) == 'machine' and nsources.get(name, 'machine') == 'machine':
+            if osources.get(name) == 'machine' and nsources.get(name, 'machine') in ('machine', 'project'):
                 continue
             if name not in nrs:
                 lost = _lost(ors[name], {})
@@ -962,6 +1004,8 @@ def write(path, new_cfg, expected_sha, now=None):
     <name>.bak-<UTC time> (0600); the 10 newest backups are kept. The new file is 0600. Returns {sha_before,
     sha_after, backup}."""
     path = os.path.realpath(os.path.expanduser(path))
+    if expected_sha is None and isinstance(new_cfg, dict) and 'version' not in new_cfg:
+        new_cfg = {'version': 1, **new_cfg}     # a new host.json starts from {"version": 1}
     errors = validate(new_cfg)
     if errors:
         raise PolicyError('the new policy has errors: ' + '; '.join(errors))
@@ -1019,8 +1063,11 @@ def write(path, new_cfg, expected_sha, now=None):
     return {'sha_before': have, 'sha_after': hashlib.sha256(data).hexdigest(), 'backup': backup}
 
 
+NEW_POLICY = {'version': 1}
+
+
 def read(path):
-    """(policy, sha256) of the file; ({}, None) if it does not exist. Raises PolicyError if it is not a JSON object."""
+    """(policy, sha256) of the file; ({}, None) if it does not exist (start a new one from NEW_POLICY). Raises PolicyError if it is not a JSON object."""
     try:
         with open(path, 'rb') as f:
             raw = f.read()
@@ -1351,13 +1398,17 @@ def cmd_apply(args):
     path = config_path()
     try:
         cfg, sha = read(path)
+        if sha is None:
+            cfg = dict(NEW_POLICY)      # a new host.json starts from {"version": 1}
         changes = _load_changes(args.file)
         project = canonical_project(os.path.abspath(args.project)) if args.project else project_root(os.getcwd())
         new, notes = apply_changes(cfg, changes, project)
     except PolicyError as e:
         _say(f'Refused: {e}')
         return 1
-    _text, fl, errors = _show_change(cfg, new, notes)
+    if sha is None:
+        notes = [f'{path} does not exist yet: this change creates it.', *notes]
+    _text, fl, errors = _show_change(cfg if sha is not None else {}, new, notes)
     if errors:
         _say('Refused: the new policy has errors. Nothing was written.')
         return 1
@@ -1380,7 +1431,9 @@ def cmd_edit(args):
     except PolicyError as e:
         _say(f'Refused: {e} Correct the file, then run `mina host edit` again.')
         return 1
-    start = cfg if sha is not None else {'version': 1, 'resources': {}, 'projects': {}}
+    if sha is None:
+        cfg = dict(NEW_POLICY)
+    start = cfg if sha is not None else {**NEW_POLICY, 'resources': {}, 'projects': {}}
     editor = os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi'
     tmpdir = tempfile.mkdtemp(prefix='mina-host-edit-')
     copy_path = os.path.join(tmpdir, 'host.json')

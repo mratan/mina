@@ -312,11 +312,25 @@ class FlagsTest(Tmp):
         self.assertEqual(self.flags([{'kind': 'monitor_paths_set', 'project': f'{self.tmp}/p1', 'paths': ['/var/log']}]), [])
         self.assertEqual(self.flags([{'kind': 'resource_set', 'scope': 'machine', 'name': 'NEW', 'resource': {'locks': []}}]), [])
 
-    def test_a_project_override_that_drops_a_machine_lockout_is_flagged(self):
+    def test_a_project_resource_that_shadows_a_machine_resource_names_what_it_drops(self):
         q = f'{self.tmp}/work/q'
         fl = self.one([{'kind': 'resource_set', 'scope': 'project', 'project': q, 'name': 'GPU_A',
-                        'resource': {'locks': self.cfg['resources']['GPU_A']['locks']}}], rf'resource "GPU_A" of project "{q}" loses lockouts')
-        self.assertFalse([f for f in fl if f.startswith('machine resource')])
+                        'resource': {'locks': [lock(f'{self.tmp}/locks/GPU_A.lock')], 'requires_active': ['x.service']}}],
+                      rf'resource "GPU_A" of project "{q}" replaces the machine resource "GPU_A" for this project; '
+                      rf'the project no longer uses its locks \["{self.tmp}/locks/GPU_A.turn"\], '
+                      rf'lockouts \["{self.tmp}/lockout-A"\], device checks \{{"nvidia": \["00000000:01:00.0"\]\}}$')
+        self.assertFalse([f for f in fl if f.startswith('machine resource')], 'the machine resource does not change')
+        self.assertEqual(len([f for f in fl if 'GPU_A' in f]), 1, fl)
+        same_copy = self.flags([{'kind': 'resource_set', 'scope': 'project', 'project': q, 'name': 'GPU_A',
+                                 'resource': self.cfg['resources']['GPU_A']}])
+        self.assertEqual(same_copy, [f'resource "GPU_A" of project "{q}" replaces the machine resource "GPU_A" for this project '
+                                     '(with the same locks, lockouts and checks)'])
+        # A shadow that exists already is not flagged again when something else changes ...
+        self.assertEqual(self.flags([{'kind': 'monitor_paths_set', 'project': f'{self.tmp}/p1', 'paths': ['/var/log']}]), [])
+        # ... but it is when the machine resource gets a lockout that the project does not use.
+        m = {**self.cfg['resources']['GPU_A'], 'lockouts': [f'{self.tmp}/lockout-A', f'{self.tmp}/lockout-new']}
+        self.one([{'kind': 'resource_set', 'scope': 'machine', 'name': 'GPU_A', 'resource': m}],
+                 rf'resource "GPU_A" of project "{self.tmp}/p1" replaces .* lockouts \["{self.tmp}/lockout-new"\]')
 
 
 class DiffTest(Tmp):
@@ -399,6 +413,25 @@ class WriteTest(Tmp):
         with self.assertRaises(P.PolicyConflict):
             P.write(self.path, self.cfg, stale)                                 # it was removed meanwhile
         self.assertFalse(os.path.exists(self.path))
+
+    def test_a_new_file_starts_from_version_1(self):
+        out = P.write(self.path, {'projects': {}}, None)
+        self.assertEqual(P.read(self.path)[0], {'version': 1, 'projects': {}})
+        self.assertEqual(out['sha_after'], P.sha256_of(self.path))
+        self.assertEqual(P.check(P.read(self.path)[0]), ([], []))
+        with self.assertRaises(P.PolicyConflict):
+            P.write(self.path, {'projects': {}}, None)
+
+    def test_apply_creates_a_new_file_with_version_1(self):
+        change = os.path.join(self.tmp, 'change.json')
+        put_text(change, json.dumps([{'kind': 'project_register', 'project': f'{self.tmp}/p1', 'entry': {'classes': {}}}]))
+        env = {**os.environ, 'MINA_HOST_CONFIG': self.path, 'MINA_HOST_STATE': os.path.join(self.tmp, 'state')}
+        r = subprocess.run([sys.executable, '-I', os.path.join(HERE, 'policy.py'), 'apply', change, '--yes'],
+                           env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn('warning', r.stdout)
+        self.assertEqual(P.read(self.path)[0], {'version': 1, 'projects': {f'{self.tmp}/p1': {'classes': {}}}})
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
 
     def test_an_invalid_policy_is_never_written(self):
         with self.assertRaisesRegex(P.PolicyError, 'version'):
@@ -692,6 +725,14 @@ class ProposeTest(unittest.TestCase):
         self.assertNotIn('\x1b', prompt)
         self.assertNotIn('‮', prompt)
         self.assertEqual(prompt.count('\nRisk flags'), 1, 'the reason stays on its own line')
+
+    def test_without_host_json_an_approved_registration_creates_it_with_version_1(self):
+        os.unlink(self.config)
+        change = [{'kind': 'project_register', 'entry': {'classes': {}}}]
+        e = self.propose(change)
+        self.assertIn('+ "version": 1', e.detail['approval_prompt'])
+        self.approve(change, e)
+        self.assertEqual(P.read(self.config)[0], {'version': 1, 'projects': {self.project: {'classes': {}}}})
 
     def test_a_defaults_project_is_registered_first(self):
         cfg = {**self.cfg, 'defaults': {'roots': [os.path.join(self.tmp, 'work')], 'classes': {'workload': 'ask'},

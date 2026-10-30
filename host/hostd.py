@@ -1741,6 +1741,9 @@ def op_policy_propose(project, sess, req):
         raise Refusal('INVALID', 'reason must be a nonempty string of at most 500 characters: why this project needs the change')
     snapshot = _policy.get()
     cfg = config()
+    shown = cfg                             # what the diff and the flags compare with: the file as it is
+    if not (snapshot and snapshot['sha256']):
+        cfg, shown = dict(hostpolicy.NEW_POLICY), {}   # no host.json yet: a new one starts from {"version": 1}
     if 'invalid' in cfg and len(cfg) == 1:
         raise Refusal('BLOCKED', f'{CONFIG} is not valid JSON, so no change can be proposed', remediation='The owner corrects it: mina host edit.')
     entry, _source = policy_entry(project)
@@ -1754,6 +1757,8 @@ def op_policy_propose(project, sess, req):
                       'write the change list to a file in the project and ask the owner to run `mina host apply FILE`.')
     try:
         new, notes = hostpolicy.apply_changes(cfg, changes, project)
+        if shown is not cfg:
+            notes = [f'{CONFIG} does not exist yet: this change creates it.', *notes]
     except hostpolicy.PolicyError as e:
         raise Refusal('INVALID', str(e)) from e
     errors = hostpolicy.validate(new)
@@ -1764,8 +1769,8 @@ def op_policy_propose(project, sess, req):
                       remediation='Correct the change. Errors that are already in host.json: the owner corrects them (mina host edit).')
     if hostpolicy.same(cfg, new):
         raise Refusal('INVALID', 'this change does not change the host policy')
-    diff_text = hostpolicy.diff(cfg, new)
-    fl = hostpolicy.flags(cfg, new)
+    diff_text = hostpolicy.diff(shown, new)
+    fl = hostpolicy.flags(shown, new)
     prompt = policy_prompt(project, reason, notes, fl, diff_text)
     diff_lines = diff_text.count('\n')
     if diff_lines > PROMPT_MAX_DIFF_LINES or len(prompt) > PROMPT_MAX_CHARS:

@@ -2002,7 +2002,11 @@ class DefaultsBrokerTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(next(line for line in r.stdout.splitlines() if line.startswith('FIXTURE '))[8:])
         self.assertTrue(out[self.proj] and out[self.proj]['grantFile'], out)
-        self.assertIsNone(out[self.outside], 'an unregistered project outside the roots gets no host session')
+        # A project outside the roots is not registered. This broker supports proposals (mina-policy-v1), so the launcher
+        # opens a limited session: the agent sees the machine and can propose a registration, nothing else.
+        # (Its limited capabilities: host/test_policy.py BrokerPolicyTest. An older broker: test/host.test.mjs.)
+        outside = out[self.outside]
+        self.assertTrue(outside and outside['grantFile'] and outside['session'] != out[self.proj]['session'], out)
 
 
 class WorkloadSandboxPolicyTest(unittest.TestCase):

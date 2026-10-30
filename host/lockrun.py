@@ -66,7 +66,8 @@ env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': os.environ.get('HOME', '/
 with open(spec['log'], 'ab') as log:
     child = subprocess.Popen(spec['argv'], cwd=spec['cwd'], env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                              pass_fds=fds, start_new_session=False)
-write('running', leader=hostlib.identity(child.pid), locks=[e['path'] for e in spec['locks']], started=time.time())
+write('running', leader=hostlib.identity(child.pid), locks=[e['path'] for e in spec['locks']],
+      shared_locks=[e['path'] for e in spec['locks'] if hostlib.lock_mode(e) == 'shared'], started=time.time())
 rc = child.wait()
 # What the leader left behind: systemd kills these when this process exits; the broker verifies they are gone.
 try:

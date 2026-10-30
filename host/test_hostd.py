@@ -1705,6 +1705,134 @@ class MachineResourceTest(unittest.TestCase):
         self.assertEqual(caps['resource:GPU']['source'], 'machine')
 
 
+def shared_free(path):
+    return subprocess.run(['flock', '-n', '-s', path, 'true']).returncode == 0
+
+
+class LockEntriesTest(unittest.TestCase):
+    """Lock modes and their de-duplication, with temporary lock files in this process."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='mina-locks-test-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_mixed_modes_on_one_path_dedupe_to_exclusive_in_the_first_position(self):
+        q, g = f'{self.tmp}/QUIET.lock', f'{self.tmp}/GPU.lock'
+        resources = {'BUILD': {'locks': [{'path': q, 'mode': 'shared'}]},
+                     'GPU': {'locks': [{'path': g}, {'path': q, 'turnstile': f'{self.tmp}/TURN.lock'}]}}
+        out = hostlib.lock_entries(resources, ['BUILD', 'GPU'])
+        self.assertEqual([e['path'] for e in out], [q, g])
+        self.assertEqual(out[0]['mode'], 'exclusive')
+        self.assertEqual(out[0]['turnstile'], f'{self.tmp}/TURN.lock')
+        self.assertEqual(resources['BUILD']['locks'][0]['mode'], 'shared', 'the registry itself is not changed')
+        self.assertEqual(hostlib.lock_entries(resources, ['BUILD'])[0]['mode'], 'shared')
+        self.assertEqual(hostlib.lock_mode(hostlib.lock_entries(resources, ['GPU', 'BUILD'])[1]), 'exclusive')
+        with self.assertRaises(ValueError):
+            hostlib.lock_mode({'path': q, 'mode': 'read'})
+
+    def test_shared_holders_overlap_and_exclude_an_exclusive_taker(self):
+        q, turn = f'{self.tmp}/QUIET.lock', f'{self.tmp}/TURN.lock'
+        shared = [{'path': q, 'turnstile': turn, 'mode': 'shared'}]
+        a, b = hostlib.acquire(shared), hostlib.acquire(shared)
+        try:
+            self.assertTrue(shared_free(q))
+            self.assertFalse(free(q))
+            self.assertTrue(free(turn), 'a shared taker passes through the turnstile')
+            with self.assertRaises(hostlib.LockConflict):
+                hostlib.acquire([{'path': q, 'turnstile': turn}])
+            t0 = time.monotonic()
+            with self.assertRaises(hostlib.LockConflict) as cm:
+                hostlib.acquire([{'path': q, 'turnstile': turn}], wait_s=0.5)
+            self.assertGreaterEqual(time.monotonic() - t0, 0.45)
+            self.assertIn('queue_s', cm.exception.evidence['why'])
+            self.assertTrue(free(turn), 'the waiter released the turnstile at its deadline')
+        finally:
+            for fd in a + b:
+                os.close(fd)
+        fds = hostlib.acquire([{'path': q, 'turnstile': turn}], wait_s=0.5)
+        self.assertFalse(shared_free(q))
+        for fd in fds:
+            os.close(fd)
+
+    def test_a_held_turnstile_stops_a_shared_taker(self):
+        q, turn = f'{self.tmp}/QUIET.lock', f'{self.tmp}/TURN.lock'
+        open(turn, 'w').close()
+        holder = flock_holder(turn)
+        try:
+            with self.assertRaises(hostlib.LockConflict) as cm:
+                hostlib.acquire([{'path': q, 'turnstile': turn, 'mode': 'shared'}])
+            self.assertEqual(cm.exception.evidence['lock'], turn)
+            self.assertTrue(free(q))
+        finally:
+            holder.kill(); holder.wait()
+
+
+@unittest.skipUnless(SYSTEMD_USER, NEEDS_SYSTEMD)
+class SharedLockBrokerTest(unittest.TestCase):
+    """A BUILD resource holds the host-quiet lock shared; a timed measurement holds it exclusively."""
+
+    def setUp(self):
+        self.b = b = Broker()
+        self.addCleanup(b.cleanup)
+        self.quiet, self.turn = f'{b.locks}/HOST_QUIET.lock', f'{b.locks}/HOST_QUIET.turn'
+        self.ran = os.path.join(b.tmp, 'measured')
+        b.config({'classes': {'observe': 'allow', 'reserve': 'allow', 'workload': 'allow'},
+                  'workloads': {
+                      'build': {'argv': ['sleep', '300'], 'resources': ['BUILD'], 'max_s': 300},
+                      'build-now': {'argv': ['true'], 'resources': ['BUILD'], 'max_s': 30},
+                      'measure': {'argv': ['touch', self.ran], 'resources': ['MEASURE'], 'max_s': 30, 'queue_s': 60}}},
+                 resources={'BUILD': {'locks': [{'path': self.quiet, 'turnstile': self.turn, 'mode': 'shared'}]},
+                            'MEASURE': {'locks': [{'path': self.quiet, 'turnstile': self.turn}]},
+                            'BAD': {'locks': [{'path': self.quiet, 'mode': 'read'}]}})
+        b.start()
+        self.grant = b.open_session()
+
+    def ok(self, op, **kw):
+        out = self.b.raw({'op': op, 'grant': self.grant, **kw})
+        self.assertTrue(out['ok'], out)
+        return out['result']
+
+    def state(self, wid):
+        return self.ok('workload_status', id=wid)['state']
+
+    def test_builds_overlap_and_a_measurement_waits_for_both(self):
+        b1, b2 = self.ok('workload_run', workload='build'), self.ok('workload_run', workload='build')
+        self.assertTrue(wait_for(lambda: self.state(b1['id']) == 'running' and self.state(b2['id']) == 'running'))
+        self.assertTrue(shared_free(self.quiet))
+        m = self.ok('workload_run', workload='measure')
+        q = wait_for(lambda: (lambda s: s if s['state'] == 'queued' else None)(self.ok('workload_status', id=m['id'])))
+        self.assertTrue(q)
+        readers = [h for h in q['waiting_for']['holders'] if h['mode'] == 'READ' and not h['waiting']]
+        self.assertEqual(len(readers), 2, q['waiting_for'])
+        self.assertFalse(free(self.turn), 'the measurement holds its place in the queue')
+        late = self.ok('workload_run', workload='build-now')     # a new build cannot pass the queued measurement
+        late_end = wait_for(lambda: (lambda s: s if s['state'] == 'conflict' else None)(self.ok('workload_status', id=late['id'])))
+        self.assertEqual(late_end['result']['evidence']['lock'], self.turn)
+        self.ok('workload_stop', id=b1['id'])
+        time.sleep(1)
+        self.assertEqual(self.state(m['id']), 'queued', 'one shared holder is left')
+        self.ok('workload_stop', id=b2['id'])
+        self.assertTrue(wait_for(lambda: self.state(m['id']) == 'exited'))
+        self.assertTrue(os.path.exists(self.ran))
+        self.assertTrue(free(self.quiet) and free(self.turn))
+
+    def test_reserve_modes_and_an_invalid_mode(self):
+        r = self.ok('reserve', resources=['BUILD'], ttl_s=30)
+        self.assertEqual((r['exclusive'], r['shared_locks']), (False, [self.quiet]))
+        self.assertTrue(shared_free(self.quiet))
+        self.assertFalse(free(self.quiet))
+        self.ok('release', reservation=r['reservation'])
+        r = self.ok('reserve', resources=['BUILD', 'MEASURE'], ttl_s=30)   # one path, both modes: exclusive
+        self.assertEqual((r['exclusive'], r['shared_locks'], r['locks']), (True, [], [self.quiet]))
+        self.assertFalse(shared_free(self.quiet))
+        self.ok('release', reservation=r['reservation'])
+        self.assertEqual(self.b.raw({'op': 'reserve', 'grant': self.grant, 'resources': ['BAD']})['error']['code'], 'INVALID')
+        caps = {c['capability']: c for c in self.ok('capabilities', refresh=True)['capabilities']}
+        self.assertIn('(shared)', caps['resource:BUILD']['detail'])
+        self.assertEqual(caps['resource:BAD']['status'], 'BLOCKED')
+        self.assertTrue(free(self.quiet))
+
+
 class DefaultsResolutionTest(unittest.TestCase):
     """Which folders get the defaults, without a broker. HOME and the policy file are temporary."""
 

@@ -187,9 +187,23 @@ def _flock(fd, op, deadline):
         raise BlockingIOError('still held at the deadline')
 
 
+MODES = ('exclusive', 'shared')
+
+
+def lock_mode(e):
+    """The mode of a lock entry: "exclusive" (the default) or "shared". Anything else is a ValueError."""
+    mode = e.get('mode', 'exclusive')
+    if mode not in MODES:
+        raise ValueError(f'lock {e.get("path")}: mode must be "exclusive" or "shared", not {mode!r}')
+    return mode
+
+
 def acquire(entries, wait_s=0, on_wait=None):
-    """Take each lock exclusively, in order. An entry is {path, turnstile?}: a turnstile is the file that a waiting
-    campaign runner holds while it queues for the lock (for example an MTURN or TURNSTILE file).
+    """Take each lock, in order. An entry is {path, turnstile?, mode?}: a turnstile is the file that a waiting
+    campaign runner holds while it queues for the lock (for example an MTURN or TURNSTILE file). An exclusive entry is
+    taken with LOCK_EX. A shared entry is taken with LOCK_SH, after it passes through the turnstile: it takes the
+    turnstile exclusively and releases it at once. So shared holders can overlap each other, but a new shared taker
+    cannot pass an exclusive waiter that holds the turnstile.
 
     wait_s 0 (the broker, and a workload without queue_s): no wait. A held turnstile means someone is queued ahead, so it
     is a conflict too: the broker never jumps a queue.
@@ -218,15 +232,20 @@ def acquire(entries, wait_s=0, on_wait=None):
 
     try:
         for e in entries:
+            shared = lock_mode(e) == 'shared'
             os.makedirs(os.path.dirname(e['path']), exist_ok=True)
             turn = None
             try:
                 if e.get('turnstile'):
                     turn = os.open(e['turnstile'], os.O_RDWR | os.O_CREAT, 0o664)
                     take(turn, e['turnstile'], fcntl.LOCK_EX, 'a campaign runner is queued for this lock')
+                    if shared:   # pass through: the turnstile only orders shared takers behind queued exclusive ones
+                        os.close(turn)
+                        turn = None
                 fd = os.open(e['path'], os.O_RDWR | os.O_CREAT, 0o664)
                 try:
-                    take(fd, e['path'], fcntl.LOCK_EX, 'held by another process')
+                    take(fd, e['path'], fcntl.LOCK_SH if shared else fcntl.LOCK_EX,
+                         'held exclusively by another process' if shared else 'held by another process')
                 except BaseException:
                     os.close(fd)
                     raise
@@ -242,14 +261,21 @@ def acquire(entries, wait_s=0, on_wait=None):
 
 
 def lock_entries(resources, names):
-    """The ordered, de-duplicated lock list for some registered resources (a lock shared by two resources is taken once,
-    where it first appears)."""
-    out, seen = [], set()
+    """The ordered, de-duplicated lock list for some registered resources. A lock path in two resources is taken once,
+    where it first appears. If the resources ask for it in different modes, exclusive wins (the stronger hold covers
+    both); a turnstile of a later entry is kept when the first entry has none."""
+    out, index = [], {}
     for n in names:
         for e in resources[n].get('locks', []):
-            if e['path'] not in seen:
-                seen.add(e['path'])
-                out.append(e)
+            i = index.get(e['path'])
+            if i is None:
+                index[e['path']] = len(out)
+                out.append(dict(e))
+                continue
+            if lock_mode(e) == 'exclusive':
+                out[i]['mode'] = 'exclusive'
+            if e.get('turnstile') and not out[i].get('turnstile'):
+                out[i]['turnstile'] = e['turnstile']
     return out
 
 

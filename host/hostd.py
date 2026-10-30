@@ -539,7 +539,8 @@ def restart_verified(project, sess, name, s, req):
     old = hostlib.identity(num(before.get('MainPID'))) if num(before.get('MainPID')) else None
     # The service's resources stay reserved during the restart: no measurement runs while its supervisor is down.
     try:
-        fds = hostlib.acquire(hostlib.lock_entries(resources, idle))
+        # Exclusive even for a shared lock entry: idle means that nothing holds it, also not a shared holder.
+        fds = hostlib.acquire([{**e, 'mode': 'exclusive'} for e in hostlib.lock_entries(resources, idle)])
     except hostlib.LockConflict as e:
         raise Refusal('CONFLICT', f'{name} cannot restart now: its resources are in use', evidence=e.evidence)
     try:
@@ -626,6 +627,12 @@ def check_resources(project, names):
     if unknown or not names:
         raise Refusal('REQUIRES_AUTHORIZATION', f'resources {unknown or names} are not registered for {project} '
                       f'(registered: {sorted(resources) or "none"})', remediation=snippet(project, f'resources.{(unknown or ["NAME"])[0]}', {'locks': [{'path': '<the lock file the host runner uses>'}]}))
+    try:
+        for n in names:
+            for e in resources[n].get('locks', []):
+                hostlib.lock_mode(e)
+    except ValueError as e:
+        raise Refusal('INVALID', f'resource {n}: {e}') from e
     return resources
 
 
@@ -642,9 +649,11 @@ def op_reserve(project, sess, req):
         raise Refusal('BLOCKED' if any(p['kind'] in ('lockout', 'supervisor', 'device_unknown') for p in problems) else 'CONFLICT',
                       'the resources may not be used now', problems=problems)
     try:
-        fds = hostlib.acquire(hostlib.lock_entries(resources, names))
+        entries = hostlib.lock_entries(resources, names)
+        fds = hostlib.acquire(entries)
     except hostlib.LockConflict as e:
         raise Refusal('CONFLICT', 'the resources are held by another process; nothing was reserved', evidence=e.evidence)
+    shared = [e['path'] for e in entries if hostlib.lock_mode(e) == 'shared']
     # With the locks held, the GPUs must still be free of users outside the protocol (otherwise exclusivity is not shown).
     problems = hostlib.resource_problems(resources, names)
     if problems:
@@ -654,10 +663,10 @@ def op_reserve(project, sess, req):
     rid = f'r-{secrets.token_hex(4)}'
     with state_lock:
         reservations[rid] = {'id': rid, 'project': project, 'session': sess, 'resources': names, 'fds': fds,
-                             'locks': [e['path'] for e in hostlib.lock_entries(resources, names)], 'expires': now() + ttl}
+                             'locks': [e['path'] for e in entries], 'shared_locks': shared, 'expires': now() + ttl}
         persist_reservations()
     return {'reservation': rid, 'resources': names, 'locks': reservations[rid]['locks'], 'expires_at': iso(now() + ttl),
-            'exclusive': True, 'note': 'Held by the broker. Processes you start yourself are not contained by it; '
+            'exclusive': not shared, 'shared_locks': shared, 'note': 'Held by the broker. Processes you start yourself are not contained by it; '
             'run measurements as registered workloads where you can.'}
 
 
@@ -1581,6 +1590,11 @@ def capabilities(project, refresh=False):
         for u in r.get('requires_active', []):
             if hostlib.unit_active(u) != 'active':
                 problems.append(f'{u} not active')
+        for e in r.get('locks', []):
+            try:
+                hostlib.lock_mode(e)
+            except ValueError as err:
+                problems.append(str(err))
         shared = []
         for u in r.get('requires_active', []):
             pid = num(show(u, ['MainPID']).get('MainPID'))
@@ -1602,9 +1616,11 @@ def capabilities(project, refresh=False):
                 participation = f'protocol_source unreadable: {e.strerror}'
         lvl = approval('reserve')
         status = 'BLOCKED' if problems else 'AVAILABLE' if lvl == 'allow' else 'REQUIRES_AUTHORIZATION'
-        cap(f'resource:{name}', status, f'host locks {[e["path"] for e in r.get("locks", [])]}; production runner participation: '
+        locks = [e['path'] + (' (shared)' if e.get('mode') == 'shared' else '') for e in r.get('locks', [])]
+        cap(f'resource:{name}', status, f'host locks {locks}; production runner participation: '
             f'{participation}; lock universe shared with {shared or "no supervisor checked"}', problems or (None if lvl == 'allow' else 'reserve approval'),
             ('An operator clears lockouts after investigating; mina never does.' if any('lockout' in x for x in problems) else
+             'The operator corrects the lock mode in host.json.' if any('mode must be' in x for x in problems) else
              'Start the supervisor unit.' if problems else None if lvl == 'allow' else snippet(project, 'classes.reserve', 'allow')),
             source=origins.get(name, 'project'))
     # Containment.

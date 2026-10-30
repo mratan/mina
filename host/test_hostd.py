@@ -1628,9 +1628,11 @@ class MachineResourceTest(unittest.TestCase):
             self.assertTrue(any('lockrun.py' in ' '.join(h['argv']) and not h['waiting'] for h in q['waiting_for']['holders']), q)
             self.assertFalse(free(self.turn), 'the waiter holds the turnstile while it waits')
             self.assertEqual(self.call(self.grant_a, 'reserve', resources=['GPU'])['error']['code'], 'CONFLICT')   # no jumping the queue
+            # An explicit workload monitor reports an end at once (no short-run hold), so a false end would show here.
+            m = self.ok(self.grant_b, 'monitor_add', kind='workload', params={'id': waiter['id']}, ttl_s=120)
             time.sleep(1.5)                                                                     # several broker ticks
             self.assertEqual(self.ok(self.grant_b, 'workload_status', id=waiter['id'])['state'], 'queued')
-            self.assertFalse([a for a in self.ok(self.grant_b, 'alarms')['pending'] if a['monitor'] == waiter['monitor']],
+            self.assertFalse([a for a in self.ok(self.grant_b, 'alarms')['pending'] if a['monitor'] in (waiter['monitor'], m['id'])],
                              'a queued workload has not ended')
             self.assertFalse(os.path.exists(self.ran))
         finally:

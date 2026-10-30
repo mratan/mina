@@ -460,7 +460,10 @@ The gate refuses force pushes, other remotes, branches that are not listed, file
 gitleaks runs offline with the rules of Mina, so a repository cannot allow its own secrets.
 See [pushing](host-profile.md#pushing).
 
-A project that is not registered has no host access. For the configuration, see [the host profile](host-profile.md).
+Resources at the top level of `host.json` are for all projects on the machine. Thus, GPU and host jobs from different projects use the same lock files and do not overlap. This coordination is only for one machine.
+A workload can wait for its locks for a maximum of `queue_s` seconds. While it waits, its state is `queued`.
+A project that is not registered gets the `defaults` of `host.json` if it is in a folder of `defaults.roots`. Otherwise, it has no host access.
+For the configuration, see [the host profile](host-profile.md).
 
 ## The footer
 

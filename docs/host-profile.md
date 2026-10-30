@@ -11,6 +11,7 @@ The host profile adds one narrow, audited route out of the sandbox. The sandbox 
 
 - [The parts](#the-parts)
 - [Install and register a project](#install-and-register-a-project)
+- [Defaults for unregistered projects](#defaults-for-unregistered-projects)
 - [Operations and approval](#operations-and-approval)
 - [Admission budgets](#admission-budgets)
 - [Capability preflight](#capability-preflight)
@@ -30,8 +31,8 @@ The host profile adds one narrow, audited route out of the sandbox. The sandbox 
 | Part | Where | What it does |
 |---|---|---|
 | Host broker | `host/hostd.py`, user service `mina-hostd` | Runs outside every sandbox. It does a fixed list of operations on what you registered, and it logs each one. No model takes part. |
-| Registry | `~/.config/mina/host.json` | Your list of services, resources, workloads, and monitor paths for each project, and the approval level of each operation class. The agent cannot write it. |
-| Workload holder | `host/lockrun.py` | The main process of each workload unit. It takes the locks, examines the resources again, runs the command, and records the result. |
+| Registry | `~/.config/mina/host.json` | The resources of the machine, and for each project its services, resources, workloads, monitor paths, and the approval level of each operation class. Optional defaults apply to unregistered projects in folders that you name. The agent cannot write it. |
+| Workload holder | `host/lockrun.py` | The main process of each workload unit. It takes the locks (it can wait for them), examines the resources again, runs the command, and records the result. |
 | Launcher session | `bin/mina.mjs` | Opens a host session when the broker runs and the project is registered. It binds the broker socket folder and a grant file for this launch into the outer sandbox layer. |
 | Mina client | `extensions/host/` | The `mina_host` tool, the capability list in the system prompt and in `.mina/host-capabilities.json`, and alarm delivery. |
 
@@ -45,51 +46,114 @@ The host profile adds one narrow, audited route out of the sandbox. The sandbox 
 
    This command writes `~/.config/systemd/user/mina-hostd.service` and starts the service.
 
-2. Register the project in `~/.config/mina/host.json`. The example that follows registers one service, one GPU resource, and two workloads:
+2. Write the resources of the machine at the top level of `~/.config/mina/host.json`.
+   A resource is a set of lock files that your host runners use, plus the conditions for its use.
+   All projects on this machine use these resources. The example that follows has two GPU groups, a host-quiet lock for timed measurements, and a `BUILD` resource:
 
    ```json
    {
     "version": 1,
-    "projects": {
-     "/home/you/work/myproject": {
-      "classes": {"observe": "allow", "reserve": "ask", "workload": "ask", "monitor": "allow", "restart": "ask"},
-      "services": {
-       "my-safety-watchdog": {
-        "unit": "my-safety-watchdog.service", "restart": "ask",
-        "sources": ["scripts/watchdog.py"], "process_match": "scripts/watchdog.py",
-        "restart_requires_idle": ["GPU0"],
-        "logs": ["/home/you/work/myproject/logs/watchdog.log"],
-        "health": {"log": "/home/you/work/myproject/logs/watchdog.log", "pattern": "START watchdog pid={pid} ",
-                   "fail_pattern": "ENFORCEMENT_FAILED", "timeout_s": 30, "stable_s": 30}}
-      },
-      "resources": {
-       "GPU0": {"locks": [{"path": "/tmp/myproject/gpu0.lock"}],
-                "lockouts": ["/home/you/work/myproject/state/lockout-GPU0"],
+    "resources": {
+     "GPU_A": {"locks": [{"path": "/tmp/gpu-locks/GPU_A.lock", "turnstile": "/tmp/gpu-locks/GPU_A.turn"}],
+               "device": {"nvidia": ["00000000:01:00.0"]}},
+     "GPU_B": {"locks": [{"path": "/tmp/gpu-locks/GPU_B.lock", "turnstile": "/tmp/gpu-locks/GPU_B.turn"}],
+               "device": {"nvidia": ["00000000:02:00.0"]}},
+     "QUIET": {"locks": [{"path": "/tmp/gpu-locks/HOST_QUIET.lock", "turnstile": "/tmp/gpu-locks/HOST_QUIET.turn"}]},
+     "BUILD": {"locks": [{"path": "/tmp/gpu-locks/HOST_QUIET.lock", "turnstile": "/tmp/gpu-locks/HOST_QUIET.turn",
+                          "mode": "shared"}]}
+    },
+    "projects": {},
+    "defaults": {}
+   }
+   ```
+
+   `QUIET` holds the host-quiet lock exclusively, for a timed measurement. `BUILD` holds the same lock shared.
+   Thus, builds can run at the same time as other builds, but not during a timed measurement. See [resource coordination](#resource-coordination).
+
+3. Register the project under `projects`. The example that follows registers one service, two workloads, and its own version of `GPU_A`:
+
+   ```json
+   "projects": {
+    "/home/you/work/myproject": {
+     "classes": {"observe": "allow", "reserve": "ask", "workload": "ask", "monitor": "allow", "restart": "ask"},
+     "services": {
+      "my-safety-watchdog": {
+       "unit": "my-safety-watchdog.service", "restart": "ask",
+       "sources": ["scripts/watchdog.py"], "process_match": "scripts/watchdog.py",
+       "restart_requires_idle": ["GPU_A"],
+       "logs": ["/home/you/work/myproject/logs/watchdog.log"],
+       "health": {"log": "/home/you/work/myproject/logs/watchdog.log", "pattern": "START watchdog pid={pid} ",
+                  "fail_pattern": "ENFORCEMENT_FAILED", "timeout_s": 30, "stable_s": 30}}
+     },
+     "resources": {
+      "GPU_A": {"locks": [{"path": "/tmp/gpu-locks/GPU_A.lock", "turnstile": "/tmp/gpu-locks/GPU_A.turn"}],
+                "lockouts": ["/home/you/work/myproject/state/lockout-GPU_A"],
                 "requires_active": ["my-safety-watchdog.service"],
                 "device": {"nvidia": ["00000000:01:00.0"]}}
-      },
-      "workloads": {
-       "gpu-smoke": {"argv": ["/usr/bin/nvidia-smi"], "resources": ["GPU0"], "max_s": 60},
-       "gpu-cell": {"argv": ["{command}"], "resources": ["GPU0"], "max_s": 3600,
-                    "sandbox": {"write": ["{project}"], "network": "offline"},
-                    "requires_fresh": ["my-safety-watchdog"]}
-      },
-      "monitor_paths": ["/home/you/work/myproject/logs", "/sys/class/hwmon/hwmonN"]
-     }
+     },
+     "workloads": {
+      "gpu-smoke": {"argv": ["/usr/bin/nvidia-smi"], "resources": ["GPU_A"], "max_s": 60},
+      "gpu-cell": {"argv": ["{command}"], "resources": ["QUIET", "GPU_A"], "max_s": 3600, "queue_s": 900,
+                   "sandbox": {"write": ["{project}"], "network": "offline"},
+                   "requires_fresh": ["my-safety-watchdog"]}
+     },
+     "monitor_paths": ["/home/you/work/myproject/logs", "/sys/class/hwmon/hwmonN"]
     }
    }
    ```
 
-3. Show what the agent can do in the project:
+   The effective resources of a project are the machine resources, plus the project's own `resources`.
+   When the project has a resource with the same name as a machine resource, the project's entry replaces the machine entry completely.
+   The two entries are not merged. Thus, the project's `GPU_A` repeats the lock and the device, and adds a lockout and a supervisor.
+   `capabilities` shows the source of each resource: `machine` or `project`.
+
+4. Show what the agent can do in the project:
 
    ```bash
    cd /home/you/work/myproject
    python3 <mina>/host/hostd.py status
    ```
 
-A project that is not registered gets no host session. `MINA_HOST=0` turns off the profile for one launch.
+A project that is not registered gets a host session only if `defaults` applies to it (see the next section). Otherwise, it gets no host session.
+`MINA_HOST=0` turns off the profile for one launch.
 
 The broker keeps its state in `~/.local/state/mina/hostd/`. This folder and its audit log are private to your user (modes 0700 and 0600).
+
+## Defaults for unregistered projects
+
+The optional top-level `defaults` object is a project entry for projects that you did not register.
+It has the same keys as a project entry, for example `classes`, `workloads`, `resources`, `max_reserve_s`, `max_monitors`, and `max_monitor_ttl_s`.
+It also has the required `roots` list:
+
+```json
+"defaults": {
+ "roots": ["~/work"],
+ "classes": {"observe": "allow", "reserve": "ask", "workload": "ask"},
+ "workloads": {
+  "build": {"argv": ["{command}"], "resources": ["BUILD"], "max_s": 1800, "queue_s": 600,
+            "sandbox": {"write": ["{project}"], "network": "offline"}},
+  "gpu-cell": {"argv": ["{command}"], "resources": ["QUIET", "GPU_A"], "max_s": 3600, "queue_s": 900,
+               "sandbox": {"write": ["{project}"], "network": "offline"}}
+ }
+}
+```
+
+These rules apply:
+
+- A project gets the defaults only if its real path is strictly inside a folder in `roots`. The broker expands `~` and resolves symbolic links in `roots`.
+- A root must be an absolute path or start with `~`. The broker ignores a root of `/`.
+- The defaults never apply to a root itself, to `/`, or to your home folder.
+  They also never apply in folders for credentials or in the folders of Mina's configuration and state, for example `~/.ssh` or `~/.config/mina`.
+- A project under `projects` never gets the defaults. Its entry is complete: the broker does not merge it with the defaults.
+- `{project}` in a workload of the defaults is the path of the project that uses it. This also applies to `argv`, `env`, `sandbox`, and the keys of `pin`.
+- The broker ignores `services` in the defaults, because a service belongs to one project. `capabilities` then shows a BLOCKED `services` line.
+  Thus, `requires_fresh` and `unit_active` monitors cannot work in the defaults. To give a project services, register it.
+
+`session_open` gives `registered: true` and `policy_source: "defaults"` for such a project. `capabilities` also shows `policy_source`.
+Audit records for operations on such a project contain `"policy_source": "defaults"`.
+A remediation for such a project names a change to `defaults`, which changes all projects under `roots`.
+
+Review the defaults as carefully as a project entry. With `ask`, you confirm each operation, but the workloads apply to every project under the roots.
 
 ## Operations and approval
 
@@ -258,11 +322,55 @@ The workload class sets the approval. The gate reduces accidental disclosure. It
 
 ## Resource coordination
 
-The broker uses the lock files of your host runner. It makes no lock files of its own.
-Each lock is exclusive, and the broker takes the locks without a wait, in the order of the `locks` list. A lock entry can name a `turnstile`: the lock file that runners hold while they wait in the queue.
+The broker uses the lock files of your host runners. It makes no lock files of its own.
+All projects on the machine use the same lock files, so GPU jobs and host jobs from different projects do not overlap.
+
+The coordination is only for one machine. The locks are `flock` locks on files of this machine.
+Another machine, for example one on the same tailnet, runs its own broker with its own locks. The brokers do not coordinate.
+
+### Lock entries
+
+A resource has a `locks` list. Each entry has these fields:
+
+- `path`: the lock file.
+- `turnstile` (optional): the lock file that runners hold while they wait in the queue for `path`.
+- `mode` (optional): `exclusive` (the default) or `shared`. Shared holders can hold the lock at the same time. An exclusive holder excludes all others.
+
+The broker takes the locks in the order of the list, and in the order of the resources in the request.
+When two requested resources contain the same path, the broker takes it once, at its first position.
+If one of them asks for `exclusive`, the lock is exclusive.
+
+Use `shared` for work that can overlap other work of the same type, but not a timed measurement.
+In the example, `BUILD` holds the host-quiet lock shared, and `QUIET` holds it exclusively. Builds overlap each other, and a measurement waits until all builds end.
+
+### Without a wait
+
+`reserve`, the idle check of a restart, and a workload with `queue_s` 0 take the locks without a wait:
 
 - A held lock is a CONFLICT. The refusal names the holder, from `/proc/locks`.
 - A held turnstile lock is also a conflict, because a runner is in the queue. The broker never jumps a queue.
+- The idle check of a restart takes all its locks exclusively, also shared entries, because idle means that nobody holds the lock.
+
+### With a wait (`queue_s`)
+
+A workload with `queue_s` greater than 0 waits for its locks, for a maximum of `queue_s` seconds in total.
+`lockrun.py` waits in the unit of the workload. The broker does not wait. It uses the queue protocol of the host runners:
+
+- **Exclusive entry with a turnstile:** it takes the turnstile (it waits if necessary). It waits for the lock while it holds the turnstile. Then it releases the turnstile.
+  Thus, it keeps its place in the queue, and nobody who comes later gets ahead of it.
+- **Shared entry with a turnstile:** it takes the turnstile (it waits if necessary) and releases it immediately. Then it takes the lock shared.
+  Thus, a shared taker cannot get ahead of an exclusive waiter that holds the turnstile.
+- **Entry without a turnstile:** it waits for the lock.
+
+While the workload waits, `workload_status` shows the state `queued`, the lock that it waits for, and the holders of that lock.
+`queued` is a live state: `workload_stop` stops the job, and the job has not ended.
+When `queue_s` ends, the workload releases every lock that it took, and its state is `conflict`, with the lock and its holders as evidence.
+
+The workload can wait while it holds the locks that come earlier in its list.
+Thus, list the locks in the same order as the host runners that share them.
+In a different order, a workload and a runner can each hold a lock that the other waits for. They then block each other until `queue_s` ends.
+
+### Exclusive use
 
 The broker gets exclusive use in two steps:
 
@@ -271,6 +379,7 @@ The broker gets exclusive use in two steps:
    `{"kfd": true}` reads `/sys/class/kfd/kfd/proc` for AMD GPUs. `{"nvidia": [bus IDs]}` reads the `nvidia-smi` compute apps.
    Both list the processes of all users.
 
+Step 2 also occurs after a wait, before the command starts.
 If the device users cannot be read, the result is BLOCKED: the broker fails closed.
 A file in `lockouts` that exists, or a unit in `requires_active` that is not active, also gives BLOCKED. The broker reads lockouts and never clears them.
 
@@ -297,7 +406,8 @@ Some tools cannot start inside bubblewrap at all. For example, rootless podman n
 Thus, a workload can take arguments, with these controls:
 
 - **`params`:** named values. Each value must match its registered pattern. The broker puts them into `argv` and `env` (`{name}`).
-  `{max_s}` is the requested time limit, at most the registered one. `queue_s` adds time for a runner that waits for its locks.
+  `{max_s}` is the requested time limit, at most the registered one.
+- **`queue_s`:** the maximum time in seconds that the workload waits for its locks (see [resource coordination](#resource-coordination)). The default is 0: no wait.
 - **`{command}`:** the agent's own argv. By default, it runs in a bubblewrap sandbox that the broker makes:
   - A read-only root, with the devices available.
   - A private `/tmp` and runtime folder: no user bus and no host lock files.
@@ -312,7 +422,7 @@ Thus, a workload can take arguments, with these controls:
 - **`cleanup`:** a registered host command that runs after each workload ends.
 - **`requires_fresh`:** services that must be FRESH (see the next section) before the workload can start.
 
-In the example registry, `gpu-cell` runs the agent's command with GPU0 locked, write access to the project only, and no network.
+In the example registry, `gpu-cell` runs the agent's command with the host-quiet lock and `GPU_A` locked, write access to the project only, and no network.
 
 ## Deployment verification
 
@@ -390,6 +500,10 @@ The broker appends each request, decision, verification, and alarm delivery to `
   - Restarts: verified, failed, approval levels, and refusal while resources are busy.
   - Stale deployments that block workloads.
   - Reservation conflicts: a holder, a turnstile in use, a second session, a lockout, a stopped supervisor, and a device user.
+  - Machine resources: two projects share one lock, and a project resource with the same name replaces the machine resource.
+  - Defaults: the folders that get them, `{project}` expansion, ignored services, and `policy_source` in sessions, capabilities, and audit records.
+  - Waits: a queued workload runs after the release, keeps the turnstile, raises no false end alarm, and can be stopped. The end of `queue_s` releases every lock.
+  - Shared locks: two builds overlap, a measurement waits for both, a new build cannot pass the measurement, and mixed modes become exclusive.
   - Workloads: completion, a conflict that runs nothing, a leader exit with a surviving child, a stop, the systemd deadline, an interrupted launch, and a broker restart during a run.
   - Monitors: alarms across sessions, log matching, TTL expiry, and the path allowlist.
   - The audit log never contains grants.
@@ -397,7 +511,10 @@ The broker appends each request, decision, verification, and alarm delivery to `
 
 ## Limits
 
-- **Your decisions.** Only you approve a class, register a service, resource, workload, or monitor path, or set `alarm_command`. These are edits to `host.json`.
+- **Your decisions.** Only you approve a class, register a service, resource, workload, or monitor path, set `defaults`, or set `alarm_command`. These are edits to `host.json`.
+- **One machine.** Locks coordinate only the jobs of this machine. Brokers on other machines, also on the same tailnet, do not coordinate with this one.
+- **Lock order.** A workload that waits holds the locks that come earlier in its list. If its order is different from the order of a host runner, both wait until `queue_s` ends.
+- **Defaults.** The defaults apply to every project under `roots`, also to a project that you did not expect. They cannot give services.
 - **Lockouts.** An operator clears a safety lockout. Mina never clears one.
 - **No root.** The broker cannot list the open files of other users' processes. Device ownership uses the KFD process list and `nvidia-smi`, which cover all users. NVIDIA graphics clients that do not compute are not listed.
 - **Files that a workload runs.** The argv of a workload is fixed, but the files that it runs are not. A workload that runs a script from the project runs what the agent last wrote there, unless you pin it.

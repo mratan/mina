@@ -99,6 +99,12 @@ def ensure_state_dir():
 
 def audit(rec):
     rec = {'ts': iso(), **rec}
+    if rec.get('project') and 'policy_source' not in rec:
+        try:
+            if policy_source(rec['project']) == 'defaults':
+                rec['policy_source'] = 'defaults'   # the operation used the defaults, not a registration of its own
+        except Exception:  # an unreadable policy must not stop the audit record
+            pass
     ensure_state_dir()
     with state_lock:
         # 0600, and existing files are narrowed to it; never through a symlink.
@@ -180,16 +186,48 @@ def machine_resources():
     return r if isinstance(r, dict) else {}
 
 
+# Folders that never get the defaults: credentials and mina's own configuration and state (relative to the home folder).
+NO_DEFAULTS = ['.ssh', '.gnupg', '.aws', '.docker', '.config/gh', '.config/mina', '.local/state/mina']
+
+
+def defaults_root(project, roots):
+    """The root of "defaults.roots" that holds this project strictly inside it, or None. Never for a root itself, for
+    /, for the home folder, or for a folder in NO_DEFAULTS. A root must be absolute (after ~); a root of / is ignored."""
+    if not isinstance(roots, list):
+        return None
+    home = os.path.realpath(os.path.expanduser('~'))
+    project = os.path.realpath(project)
+    if project in ('/', home):
+        return None
+    for p in NO_DEFAULTS:
+        guarded = os.path.join(home, p)
+        if project == guarded or project.startswith(guarded + '/'):
+            return None
+    for r in roots:
+        if not isinstance(r, str) or not os.path.isabs(os.path.expanduser(r)):
+            continue
+        root = os.path.realpath(os.path.expanduser(r))
+        if root != '/' and project.startswith(root.rstrip('/') + '/'):
+            return root
+    return None
+
+
 def policy_entry(project):
-    """(entry, source): the project's own entry in "projects" (source 'project'), or (None, None)."""
-    entry = (config().get('projects') or {}).get(project)
+    """(entry, source): the project's own entry in "projects" (source 'project'); else the "defaults" template when the
+    project is strictly inside one of its roots (source 'defaults'); else (None, None). A registered project never gets
+    the defaults: there is no merging. The template's "services" are ignored, because a service belongs to one project."""
+    cfg = config()
+    entry = (cfg.get('projects') or {}).get(project)
     if entry is not None:
         return entry, 'project'
+    d = cfg.get('defaults')
+    if isinstance(d, dict) and defaults_root(project, d.get('roots')):
+        return {k: v for k, v in d.items() if k not in ('roots', 'services')}, 'defaults'
     return None, None
 
 
 def policy_source(project):
-    """'project', or None when no policy applies."""
+    """'project', 'defaults', or None when no policy applies."""
     return policy_entry(project)[1]
 
 
@@ -212,8 +250,15 @@ def resource_origins(project):
 
 
 def snippet(project, path, value):
-    """The exact host.json change that approves something, for a refusal's remediation."""
+    """The exact host.json change that approves something, for a refusal's remediation. For a project that gets the
+    defaults, the change is to the defaults (or a registration of its own, which then replaces the defaults for it)."""
+    if policy_source(project) == 'defaults':
+        return (f'In {CONFIG}, set defaults.{path} = {json.dumps(value)} (this changes every project under defaults.roots; '
+                f'for this project only, register "{project}" under "projects": its entry then replaces the defaults)')
     return f'In {CONFIG}, set projects["{project}"].{path} = {json.dumps(value)}'
+
+
+UNREGISTERED = 'Add "{project}" under "projects" in {config}, or make it a subfolder of a folder in "defaults.roots" (see docs/host-profile.md).'
 
 
 def require_class(project, cls, target=None, level=None):
@@ -222,7 +267,7 @@ def require_class(project, cls, target=None, level=None):
     p = project_config(project)
     if p is None:
         raise Refusal('REQUIRES_AUTHORIZATION', f'project {project} is not registered with the host broker',
-                      remediation=f'Add "{project}" under "projects" in {CONFIG} (see docs/host-profile.md).')
+                      remediation=UNREGISTERED.format(project=project, config=CONFIG))
     have = (p.get('classes') or {}).get(cls, 'allow' if cls == 'observe' else 'deny')
     if level is not None:
         have = min(have, level, key=lambda x: LEVEL.get(x, 0))
@@ -328,7 +373,8 @@ def op_session_open(req, pid):
         hostlib.write_json(SESSIONS, sessions)
     budgets.open((project, sid))
     audit({'op': 'session_open', 'session': sid, 'project': project, 'launcher': pid})
-    return {'grant': grant, 'session': sid, 'project': project, 'registered': project_config(project) is not None}
+    source = policy_source(project)
+    return {'grant': grant, 'session': sid, 'project': project, 'registered': source is not None, 'policy_source': source}
 
 
 # --- systemd ---------------------------------------------------------------------------------------------------------
@@ -772,12 +818,12 @@ def workload_argv(project, name, w, req):
     for k, pat in patterns.items():
         if k not in params or not isinstance(params[k], str) or not re.fullmatch(pat, params[k]):
             raise Refusal('INVALID', f'param {k!r} must match {pat}', given=params.get(k))
-    for path, want in (w.get('pin') or {}).items():
-        path = path.replace('{project}', project)
+    for key, want in (w.get('pin') or {}).items():
+        path = key.replace('{project}', project)
         have = sha256_file(path)
         if have != want:
             raise Refusal('BLOCKED', f'{path} is not the approved version, so workload "{name}" will not run it outside the sandbox',
-                          have=have, approved=want, remediation=snippet(project, f'workloads.{name}.pin["{path}"]', have) + ' after reviewing the change.')
+                          have=have, approved=want, remediation=snippet(project, f'workloads.{name}.pin["{key}"]', have) + ' after reviewing the change.')
     command = req.get('command')
     takes_command = '{command}' in w['argv']
     if takes_command:
@@ -993,7 +1039,7 @@ def launch_workload(project, sess, req):
             'log': os.path.join(d, 'output.log'), 'locks': hostlib.lock_entries(resources, names),
             'resources': {n: resources[n] for n in names}, 'resource_names': names}
     hostlib.write_json(os.path.join(d, 'spec.json'), spec)
-    rec = {'id': wid, 'workload': name, 'project': project, 'session': sess, 'unit': unit, 'resources': names,
+    rec = {'id': wid, 'workload': name, 'project': project, 'policy_source': policy_source(project), 'session': sess, 'unit': unit, 'resources': names,
            'max_s': max_s, 'params': params, 'command': command, 'request_id': req.get('request_id'), 'admission': admission, 'state': 'launching', 'launched': now(), 'deadline': now() + max_s + queue_s, 'members_seen': []}
     hostlib.write_json(os.path.join(d, 'record.json'), rec)   # recorded before launch: an interrupted launch is found
     r = subprocess.run(['systemd-run', '--user', '--quiet', '--collect', f'--unit={unit}', f'--slice={SLICE}',
@@ -1476,11 +1522,14 @@ def capabilities(project, refresh=False):
     p = project_config(project)
     if p is None:
         cap('project', 'REQUIRES_AUTHORIZATION', f'{project} is not registered with the host broker', 'a project entry in host.json',
-            f'Add "{project}" under "projects" in {CONFIG} (docs/host-profile.md has an example).')
+            UNREGISTERED.format(project=project, config=CONFIG))
         result = {'project': project, 'broker': VERSION, 'confirmation_protocol': PROTOCOL, 'mutation_protocol': MUTATION_OP, 'checked_at': iso(), 'fingerprint': fp, 'policy_source': None, 'capabilities': caps}
         cap_cache[project] = (fp, result)
         return result
     classes = p.get('classes') or {}
+    if policy_source(project) == 'defaults' and 'services' in (config().get('defaults') or {}):
+        cap('services', 'BLOCKED', 'host.json defaults has "services"; the broker ignores them, because a service belongs to '
+            'one project', 'a registration of this project', f'Register "{project}" under "projects" with its services.')
 
     def approval(cls):
         lvl = classes.get(cls, 'allow' if cls == 'observe' else 'deny')
@@ -1681,6 +1730,7 @@ OPS = {'capabilities': ('observe', op_capabilities), 'service_status': ('observe
        'monitor_list': ('observe', op_monitor_list), 'monitor_remove': ('monitor', op_monitor_remove),
        'alarms': ('observe', op_alarms)}
 REQUEST_PROTOCOL = 'mina-workload-request-v1'
+_request = threading.local()   # the project of the request in this handler thread, for its audit record
 MUTATIONS = frozenset(op for op, (cls, _fn) in OPS.items() if cls != 'observe')
 
 
@@ -1713,6 +1763,7 @@ def handle(req, pid, uid):
         sess, project = 'host-user', os.path.realpath(req.get('project') or '')   # the user, from a shell outside the sandbox
     else:
         raise Refusal('UNAUTHENTICATED', 'a host session grant is required')
+    _request.project = project
     cls, fn = OPS[op]
     # Class admission here; mutation handlers also enforce per-operation ask, including service restart policy.
     if not (op == 'capabilities' and project_config(project) is None):   # an unregistered project still learns what it lacks
@@ -1749,6 +1800,7 @@ class Handler(socketserver.StreamRequestHandler):
         pid, uid = peer_of(self.connection)
         line = self.rfile.readline(1 << 20)
         req, t0 = {}, now()
+        _request.project = None
         try:
             req = json.loads(line)
             out = {'ok': True, 'result': handle(req, pid, uid)}
@@ -1757,8 +1809,13 @@ class Handler(socketserver.StreamRequestHandler):
         except Exception as e:
             out = {'ok': False, 'error': {'code': 'FAILED', 'message': f'{type(e).__name__}: {e}'}}
         safe, error = audit_safe(req, None if out['ok'] else out['error'])
-        audit({'op': safe.get('op'), 'peer': pid, 'request': safe, 'ok': out['ok'], 'error': error,
-               'ms': round((now() - t0) * 1000)})
+        rec = {'op': safe.get('op'), 'peer': pid, 'request': safe, 'ok': out['ok'], 'error': error, 'ms': round((now() - t0) * 1000)}
+        try:
+            if _request.project and policy_source(_request.project) == 'defaults':
+                rec.update(project=_request.project, policy_source='defaults')
+        except Exception:  # an unreadable policy must not stop the audit record
+            pass
+        audit(rec)
         self.wfile.write((json.dumps(out, default=str) + '\n').encode())
 
 

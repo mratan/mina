@@ -1625,6 +1625,176 @@ class MachineResourceTest(unittest.TestCase):
         self.assertEqual(caps['resource:GPU']['source'], 'machine')
 
 
+class DefaultsResolutionTest(unittest.TestCase):
+    """Which folders get the defaults, without a broker. HOME and the policy file are temporary."""
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix='mina-defaults-test-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = os.path.join(self.tmp, 'home')
+        self.work = os.path.join(self.home, 'work')
+        for d in ('work/a/deep', '.config/mina', '.ssh/x', 'elsewhere'):
+            os.makedirs(os.path.join(self.home, d))
+        os.symlink(self.work, os.path.join(self.tmp, 'link-to-work'))
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.dict(os.environ, {'HOME': self.home}))
+        self.config = os.path.join(self.tmp, 'host.json')
+        stack.enter_context(patch.object(hostd, 'CONFIG', self.config))
+
+    def source(self, project, roots, projects=None, **extra):
+        hostlib.write_json(self.config, {'version': 1, 'projects': projects or {},
+                                         'defaults': {'roots': roots, 'classes': {'workload': 'ask'}, **extra}})
+        return hostd.policy_source(os.path.realpath(project))
+
+    def test_only_strictly_inside_a_root(self):
+        a = os.path.join(self.work, 'a')
+        self.assertEqual(self.source(a, ['~/work']), 'defaults')                         # ~ expanded
+        self.assertEqual(self.source(os.path.join(a, 'deep'), [self.work]), 'defaults')
+        self.assertEqual(self.source(a, [os.path.join(self.tmp, 'link-to-work')]), 'defaults')   # roots are realpath'd
+        self.assertIsNone(self.source(self.work, ['~/work']), 'never for a root itself')
+        self.assertIsNone(self.source(os.path.join(self.home, 'elsewhere'), ['~/work']), 'outside the roots')
+        self.assertIsNone(self.source(self.work + '-sibling', ['~/work']), 'a name prefix is not a subfolder')
+        self.assertIsNone(self.source(self.home, [self.tmp]), 'never for $HOME')
+        self.assertIsNone(self.source('/', ['/']), 'never for /')
+        self.assertIsNone(self.source(a, ['/']), 'a root of / is ignored')
+        self.assertIsNone(self.source(a, ['work']), 'a relative root is ignored')
+        self.assertIsNone(self.source(a, '~/work'), 'roots must be a list')
+        self.assertIsNone(self.source(os.path.join(self.home, '.config', 'mina'), ['~']), "never for mina's configuration")
+        self.assertIsNone(self.source(os.path.join(self.home, '.ssh', 'x'), ['~']), 'never inside a credential folder')
+        self.assertEqual(self.source(os.path.join(self.home, 'elsewhere'), ['~']), 'defaults')
+
+    def test_a_registered_project_never_gets_the_defaults(self):
+        a = os.path.join(self.work, 'a')
+        self.assertEqual(self.source(a, ['~/work'], projects={a: {'classes': {}}}), 'project')
+        policy = hostd.project_config(a)
+        self.assertEqual(policy['classes'], {}, 'no merging with the defaults')
+
+    def test_services_and_roots_are_not_part_of_the_policy(self):
+        a = os.path.join(self.work, 'a')
+        self.source(a, ['~/work'], services={'svc': {'unit': 'x.service'}}, max_reserve_s=60,
+                    resources={'BUILD': {'locks': []}})
+        policy = hostd.project_config(a)
+        self.assertNotIn('services', policy)
+        self.assertNotIn('roots', policy)
+        self.assertEqual(policy['max_reserve_s'], 60)
+        self.assertEqual(hostd.resource_origins(a), {'BUILD': 'defaults'})
+        with self.assertRaises(hostd.Refusal) as cm:
+            hostd.service_config(a, 'svc')
+        self.assertEqual(cm.exception.code, 'REQUIRES_AUTHORIZATION')
+        self.assertIn('defaults.', hostd.snippet(a, 'classes.workload', 'allow'))
+
+
+@unittest.skipUnless(SYSTEMD_USER, NEEDS_SYSTEMD)
+class DefaultsBrokerTest(unittest.TestCase):
+    """An unregistered project under a root of "defaults" gets the template, with {project} expanded for it."""
+
+    def setUp(self):
+        self.b = b = Broker()
+        self.addCleanup(b.cleanup)
+        self.root = os.path.join(b.tmp, 'work')
+        self.proj = os.path.join(self.root, 'proj')
+        self.registered = os.path.join(self.root, 'registered')
+        self.outside = os.path.join(b.tmp, 'outside')
+        for d in (self.proj, self.registered, self.outside):
+            os.makedirs(d)
+        put(os.path.join(self.proj, 'tool.sh'), 'echo tool-ran\n')
+        self.tool_sha = hashlib.sha256(b'echo tool-ran\n').hexdigest()
+        self.gpu = f'{b.locks}/GPU_D.lock'
+        self.cfg = {'version': 1,
+                    'resources': {'GPU': {'locks': [{'path': self.gpu}]}},
+                    'projects': {self.registered: {'classes': {'observe': 'allow'}}},
+                    'defaults': {
+                        'roots': [self.root],
+                        'classes': {'observe': 'allow', 'reserve': 'allow', 'workload': 'allow'},
+                        'services': {'svc': {'unit': 'never-real.service'}},
+                        'workloads': {
+                            'where': {'argv': ['sh', '-c', 'echo at={project} > {project}/where.out'], 'max_s': 30},
+                            'tool': {'argv': ['sh', '{project}/tool.sh'], 'max_s': 30, 'pin': {'{project}/tool.sh': self.tool_sha}},
+                            'gpu-cell': {'argv': ['{command}'], 'resources': ['GPU'], 'max_s': 30,
+                                         'sandbox': {'write': ['{project}'], 'network': 'offline'}}}}}
+        hostlib.write_json(b.env['MINA_HOST_CONFIG'], self.cfg)
+        b.start()
+
+    def end(self, grant, wid):
+        live = ('launching', 'starting', 'queued', 'running')
+        return wait_for(lambda: (lambda s: s if s['state'] not in live else None)(
+            self.b.raw({'op': 'workload_status', 'grant': grant, 'id': wid})['result']), timeout=30)
+
+    def test_session_and_capabilities_name_the_policy_source(self):
+        opened = self.b.open_session(self.proj, full=True)
+        self.assertEqual((opened['registered'], opened['policy_source']), (True, 'defaults'))
+        caps = self.b.raw({'op': 'capabilities', 'grant': opened['grant'], 'refresh': True})['result']
+        self.assertEqual(caps['policy_source'], 'defaults')
+        by = {c['capability']: c for c in caps['capabilities']}
+        self.assertEqual(by['resource:GPU']['source'], 'machine')
+        self.assertEqual(by['services']['status'], 'BLOCKED', 'services in the defaults are ignored, and the agent is told')
+        self.assertFalse([c for c in by if c.startswith('service:')])
+        self.assertEqual(self.b.raw({'op': 'service_status', 'grant': opened['grant'], 'service': 'svc'})['error']['code'],
+                         'REQUIRES_AUTHORIZATION')
+        mine = self.b.open_session(self.registered, full=True)
+        self.assertEqual((mine['registered'], mine['policy_source']), (True, 'project'))
+        caps = self.b.raw({'op': 'capabilities', 'grant': mine['grant'], 'refresh': True})['result']
+        self.assertEqual(caps['policy_source'], 'project')
+        self.assertFalse([c for c in caps['capabilities'] if c['capability'].startswith('workload:')], 'no merging')
+        for project in (self.root, self.outside, os.path.expanduser('~'), '/'):
+            with self.subTest(project=project):
+                opened = self.b.open_session(project, full=True)
+                self.assertEqual((opened['registered'], opened['policy_source']), (False, None))
+                out = self.b.raw({'op': 'workload_run', 'grant': opened['grant'], 'workload': 'where'})
+                self.assertEqual(out['error']['code'], 'REQUIRES_AUTHORIZATION')
+
+    def test_project_placeholders_expand_and_audit_names_the_defaults(self):
+        grant = self.b.open_session(self.proj)
+        w = self.b.raw({'op': 'workload_run', 'grant': grant, 'workload': 'where'})['result']
+        self.assertEqual(self.end(grant, w['id'])['state'], 'exited')
+        with open(os.path.join(self.proj, 'where.out')) as f:
+            self.assertEqual(f.read().strip(), f'at={self.proj}')
+        w = self.b.raw({'op': 'workload_run', 'grant': grant, 'workload': 'tool'})['result']   # a {project} pin
+        end = self.end(grant, w['id'])
+        self.assertEqual(end['state'], 'exited', end)
+        self.assertIn('tool-ran', end['output_tail'])
+        put(os.path.join(self.proj, 'tool.sh'), 'echo changed\n')
+        e = self.b.raw({'op': 'workload_run', 'grant': grant, 'workload': 'tool'})['error']
+        self.assertEqual(e['code'], 'BLOCKED')
+        self.assertIn('defaults.workloads.tool.pin["{project}/tool.sh"]', e['remediation'])
+        with open(os.path.join(self.b.env['MINA_HOST_STATE'], 'audit.jsonl')) as f:
+            records = [json.loads(line) for line in f]
+        mine = [r for r in records if r.get('project') == self.proj]
+        self.assertTrue({'session_open', 'workload_admission', 'workload_end', 'workload_run'} <= {r['op'] for r in mine}, mine)
+        self.assertTrue(all(r.get('policy_source') == 'defaults' for r in mine), mine)
+        self.assertFalse([r for r in records if r.get('policy_source') and r.get('project') != self.proj])
+
+    @unittest.skipUnless(BWRAP, NEEDS_BWRAP)
+    def test_command_sandbox_writes_the_project(self):
+        grant = self.b.open_session(self.proj)
+        w = self.b.raw({'op': 'workload_run', 'grant': grant, 'workload': 'gpu-cell',
+                        'command': ['sh', '-c', 'pwd; touch made-in-sandbox']})['result']
+        end = self.end(grant, w['id'])
+        self.assertEqual(end['state'], 'exited', end)
+        self.assertIn(self.proj, end['output_tail'])
+        self.assertTrue(os.path.exists(os.path.join(self.proj, 'made-in-sandbox')))
+        self.assertTrue(free(self.gpu))
+
+    def test_launcher_opens_a_session_for_a_defaults_project(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        runtime, cwd = os.path.join(self.b.tmp, 'xdg'), os.path.join(self.b.tmp, 'node-cwd')   # mina.mjs examines its cwd on import
+        os.makedirs(runtime); os.makedirs(cwd)
+        env = {'MINA_HOSTD_RUNTIME': os.path.dirname(self.b.sock), 'XDG_RUNTIME_DIR': runtime,
+               'MINA_HOST_CONFIG': self.b.env['MINA_HOST_CONFIG']}
+        script = ("const m = await import(process.argv[1]); const out = {};"
+                  "for (const p of process.argv.slice(2)) out[p] = await m.openHostSession(p, JSON.parse(process.env.FIXTURE_ENV));"
+                  "process.stdout.write(`\\nFIXTURE ${JSON.stringify(out)}\\n`); process.exit(0);")
+        r = subprocess.run([node, '--input-type=module', '-e', script, os.path.join(hostd.REPO, 'bin', 'mina.mjs'), self.proj, self.outside],
+                           env={**os.environ, 'FIXTURE_ENV': json.dumps(env)}, cwd=cwd, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(next(line for line in r.stdout.splitlines() if line.startswith('FIXTURE '))[8:])
+        self.assertTrue(out[self.proj] and out[self.proj]['grantFile'], out)
+        self.assertIsNone(out[self.outside], 'an unregistered project outside the roots gets no host session')
+
+
 class WorkloadSandboxPolicyTest(unittest.TestCase):
     """The workload command sandbox's hidden paths and network, and the broker's private state, without a broker."""
 

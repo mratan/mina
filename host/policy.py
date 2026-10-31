@@ -234,7 +234,7 @@ RESOURCE_KEYS = {'locks', 'lockouts', 'requires_active', 'device', 'protocol_sou
 LOCK_KEYS = {'path', 'turnstile', 'mode'}
 DEVICE_KEYS = {'nvidia', 'kfd'}
 WORKLOAD_KEYS = {'argv', 'params', 'max_s', 'queue_s', 'resources', 'sandbox', 'command_sandbox', 'pin', 'env', 'cwd',
-                 'delegate', 'cleanup', 'requires_fresh', 'instance_budget', 'description'}
+                 'delegate', 'cleanup', 'requires_fresh', 'instance_budget', 'description', 'runner_queue'}
 SANDBOX_KEYS = {'write', 'readonly', 'hide', 'network'}
 SERVICE_KEYS = {'unit', 'restart', 'sources', 'source_root', 'process_match', 'restart_requires_idle', 'logs', 'health',
                 'restart_timeout_s', 'settle_s', 'description'}
@@ -409,6 +409,14 @@ def _workload(rep, path, w, names, services, is_defaults):
             rep.err(path + ['env'], 'must be an object of strings')
     if 'cwd' in w and not isinstance(w['cwd'], str):
         rep.err(path + ['cwd'], 'must be a path')
+    if 'runner_queue' in w:
+        rq = w['runner_queue']
+        if not (_strings(rq) and rq):
+            rep.err(path + ['runner_queue'], 'must be a nonempty list of lock files or directories (ending in "/")')
+        else:
+            for i, f in enumerate(rq):
+                if not os.path.isabs(f):
+                    rep.err(path + ['runner_queue', i], f'must be an absolute path, not {f!r}')
     if 'cleanup' in w and not (_strings(w['cleanup']) and w['cleanup']):
         rep.err(path + ['cleanup'], 'must be a nonempty argv list')
     if 'requires_fresh' in w:

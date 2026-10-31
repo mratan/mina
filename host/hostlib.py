@@ -146,6 +146,61 @@ def lock_holders(path):
     return out
 
 
+def lock_key(path):
+    """The dev:ino of a file in the form of /proc/locks, or None. It names the file itself, not a path in a namespace."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return f'{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}'
+
+
+def _fd_path(pid, key):
+    """The path of the open file of a process whose dev:ino is key (the /proc/locks form), or None. The path is the one
+    in the process's mount namespace: in a sandbox it can name another file in the broker's namespace."""
+    d = f'/proc/{pid}/fd'
+    try:
+        fds = os.listdir(d)
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            if lock_key(os.path.join(d, fd)) == key:
+                return os.readlink(os.path.join(d, fd))
+        except OSError:
+            continue
+    return None
+
+
+def blocked_waits(pids):
+    """The flocks that these processes wait for now, from /proc/locks: [{pid, lock, key, mode}] in /proc/locks order. The
+    path comes from the waiter's own descriptors, so no lock list is needed; a wait whose file cannot be found is left out.
+    Compare key, not only the path, with a lock of the host (see _fd_path)."""
+    pids = set(pids)
+    out = []
+    with open('/proc/locks') as f:
+        for line in f:
+            parts = line.split()
+            if '->' not in parts:
+                continue
+            parts.remove('->')
+            if len(parts) < 6 or parts[1] != 'FLOCK' or int(parts[4]) not in pids:
+                continue
+            path = _fd_path(int(parts[4]), parts[5])
+            if path:
+                out.append({'pid': int(parts[4]), 'lock': path, 'key': parts[5], 'mode': 'shared' if parts[3] == 'READ' else 'exclusive'})
+    return out
+
+
+def cgroup_of(pid):
+    """The cgroup v2 path of a process ("/user.slice/..."), or None."""
+    try:
+        with open(f'/proc/{pid}/cgroup') as f:
+            return next((line[3:].strip() for line in f if line.startswith('0::')), None)
+    except OSError:
+        return None
+
+
 class _Expired(Exception):
     pass
 

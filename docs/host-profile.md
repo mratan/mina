@@ -678,6 +678,31 @@ The workload can wait while it holds the locks that come earlier in its list.
 Thus, list the locks in the same order as the host runners that share them.
 In a different order, a workload and a runner can each hold a lock that the other waits for. They then block each other until `queue_s` ends.
 
+### A runner that takes the locks itself
+
+Some workloads run a host runner, for example `crun.py`, that takes the host locks itself. Such a workload has no `resources`, and the runner waits inside the job.
+The broker sees this wait in `/proc/locks`:
+
+- If a process of the job waits for a coordination lock, `workload_status` shows the state `queued` with `queued_by: "runner"`. It also shows the lock, its mode, and its holders.
+  A coordination lock is a lock or turnstile of a machine resource or a project resource, or a path in the `runner_queue` of the workload.
+  A wait for another lock, for example a cache lock of a build, is work. The state stays `running`.
+  The broker compares the file itself (device and inode), not only its path. Thus, a lock in the private `/tmp` of a command sandbox is not a coordination lock, also if its path is the same.
+- A holder that is in a broker workload has a `workload` field: its id, project, workload name and params. This also applies to holders of other projects on the machine.
+  A wait in the broker's own queue shows `queued_by: "broker"`.
+
+Without `runner_queue`, `queue_s` does not limit the runner's wait. The unit deadline `max_s + queue_s` from the launch applies, so a long wait takes run time away from the job.
+To make `queue_s` a queue limit, give the workload the lock files or directories (with a final `/`) of the runner:
+
+```json
+"crun-cell": {"argv": ["...crun.py", "..."], "max_s": 2400, "queue_s": 3600,
+              "runner_queue": ["/tmp/llmbench-campaign/", "/tmp/llmbench-measurement.lock"]}
+```
+
+- If a process of the job still waits for one of these locks when `queue_s` from the launch ends, the broker stops the unit. The state is `conflict`. Its evidence gives the lock, the holders and `waited_s`. The kernel releases every lock that the runner held.
+- Thus, a job either starts within `queue_s` and has at least `max_s` left, or it never starts. systemd does not stop it in the middle of its work because of the queue.
+- The broker reads the setting at the admission. A later change applies to new jobs only.
+- List only locks that the runner takes before it starts its command. A wait for a listed lock after `queue_s` stops the job, also if the command itself waits.
+
 ### Exclusive use
 
 The broker gets exclusive use in two steps:
@@ -834,6 +859,8 @@ The broker appends each request, decision, verification, and alarm delivery to `
   A new machine resource from a proposal applies to all projects. The risk flags do not find every risk: read the diff.
 - **One machine.** Locks coordinate only the jobs of this machine. Brokers on other machines, also on the same tailnet, do not coordinate with this one.
 - **Lock order.** A workload that waits holds the locks that come earlier in its list. If its order is different from the order of a host runner, both wait until `queue_s` ends.
+- **Waits that a runner does not do with `flock`.** The broker sees only flock waits in `/proc/locks`. If a runner waits in another way, for example when it polls for the clear of a lockout, the state stays `running`, and `runner_queue` does not apply.
+- **The instant of the stop.** At the end of `queue_s`, the runner can get its lock in the same instant as the broker stops it. The command can then run for a very short time before it stops. The state is `conflict`.
 - **Defaults.** The defaults apply to every project under `roots`, also to a project that you did not expect. They cannot give services.
 - **Lockouts.** An operator clears a safety lockout. Mina never clears one.
 - **No root.** The broker cannot list the open files of other users' processes. Device ownership uses the KFD process list and `nvidia-smi`, which cover all users. NVIDIA graphics clients that do not compute are not listed.

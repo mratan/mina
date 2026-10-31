@@ -1030,7 +1030,8 @@ def launch_workload(project, sess, req):
             'resources': {n: resources[n] for n in names}, 'resource_names': names}
     hostlib.write_json(os.path.join(d, 'spec.json'), spec)
     rec = {'id': wid, 'workload': name, 'project': project, 'policy_source': policy_source(project), 'session': sess, 'unit': unit, 'resources': names,
-           'max_s': max_s, 'params': params, 'command': command, 'request_id': req.get('request_id'), 'admission': admission, 'state': 'launching', 'launched': now(), 'deadline': now() + max_s + queue_s, 'members_seen': []}
+           'max_s': max_s, 'params': params, 'command': command, 'request_id': req.get('request_id'), 'admission': admission, 'state': 'launching', 'launched': now(), 'deadline': now() + max_s + queue_s, 'members_seen': [],
+           'queue_s': queue_s, **({'runner_queue': list(w['runner_queue'])} if w.get('runner_queue') else {})}
     hostlib.write_json(os.path.join(d, 'record.json'), rec)   # recorded before launch: an interrupted launch is found
     r = subprocess.run(['systemd-run', '--user', '--quiet', '--collect', f'--unit={unit}', f'--slice={SLICE}',
                         '--property=Type=exec', f'--property=RuntimeMaxSec={max_s + queue_s}', '--property=KillMode=control-group',
@@ -1082,6 +1083,74 @@ def load_workload(project, wid):
     return rec
 
 
+# The unit of a broker workload, in a cgroup path: {UNIT_PREFIX}-{tag}-{id}.service
+WL_UNIT = re.compile(r'/' + re.escape(UNIT_PREFIX) + r'-[0-9a-f]{8}-(\d{14}-[0-9a-f]{6})\.service(?:/|$)')
+
+
+def holder_workload(pid):
+    """The broker workload whose unit contains this process: {id, project, workload, params}, or None."""
+    m = WL_UNIT.search(hostlib.cgroup_of(pid) or '')
+    rec = hostlib.read_json(os.path.join(WL, m.group(1), 'record.json')) if m else None
+    if not rec:
+        return None
+    return {'id': rec['id'], 'project': rec['project'], 'workload': rec['workload'], 'params': rec.get('params') or {}}
+
+
+def attributed(holders):
+    """Lock holders with the broker workload of each, where a holder belongs to one (any project of this machine)."""
+    out = []
+    for h in holders or []:
+        wl = holder_workload(h['pid'])
+        out.append({**h, 'workload': wl} if wl else h)
+    return out
+
+
+def lock_matches(wait, entries):
+    """Whether a wait is for one of the entries: a file, or a directory when the entry ends with "/". The file at that
+    path in the broker's namespace must be the file of the wait (dev:ino): a sandbox's own /tmp can have the same path."""
+    path = wait['lock']
+    for e in entries:
+        named = path.startswith(os.path.realpath(e) + '/') if e.endswith('/') else os.path.realpath(e) == path
+        if named and hostlib.lock_key(path) == wait['key']:
+            return True
+    return False
+
+
+def coordination_locks(rec):
+    """The locks for which a wait inside a job is a queue: every lock and turnstile of the machine resources and of the
+    project's resources, and the job's runner_queue."""
+    resources = [*machine_resources().values(), *((project_config(rec['project']) or {}).get('resources') or {}).values()]
+    paths = [e.get(k) for r in resources if isinstance(r, dict) for e in r.get('locks') or [] if isinstance(e, dict)
+             for k in ('path', 'turnstile')]
+    return [p for p in paths if isinstance(p, str)] + list(rec.get('runner_queue') or [])
+
+
+def runner_wait(rec, members):
+    """The coordination lock that a process of the job waits for now (a runner such as crun.py that takes the host
+    locks itself), or None. Waits for other locks, for example a cache lock of a build, are work, not a queue."""
+    entries = coordination_locks(rec)
+    for w in hostlib.blocked_waits(m['pid'] for m in members or []):
+        if lock_matches(w, entries):
+            return w
+    return None
+
+
+def note_runner_wait(rec, wait):
+    """Record a runner's wait as the state queued. With runner_queue, the end of queue_s (from the launch) stops the unit
+    while the runner still waits: the job then never starts, and a job that starts has its full max_s left."""
+    enforced = bool(rec.get('runner_queue')) and lock_matches(wait, rec['runner_queue'])
+    holders = attributed(hostlib.lock_holders(wait['lock']))
+    rec.update(state='queued', queued_by='runner', queue_deadline=rec['launched'] + rec.get('queue_s', 0) if enforced else None,
+               waiting_for={'lock': wait['lock'], 'mode': wait['mode'], 'holders': holders})
+    rec.setdefault('queued_since', now())
+    if enforced and now() >= rec['queue_deadline'] and not rec.get('runner_queue_expired'):
+        rec['runner_queue_expired'] = {'lock': wait['lock'], 'holders': holders, 'waited_s': round(now() - rec['launched'], 1),
+                                       'why': f'queue_s {rec.get("queue_s", 0)} ended while the runner waited for this lock'}
+        systemctl('stop', '--no-block', rec['unit'])
+        audit({'op': 'workload_queue_end', 'id': rec['id'], 'project': rec['project'], 'workload': rec['workload'],
+               'lock': wait['lock'], 'waited_s': rec['runner_queue_expired']['waited_s']})
+
+
 def reconcile_workload(rec):
     """Bring a record up to date from systemd, the cgroup and lockrun's result. Final states: exited, conflict, blocked,
     stopped, deadline, launch_failed; containment_unknown when a recorded process still lives after the unit ended."""
@@ -1097,11 +1166,16 @@ def reconcile_workload(rec):
         seen = {(m['pid'], m['start']) for m in rec['members_seen']}
         rec['members_seen'] += [m for m in (members or []) if (m['pid'], m['start']) not in seen][:200]
         rec['state'] = res.get('state') if res.get('state') in ('running', 'queued') else 'starting'
-        if rec['state'] == 'queued':
-            rec['waiting_for'] = res.get('waiting_for')
-            rec['queue_deadline'] = res.get('queue_deadline')
+        wait = runner_wait(rec, members) if rec['state'] == 'running' else None
+        if wait:
+            note_runner_wait(rec, wait)
+        elif rec['state'] == 'queued':
+            wf = res.get('waiting_for') or {}
+            rec.update(queued_by='broker', queue_deadline=res.get('queue_deadline'), queued_since=res.get('queued_since'),
+                       waiting_for={**wf, 'holders': attributed(wf.get('holders'))} if wf else None)
         else:
-            rec.pop('waiting_for', None)
+            for k in ('waiting_for', 'queued_by'):
+                rec.pop(k, None)
     else:
         # The unit has ended (collected units vanish). Every process ever seen in it, and any left in its cgroup, must be gone.
         left = hostlib.cgroup_members(f'/sys/fs/cgroup{rec["cgroup"]}') if rec.get('cgroup') else None
@@ -1116,14 +1190,19 @@ def reconcile_workload(rec):
             rec['state'] = 'stopped'
         elif st in ('exited', 'conflict', 'blocked'):
             rec['state'] = st
+        elif rec.get('runner_queue_expired'):
+            rec['state'] = 'conflict'
         elif st in ('running', 'terminated', 'queued'):
             rec['state'] = 'deadline' if now() >= rec['deadline'] - 1 else 'terminated'
         else:
             rec['state'] = 'launch_failed'
-        rec.pop('waiting_for', None)
+        for k in ('waiting_for', 'queued_by'):
+            rec.pop(k, None)
         rec['verification'] = {'unit_ended': True, 'cgroup_remaining': left, 'recorded_processes': len(known),
                                'still_alive': living, 'verified_exit': not living, 'checked_at': iso()}
         rec['result'] = {k: v for k, v in res.items() if k in ('rc', 'state', 'evidence', 'problems', 'signal', 'survivors')}
+        if rec['state'] == 'conflict' and rec.get('runner_queue_expired'):
+            rec['result']['evidence'] = rec['runner_queue_expired']
         rec['ended'] = now()
         cleanup = ((project_config(rec['project']) or {}).get('workloads') or {}).get(rec['workload'], {}).get('cleanup')
         if cleanup:   # a registered host-side tidy-up, e.g. podman records of containers whose processes are gone
@@ -1141,7 +1220,9 @@ def reconcile_workload(rec):
 def describe_workload(rec):
     out = {k: rec.get(k) for k in ('id', 'request_id', 'workload', 'unit', 'state', 'resources', 'max_s', 'params', 'command', 'admission', 'result', 'verification', 'cleanup')}
     if rec.get('state') == 'queued':   # what it waits for, and who holds that lock now
-        out.update(waiting_for=rec.get('waiting_for'), queue_deadline_at=iso(rec['queue_deadline']) if rec.get('queue_deadline') else None)
+        out.update(queued_by=rec.get('queued_by'), waiting_for=rec.get('waiting_for'),
+                   queued_since=iso(rec['queued_since']) if rec.get('queued_since') else None,
+                   queue_deadline_at=iso(rec['queue_deadline']) if rec.get('queue_deadline') else None)
     out['launched_at'] = iso(rec['launched'])
     out['output_tail'] = tail(os.path.join(WL, rec['id'], 'output.log'), 20)
     return out

@@ -1739,6 +1739,155 @@ class MachineResourceTest(unittest.TestCase):
         self.assertEqual(caps['resource:GPU']['source'], 'machine')
 
 
+class RunnerQueueTest(unittest.TestCase):
+    """A runner that takes the coordination locks itself (crun.py) and waits inside the job: the broker shows the wait as
+    queued, names the holder, and with runner_queue enforces queue_s as a queue ceiling. flock(1) stands in for the runner."""
+
+    def setUp(self):
+        self.b = b = Broker()
+        self.addCleanup(b.cleanup)
+        self.other = os.path.join(b.tmp, 'other-project')
+        os.makedirs(self.other)
+        self.gpu = f'{b.locks}/GPU_R.lock'
+        self.private = os.path.join(b.tmp, 'private.lock')      # not a coordination lock: no resource, no runner_queue
+        for p in (self.gpu, self.private):
+            put(p, '')
+        self.ran = os.path.join(b.tmp, 'runner-ran')
+        classes = {'observe': 'allow', 'reserve': 'allow', 'workload': 'allow', 'monitor': 'allow'}
+        runner = lambda lock, *cmd: ['flock', '-x', lock, *(cmd or ['touch', self.ran])]
+        queue = [b.locks + '/']
+        self.cfg = {'version': 1, 'resources': {'GPU': {'locks': [{'path': self.gpu}]}}, 'projects': {
+            b.project: {'classes': classes, 'workloads': {
+                'hold': {'argv': ['sleep', '300'], 'resources': ['GPU'], 'max_s': 300}}},
+            self.other: {'classes': classes, 'workloads': {
+                'cell': {'argv': runner(self.gpu), 'max_s': 30, 'queue_s': 1},
+                'cell-q': {'argv': runner(self.gpu), 'max_s': 30, 'queue_s': 2, 'runner_queue': queue},
+                'cell-private': {'argv': runner(self.private), 'max_s': 30, 'queue_s': 1, 'runner_queue': queue},
+                'cell-late': {'argv': runner(self.gpu, 'sh', '-c', f'sleep 3.5; touch {self.ran}'), 'max_s': 4, 'queue_s': 3,
+                              'runner_queue': queue}}}}}
+        hostlib.write_json(b.env['MINA_HOST_CONFIG'], self.cfg)
+        b.start()
+        self.grant_a = b.open_session()
+        self.grant_b = b.open_session(self.other)
+
+    def ok(self, grant, op, **kw):
+        out = self.b.raw({'op': op, 'grant': grant, **kw})
+        self.assertTrue(out['ok'], out)
+        return out['result']
+
+    def status(self, wid, grant=None):
+        return self.ok(grant or self.grant_b, 'workload_status', id=wid)
+
+    def end(self, wid, grant=None, timeout=30):
+        live = ('launching', 'starting', 'queued', 'running')
+        return wait_for(lambda: (lambda s: s if s['state'] not in live else None)(self.status(wid, grant)), timeout=timeout)
+
+    def queued(self, wid):
+        return wait_for(lambda: (lambda s: s if s['state'] == 'queued' else None)(self.status(wid)))
+
+    def test_a_wait_inside_the_runner_is_queued_with_the_holding_workload(self):
+        hold = self.ok(self.grant_a, 'workload_run', workload='hold')
+        self.assertTrue(wait_for(lambda: self.status(hold['id'], self.grant_a)['state'] == 'running'))
+        try:
+            w = self.ok(self.grant_b, 'workload_run', workload='cell')
+            q = self.queued(w['id'])
+            self.assertTrue(q, 'workload_status shows queued')
+            self.assertEqual(q['queued_by'], 'runner')
+            self.assertEqual(q['waiting_for']['lock'], self.gpu)
+            self.assertEqual(q['waiting_for']['mode'], 'exclusive')
+            held = [h for h in q['waiting_for']['holders'] if not h['waiting']]
+            self.assertTrue(held, q)
+            self.assertEqual(held[0].get('workload'), {'id': hold['id'], 'project': self.b.project, 'workload': 'hold', 'params': {}}, q)
+            # Without runner_queue, queue_s is no ceiling for the runner's own wait: past it, the job is still queued.
+            time.sleep(2)
+            self.assertEqual(self.status(w['id'])['state'], 'queued')
+            self.assertFalse([a for a in self.ok(self.grant_b, 'alarms')['pending'] if a['monitor'] == w['monitor']],
+                             'a queued workload has not ended')
+            self.assertFalse(os.path.exists(self.ran))
+        finally:
+            self.ok(self.grant_a, 'workload_stop', id=hold['id'])
+        end = self.end(w['id'])
+        self.assertEqual(end['state'], 'exited', end)
+        self.assertNotIn('waiting_for', end)
+        self.assertTrue(os.path.exists(self.ran))
+
+    def test_the_end_of_queue_s_stops_a_waiting_runner_as_a_conflict(self):
+        holder = flock_holder(self.gpu)
+        try:
+            w = self.ok(self.grant_b, 'workload_run', workload='cell-q')
+            end = self.end(w['id'])
+            self.assertEqual(end['state'], 'conflict', end)
+            evidence = end['result']['evidence']
+            self.assertEqual(evidence['lock'], self.gpu)
+            self.assertIn(holder.pid, [h['pid'] for h in evidence['holders']])
+            self.assertGreaterEqual(evidence['waited_s'], 2)
+            self.assertIn('queue_s', evidence['why'])
+            self.assertTrue(end['verification']['verified_exit'], end)
+            self.assertFalse(os.path.exists(self.ran))
+        finally:
+            holder.kill(); holder.wait()
+        self.assertTrue(free(self.gpu))
+
+    def test_a_wait_for_a_lock_that_is_not_a_coordination_lock_is_not_queued_or_stopped(self):
+        holder = flock_holder(self.private)
+        try:
+            w = self.ok(self.grant_b, 'workload_run', workload='cell-private')
+            time.sleep(2.5)                                                     # past queue_s 1
+            s = self.status(w['id'])
+            self.assertEqual(s['state'], 'running', s)
+            self.assertNotIn('waiting_for', s)
+        finally:
+            holder.kill(); holder.wait()
+        end = self.end(w['id'])
+        self.assertEqual(end['state'], 'exited', end)
+        self.assertTrue(os.path.exists(self.ran))
+
+    def test_a_runner_that_starts_within_queue_s_gets_its_full_max_s(self):
+        holder = flock_holder(self.gpu)
+        try:
+            w = self.ok(self.grant_b, 'workload_run', workload='cell-late')
+            self.assertTrue(self.queued(w['id']))
+            time.sleep(2.5)
+        finally:
+            holder.kill(); holder.wait()
+        # It runs from about 2.5 s to 6 s: past queue_s 3, and longer than max_s minus the wait.
+        end = self.end(w['id'])
+        self.assertEqual((end['state'], end['result'].get('rc')), ('exited', 0), end)
+        self.assertTrue(os.path.exists(self.ran))
+
+    @unittest.skipUnless(BWRAP, NEEDS_BWRAP)
+    def test_a_wait_for_a_private_file_at_a_coordination_path_is_work(self):
+        # The command sandbox of a cell has its own /tmp: a lock there has the path of a coordination lock, not its inode.
+        L = self.b.locks
+        script = f'flock -x {self.gpu} sleep 4 & sleep 0.5; flock -x {self.gpu} touch {self.ran}'
+        self.cfg['projects'][self.other]['workloads']['cell-private-ns'] = {
+            'argv': ['bwrap', '--dev-bind', '/', '/', '--tmpfs', L, '--bind', self.b.tmp + '/runner-out', self.b.tmp + '/runner-out',
+                     'sh', '-c', script.replace(self.ran, self.b.tmp + '/runner-out/ran')],
+            'max_s': 30, 'queue_s': 1, 'runner_queue': [L + '/']}
+        os.makedirs(self.b.tmp + '/runner-out')
+        hostlib.write_json(self.b.env['MINA_HOST_CONFIG'], self.cfg)
+        w = self.ok(self.grant_b, 'workload_run', workload='cell-private-ns')
+        time.sleep(2.5)                                                         # past queue_s 1, inside the private wait
+        s = self.status(w['id'])
+        self.assertEqual(s['state'], 'running', s)
+        end = self.end(w['id'])
+        self.assertEqual(end['state'], 'exited', end)
+        self.assertTrue(os.path.exists(self.b.tmp + '/runner-out/ran'))
+        self.assertTrue(free(self.gpu), 'the real lock was never taken')
+
+    def test_workload_stop_stops_a_runner_queued_job(self):
+        holder = flock_holder(self.gpu)
+        try:
+            w = self.ok(self.grant_b, 'workload_run', workload='cell')
+            self.assertTrue(self.queued(w['id']))
+            s = self.ok(self.grant_b, 'workload_stop', id=w['id'])
+            self.assertEqual(s['state'], 'stopped', s)
+            self.assertTrue(s['verification']['verified_exit'])
+        finally:
+            holder.kill(); holder.wait()
+        self.assertFalse(os.path.exists(self.ran))
+
+
 def shared_free(path):
     return subprocess.run(['flock', '-n', '-s', path, 'true']).returncode == 0
 

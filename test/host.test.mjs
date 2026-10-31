@@ -11,6 +11,8 @@ import { needsSandbox } from './capabilities.mjs';
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const CLAIM = Symbol.for('mina:host-claim');
 
@@ -120,6 +122,71 @@ test('extension: manifest in the system prompt and .mina; a subagent instance ge
   assert.ok(successor.tools.mina_host);
   await successor.emit('session_shutdown');
   await b.close();
+});
+
+// 2026-10-30: a conversation begun before its project could reach the broker (no mina_host then) was continued with -c.
+// Pi restores the tool loadout of the transcript, so mina_host stayed undeclared while the host prompt section offered it.
+test('extension: mina_host is activated when a continued transcript did not declare it; other tools stay as they are', async () => {
+  delete globalThis[CLAIM];
+  const b = await fakeBroker((req) => (req.op === 'capabilities' ? { ok: true, result: CAPS } : { ok: true, result: { pending: [], acked: [] } }));
+  const env = { MINA_HOST_SOCKET: b.socket, MINA_HOST_GRANT_FILE: b.grantFile };
+  const pi = fakePi();
+  let active = ['read', 'bash', 'mina_sandbox_request'];                 // the restored loadout of an old transcript
+  const sets = [];
+  pi.getActiveTools = () => [...active];
+  pi.setActiveTools = (names) => { sets.push(names); active = [...names]; };
+  minaHost(pi, { env, pollMs: 60_000 });
+  await pi.emit('session_start', {}, { cwd: mkdtempSync(join(tmpdir(), 'mina-proj-')) });
+  assert.deepEqual(active, ['read', 'bash', 'mina_sandbox_request', 'mina_host']);
+  await pi.emit('session_start', {}, { cwd: mkdtempSync(join(tmpdir(), 'mina-proj-')) });
+  assert.equal(sets.length, 1, 'no change when mina_host is already active');
+  await pi.emit('session_shutdown');
+  const older = fakePi();                                                   // a Pi without the active-tool API
+  minaHost(older, { env, pollMs: 60_000 });
+  await older.emit('session_start', {}, { cwd: mkdtempSync(join(tmpdir(), 'mina-proj-')) });
+  await older.emit('session_shutdown');
+  await b.close();
+});
+
+// The same with the pinned Pi itself: its transcript restore does not activate a tool registered later.
+test('real pi: a continued transcript without mina_host gets it at session_start; a plain later tool stays inactive', () => {
+  const root = mkdtempSync(join(tmpdir(), 'mina-host-resume-'));
+  const project = join(root, 'project'), sessions = join(root, 'sessions');
+  mkdirSync(project); mkdirSync(sessions); mkdirSync(join(root, 'agent'));
+  const ts = '2026-10-29T19:46:03.193Z';
+  const lines = [{ type: 'session', version: 3, id: '01a18932-b139-7347-b526-19f4e3ffe017', timestamp: ts, cwd: project },
+    { type: 'message', id: 'a0000001', parentId: null, timestamp: ts, message: { role: 'system', content: '', sections: { cwd: project },
+      toolsAdded: [{ name: 'read', description: 'read', parameters: {} }, { name: 'bash', description: 'bash', parameters: {} }], timestamp: 1 } },
+    { type: 'message', id: 'a0000002', parentId: 'a0000001', timestamp: ts, message: { role: 'user', content: 'hello', timestamp: 2 } }];
+  const file = join(sessions, 'old.jsonl');
+  writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  writeFileSync(join(root, 'grant'), 'G\n');
+  const code = `
+    const { createAgentSession, SessionManager, DefaultResourceLoader, SettingsManager } = await import(${JSON.stringify(join(REPO_ROOT, 'node_modules/@earendil-works/pi-coding-agent/dist/index.js'))});
+    const [root, project, file, mode] = process.argv.slice(1);
+    const settingsManager = SettingsManager.inMemory();
+    const probe = (pi) => pi.registerTool({ name: 'probe_tool', label: 'p', description: 'p', parameters: { type: 'object', properties: {} }, execute: async () => ({ content: [] }) });
+    const resourceLoader = new DefaultResourceLoader({ cwd: project, agentDir: root + '/agent', settingsManager, noExtensions: true, noSkills: true,
+      noContextFiles: true, noPromptTemplates: true, noThemes: true,
+      ...(mode === 'host' ? { additionalExtensionPaths: [${JSON.stringify(join(REPO_ROOT, 'extensions/host'))}] } : { extensionFactories: [probe] }) });
+    await resourceLoader.reload();
+    const { session } = await createAgentSession({ cwd: project, agentDir: root + '/agent', settingsManager, resourceLoader,
+      sessionManager: SessionManager.open(file, root + '/sessions', project) });
+    await session.bindExtensions({});
+    const names = session.getActiveToolNames();
+    console.log(JSON.stringify({ restored: names.includes('bash'), mina_host: names.includes('mina_host'), probe_tool: names.includes('probe_tool'),
+      registered: session.getAllTools().map((t) => t.name).filter((n) => ['mina_host', 'probe_tool'].includes(n)) }));
+    process.exit(0);`;
+  const run = (mode) => {
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', code, root, project, file, mode], { encoding: 'utf8', timeout: 60_000,
+      env: { PATH: process.env.PATH, HOME: root, MINA_HOST_SOCKET: join(root, 'no-broker.sock'), MINA_HOST_GRANT_FILE: join(root, 'grant') } });
+    assert.equal(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout.trim().split('\n').at(-1));
+  };
+  try {
+    assert.deepEqual(run('probe'), { restored: true, mina_host: false, probe_tool: false, registered: ['probe_tool'] }, 'pi keeps the transcript loadout');
+    assert.deepEqual(run('host'), { restored: true, mina_host: true, probe_tool: false, registered: ['mina_host'] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('the capability cache cannot overwrite a controller file through a project symlink', { skip: needsSandbox }, async () => {

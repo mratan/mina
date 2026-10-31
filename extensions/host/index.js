@@ -195,6 +195,10 @@ export default function minaHost(pi, { env = process.env, pollMs = POLL_MS, term
   }
 
   pi.on('session_start', async (_event, ctx) => {
+    // A continued conversation (-c, /resume) gets the tool loadout of its transcript. One begun when this project had no
+    // broker session never declared mina_host, so the tool stayed inactive while the host section of the prompt offered it.
+    const active = pi.getActiveTools?.();
+    if (active && !active.includes('mina_host')) pi.setActiveTools([...active, 'mina_host']);
     await refresh(ctx).catch(() => {});
     await deliver(ctx).catch(() => {});
     if (!unavailable && !timer) { timer = setInterval(() => deliver(ctx).catch(() => {}), pollMs); timer.unref?.(); }

@@ -122,9 +122,13 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
 
   // The steer tool passes the session context: a child launched on another branch is not steered from this one. The viewer
   // (a person) passes none and may steer or stop any running child of this runtime.
+  // Each refusal names its reason: a bare "no live child" made a parent conclude that its live children were lost.
   function steerChild(id, message, ctx) {
     const r = records.get(id);
-    if (retired || r?.owner !== owner || r.status !== 'running') throw new Error('No live child owned by this runtime.');
+    if (retired) throw new Error('No live child owned by this runtime: this runtime is shutting down.');
+    if (!r) throw new Error(`No child or task "${id}" in this runtime. Steer with the id from the Agent receipt ("id"), or pass task_id.`);
+    if (r.owner !== owner) throw new Error(`No live child owned by this runtime: ${id} belongs to an earlier runtime (a reload or another process), so it cannot be steered. Read it with get_subagent_result.`);
+    if (r.status !== 'running') throw new Error(`Child ${id} is not running (${r.status}): there is nothing to steer. Read it with get_subagent_result.`);
     if (ctx && !branchView(ctx).launches.has(id)) throw new Error('This child was launched on another branch. Return to that branch to steer it, or start a new child here.');
     r.agent.steer({ role: 'user', content: [{ type: 'text', text: message }], timestamp: Date.now() });
   }
@@ -464,8 +468,19 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
     renderCall: (args, theme) => renderChildCall('get_subagent_result', args, theme, label),
     renderResult: (res, options, theme, context) => renderChildResult('get_subagent_result', res, options, theme, context) });
   pi.registerTool({ name: 'steer_subagent', label: 'Steer child', description: 'Queue guidance for a running child without changing its authority or limits.',
-    parameters: schema({ agent_id: text, message: text }, ['agent_id', 'message']),
-    execute: async (_id, args, _signal, _update, ctx) => { steerChild(args.agent_id, args.message, ctx ?? {}); return result({ queued: true }); },
+    parameters: schema({ agent_id: { ...text, description: 'The child id from the Agent receipt. A task id also works: it steers that task\'s latest child.' },
+      task_id: { ...text, description: 'Steer the latest child of this task on the current branch.' }, message: text }, ['message']),
+    execute: async (_id, args, _signal, _update, ctx) => {
+      if (args.agent_id !== undefined && args.task_id !== undefined) throw new Error('Give agent_id or task_id, not both.');
+      const key = args.task_id ?? args.agent_id;
+      if (typeof key !== 'string' || !key) throw new Error('Give agent_id or task_id.');
+      // A task id resolves to its latest child on this branch; a child id is used as it is.
+      const task = args.task_id !== undefined || !records.has(key) ? branchView(ctx ?? {}).tasks.get(key) : null;
+      if (args.task_id !== undefined && !task) throw new Error(`No task "${key}" on the current branch.`);
+      const id = task ? task.attempts.at(-1) : key;
+      steerChild(id, args.message, ctx ?? {});
+      return result({ queued: true, agent_id: id, ...(task ? { task_id: key } : {}) });
+    },
     renderCall: (args, theme) => renderChildCall('steer_subagent', args, theme, label),
     renderResult: (res, options, theme, context) => renderChildResult('steer_subagent', res, options, theme, context) });
   // The list and fleet need the session's UI; a parent tool call also ages finished rows out of the list.

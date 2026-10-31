@@ -196,7 +196,7 @@ export function renderAgentResult(result, { expanded = false, isPartial = false 
 
 // `label(id)` names a child this runtime knows ("delegate  description"); otherwise the row shows the short id.
 export function renderChildCall(tool, args, theme, label) {
-  const id = typeof args?.agent_id === 'string' ? args.agent_id : '';
+  const id = typeof args?.agent_id === 'string' ? args.agent_id : typeof args?.task_id === 'string' ? args.task_id : '';
   const known = id ? label(id) : null;
   const target = known ? `${nameOf(known.type, theme, { fallbackColor: 'accent' })}  ${theme.fg('muted', known.description)}`
     : theme.fg('accent', id ? short(id) : '…');

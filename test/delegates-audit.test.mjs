@@ -222,6 +222,25 @@ test('after a branch switch, an off-branch child cannot be superseded, resumed o
   } finally { open(); await f.shutdown(); }
 });
 
+// 2026-10-30: a parent steered three live children with their task_id as agent_id and got "No live child owned by this
+// runtime"; it concluded they belonged to an earlier runtime. A task id steers its latest child; each refusal says why.
+test('steer_subagent takes a task id, as agent_id or task_id; an unknown or finished child is refused with the reason', { skip: needsSandbox }, async () => {
+  const { gate, open } = gated();
+  const f = await fixture([async () => { await gate; return fauxAssistantMessage('bg'); }, ...['s1', 's2', 's3'].map((t) => fauxAssistantMessage(t))]);
+  try {
+    const bg = await f.call('Agent', { prompt: 'x', description: 'bg', task_id: 'ml4-final-L-topo' });       // each steer adds a turn
+    assert.equal(body(await f.call('steer_subagent', { agent_id: 'ml4-final-L-topo', message: 'correction' })).queued, true);
+    const byTask = body(await f.call('steer_subagent', { task_id: 'ml4-final-L-topo', message: 'correction 2' }));
+    assert.deepEqual([byTask.queued, byTask.agent_id], [true, bg.details.id]);
+    assert.equal(body(await f.call('steer_subagent', { agent_id: bg.details.id, message: 'by id' })).queued, true);
+    await f.reject('steer_subagent', { agent_id: 'nope', message: 'x' }, /No child or task "nope" in this runtime[^]*id from the Agent receipt/);
+    await f.reject('steer_subagent', { agent_id: bg.details.id, task_id: 'ml4-final-L-topo', message: 'x' }, /not both/);
+    open();
+    await f.call('get_subagent_result', { agent_id: bg.details.id, wait: true });
+    await f.reject('steer_subagent', { task_id: 'ml4-final-L-topo', message: 'late' }, /is not running \(completed\)[^]*get_subagent_result/);
+  } finally { open(); await f.shutdown(); }
+});
+
 test('without a session manager every child of this runtime counts as on the branch (compatibility)', { skip: needsSandbox }, async () => {
   const f = await fixture([fauxAssistantMessage('a'), fauxAssistantMessage('a again'), fauxAssistantMessage('b')], { sessionManager: false });
   try {
@@ -321,7 +340,7 @@ test('after a reload with the same instance id, the earlier runtime\'s child rea
     assert.equal(read.historical, true);
     assert.equal(read.status, 'completed');
     await f.reject('Agent', { prompt: 'x', description: 'x', resume: a.details.id }, /Cannot resume a historical child/);
-    await f.reject('steer_subagent', { agent_id: a.details.id, message: 'x' }, /No live child/);
+    await f.reject('steer_subagent', { agent_id: a.details.id, message: 'x' }, /No live child owned by this runtime[^]*earlier runtime/);
     const t = body(await f.call('get_subagent_result', { task_id: 'alpha' })).task;
     assert.equal(t.latest.historical, true);
     assert.equal(f.faux.state.callCount, 1);

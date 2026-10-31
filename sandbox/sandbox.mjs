@@ -416,6 +416,14 @@ export const COMMAND_ENV = /^(PATH|HOME|USER|LOGNAME|LANG|LANGUAGE|LC_[A-Z_]+|TE
 function refusePrivateOverlap(p, trustedRoots) {
   if (trustedRoots.map(canonical).some((r) => contains(p, r) || contains(r, p))) throw new Error(`mina sandbox: readable root overlaps private controller state: ${p}`);
 }
+// The read and write roots of a launch (sandbox.json, --sandbox-read, --sandbox-write) that do not exist: [{ path, kind }].
+// The launcher leaves them out with a note. A folder made later at such a path is not mounted in that session, because
+// the launch checks (hardlinks, sockets, special files) did not cover it. The project is never in the list.
+export function missingRoots(s) {
+  return [...s.writable.filter((p) => canonical(p) !== canonical(s.project)).map((path) => ({ path, kind: 'write' })),
+    ...s.readable.map((path) => ({ path, kind: 'read' }))].filter(({ path }) => !existsSync(path));
+}
+
 export function validateReadableRoots(roots, { trustedRoots = [] } = {}) {
   for (const root of roots) {
     const p = canonical(root);
@@ -475,8 +483,10 @@ export function innerArgs({ cwd, project = cwd, writable = [project], readable =
   if (!NETWORK_LEVELS.includes(network)) throw new Error('mina sandbox: invalid network level');
   if (network !== 'offline' && !egressSocket) throw new Error(`mina sandbox: ${network} network needs the egress proxy`);
   if (!cwd || !project) throw new Error('mina sandbox: cwd and project required');
-  const writes = [...new Set(writable.map(canonical))];
-  const reads = [...new Set([...readable, ...readOnly.filter(existsSync), ...exposed.filter(existsSync)].map(canonical))];
+  // A root that no longer exists is not mounted: bwrap refuses a missing bind source, so one deleted folder (a read grant
+  // for a sibling repository) would stop every command and file operation. The project stays: its loss must be loud.
+  const writes = [...new Set(writable.filter((p) => canonical(p) === canonical(project) || existsSync(p)).map(canonical))];
+  const reads = [...new Set([...readable, ...readOnly, ...exposed].filter(existsSync).map(canonical))];
   validateTrustedResources([claudeConfigFile(homedir(), env)], writes);
   validateRootPolicy(writes, defaultWritable(homedir(), env));
   // Refuse broad data mounts that would import host control sockets or runtime paths.

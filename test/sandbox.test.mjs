@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { outerArgs, innerArgs, wrapCommand, scrubEnv, insideAny, projectProblem, settings, loadConfig, claudeState, defaultWritable, defaultHidden, REPO, minaCode, validateTrustedResources, validateWritableRoots, validateReadableRoots, projectRoot, checkReadGrant, scanReadableRoot } from '../sandbox/sandbox.mjs';
+import { outerArgs, innerArgs, wrapCommand, scrubEnv, insideAny, projectProblem, settings, loadConfig, claudeState, defaultWritable, defaultHidden, REPO, minaCode, validateTrustedResources, validateWritableRoots, validateReadableRoots, projectRoot, checkReadGrant, scanReadableRoot, missingRoots } from '../sandbox/sandbox.mjs';
 import minaSandbox, { sandboxNote, scanLine } from '../extensions/sandbox/index.js';
 import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
-import { runWorker } from '../sandbox/worker-client.mjs';
+import { runWorker, runFileOperation } from '../sandbox/worker-client.mjs';
 import minaIdentity from '../extensions/identity/index.js';
 import { needsSandbox } from './capabilities.mjs';
 
@@ -538,6 +538,44 @@ test('mina_sandbox_request: shows the progress of a long scan, can be cancelled 
   assert.equal(asked.length, 2); assert.equal(updates.length, 0);
   assert.equal(scanLine('/d', { folders: 1, files: 1234, current: '/d/run7/images' }, 75000),
     'Checking /d for Unix sockets and special files before asking the user · 1 folder · 1,234 files · 1m15s · now in run7/images · Esc cancels');
+});
+
+// 2026-10-30: a deleted sibling repository with a read grant stopped every local tool of another session (bwrap: Can't
+// find source path). A root that no longer exists is not mounted; the project itself still is, so its loss stays loud.
+test('inner layer: a read or write root that was deleted is not mounted; the project still is', () => {
+  const project = mkdtempSync(join(tmpdir(), 'mina-gone-project-'));
+  const reads = mkdtempSync(join(tmpdir(), 'mina-gone-read-'));
+  const writes = mkdtempSync(join(tmpdir(), 'mina-gone-write-'));
+  const args = () => innerArgs({ cwd: project, project, writable: [project, writes], readable: [reads], env: {} }).join(' ');
+  assert.ok(args().includes(`--ro-bind ${reads} ${reads}`) && args().includes(`--bind ${writes} ${writes}`));
+  rmSync(reads, { recursive: true }); rmSync(writes, { recursive: true });
+  assert.ok(!args().includes(reads) && !args().includes(writes), 'deleted roots are left out');
+  assert.ok(args().includes(`--bind ${project} ${project}`));
+  rmSync(project, { recursive: true });
+  assert.ok(args().includes(`--bind ${project} ${project}`), 'a deleted project is still mounted, so bwrap refuses loudly');
+});
+
+test('missingRoots: the read and write roots of a launch that do not exist, never the project', () => {
+  const home = mkdtempSync(join(tmpdir(), 'mina-missing-'));
+  const cwd = join(home, 'project'); mkdirSync(cwd); mkdirSync(join(home, 'data'));
+  const s = settings({ cwd, home, env: {}, read: ['~/gone-read'], write: ['~/gone-write'], config: { file: null, read: ['~/data'] } });
+  assert.deepEqual(missingRoots(s), [{ path: join(home, 'gone-write'), kind: 'write' }, { path: join(home, 'gone-read'), kind: 'read' }]);
+  rmSync(cwd, { recursive: true });
+  assert.ok(!missingRoots(s).some((m) => m.path === cwd), 'the project is not a launch root to drop');
+});
+
+test('real worker: a read grant whose folder is deleted does not stop the next command', { skip: needsSandbox }, async () => {
+  const project = mkdtempSync(join(tmpdir(), 'mina-gone-project-'));
+  const sibling = mkdtempSync(join(tmpdir(), 'mina-gone-sibling-'));
+  writeFileSync(join(project, 'a.txt'), 'alive\n');
+  const env = { ...grantEnv(project), MINA_SANDBOX_READ: JSON.stringify([sibling]) };
+  const sh = () => runWorker(['/bin/bash', '-c', 'cat a.txt 2>&1'], { cwd: project, env, network: 'offline', timeout: 10 });
+  assert.equal((await sh()).stdout.toString(), 'alive\n');
+  rmSync(sibling, { recursive: true });
+  const after = await sh();
+  assert.equal(after.exitCode, 0, after.stderr.toString());
+  assert.equal(after.stdout.toString(), 'alive\n');
+  assert.equal((await runFileOperation('read', { path: join(project, 'a.txt') }, { cwd: project, env })).toString(), 'alive\n');
 });
 
 test('real worker: a read grant applies to the next command without a restart', { skip: needsSandbox }, async () => {

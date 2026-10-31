@@ -341,6 +341,12 @@ If nobody answers within 5 minutes, or if there is no terminal, the request wait
 Type `/mina-sandbox` to decide waiting requests and to show what the agent can see.
 Write access to a new folder needs a restart with `--sandbox-write PATH`.
 
+You can delete a folder that a session can read or write, for example another clone of the repository.
+The session then continues without that folder. Its commands and file tools continue to work.
+If you make a folder again at the same path, a read grant from earlier in the session applies to it again, without a new scan.
+A folder of `--sandbox-read`, `--sandbox-write`, or `sandbox.json` that does not exist at the launch is left out of that session, with a note.
+If the project folder itself is deleted, the commands stop with an error.
+
 ### Permanent settings
 
 Put permanent sandbox settings in `~/.config/mina/sandbox.json`:

@@ -308,6 +308,13 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   }
   if (!existsSync(PI_CLI)) { process.stderr.write(`mina: the pinned Pi is missing: ${PI_CLI}\n`); return 1; }
   const p = plan(argv, env);
+  if (p.sandbox) {   // a deleted folder in sandbox.json or a flag must not stop every launch: it is left out, with a note
+    const missing = sandbox.missingRoots(p.sandbox);
+    for (const m of missing) process.stderr.write(`mina: the ${m.kind} folder ${m.path} (sandbox.json or --sandbox-${m.kind}) does not exist; this session does not mount it\n`);
+    const gone = new Set(missing.map((m) => m.path));
+    p.sandbox.writable = p.sandbox.writable.filter((x) => !gone.has(x));
+    p.sandbox.readable = p.sandbox.readable.filter((x) => !gone.has(x));
+  }
   for (const s of p.skipped ?? []) process.stderr.write(`mina: your Pi or project settings already load ${({ goal: 'pi-goal', literature: 'pi-literature-broker', 'research-search': 'pi-research-search' })[s] ?? s}; mina uses that copy instead of its own\n`);
   if (p.sandbox && p.mode === 'full' && !argv.some(a => ['--no-skills', '-ns'].includes(a))) {
     const skills = await ownerSkills({ agentDir: agentDir(env), home: homedir(), writable: p.sandbox.writable,

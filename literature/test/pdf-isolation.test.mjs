@@ -17,6 +17,8 @@ import { DEFAULT_PYTHON, PDF_SCRIPT, RLIMIT_PRELUDE, extractPdfText } from '../s
 import { BWRAP, pdfSandboxArgs, resolvePdfRuntime, runSandboxedPython } from '../supplements/pdf-sandbox.mjs';
 import { buildPdf } from './supplement-fixtures.mjs';
 import { createProviders } from '../broker/providers.mjs';
+import { SANDBOX } from '../../test/capabilities.mjs';
+import { MACOS } from '../../sandbox/sandbox.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const PY = process.env.SUPPLEMENT_TEST_PYTHON || DEFAULT_PYTHON;
@@ -24,7 +26,10 @@ const userns = existsSync(BWRAP) && spawnSync(BWRAP, ['--unshare-user', '--unsha
   { env: { PATH: '/usr/bin' }, stdio: 'ignore' }).status === 0;
 // Slow hosts (a small ARM board under load) set MINA_TEST_TIMEOUT_SCALE; teardown after an abort can take longer than 3 s there.
 const SCALE = Math.max(1, Number(process.env.MINA_TEST_TIMEOUT_SCALE) || 1);
-const REAL = !existsSync(PY) ? `no Python at ${PY} (set SUPPLEMENT_TEST_PYTHON)` : !userns ? `bubblewrap namespaces unavailable (${BWRAP})` : false;
+// macOS: the converter runs as a call of a sandbox supervisor (test/capabilities.mjs starts one for this process).
+const REAL = !existsSync(PY) ? `no Python at ${PY} (set SUPPLEMENT_TEST_PYTHON)`
+  : MACOS ? (SANDBOX ? false : 'needs the macOS helper (npm run macos:helpers)')
+  : !userns ? `bubblewrap namespaces unavailable (${BWRAP})` : false;
 
 const fakeChild = () => {
   const c = new EventEmitter(); c.stdout = new EventEmitter(); c.stderr = new EventEmitter();
@@ -38,9 +43,11 @@ function fakeVenv(home = '/usr/bin') {
   writeFileSync(join(root, 'pyvenv.cfg'), `home = ${home}\n`);
   return { root, python: join(root, 'bin', 'python'), cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
-const markerProcesses = (marker) => readdirSync('/proc').filter((p) => /^\d+$/.test(p)).filter((p) => {
-  try { return readFileSync(`/proc/${p}/cmdline`, 'utf8').includes(marker); } catch { return false; }
-});
+const markerProcesses = (marker) => (MACOS
+  ? spawnSync('/usr/bin/pgrep', ['-f', marker], { encoding: 'utf8' }).stdout.split('\n').filter(Boolean)
+  : readdirSync('/proc').filter((p) => /^\d+$/.test(p)).filter((p) => {
+    try { return readFileSync(`/proc/${p}/cmdline`, 'utf8').includes(marker); } catch { return false; }
+  }));
 const waitFor = async (fn, ms = 5000) => { const end = Date.now() + ms; while (Date.now() < end) { if (fn()) return true; await new Promise((r) => setTimeout(r, 25)); } return fn(); };
 
 // ---------------------------------------------------------------- real functionality inside the sandbox
@@ -115,7 +122,7 @@ attempt("limits", lambda: [resource.getrlimit(r) for r in (resource.RLIMIT_AS, r
 sys.stdout.write(json.dumps(res)); sys.stdout.flush()
 `;
 
-test('canary in the PDF namespace: no owner secrets, no writes outside /tmp, no host loopback, no caps/fds/env', { skip: REAL }, async () => {
+test('canary in the PDF namespace: no owner secrets, no writes outside /tmp, no host loopback, no caps/fds/env', { skip: MACOS ? 'Linux namespaces; macOS: the canary in the PDF sandbox profile' : REAL }, async () => {
   const token = `SECRET-CANARY-${process.pid}-${Date.now()}`;
   const hostTmp = mkdtempSync(join(tmpdir(), 'pdf-canary-'));
   const repoTmp = mkdtempSync(join(REPO, '.pdf-canary-'));
@@ -221,7 +228,7 @@ test('stdout cap still applies inside the sandbox', { skip: REAL }, async () => 
 
 // ---------------------------------------------------------------- fail closed
 
-test('missing or untrusted bubblewrap fails closed: nothing is spawned, no unsandboxed fallback', async () => {
+test('missing or untrusted bubblewrap fails closed: nothing is spawned, no unsandboxed fallback', { skip: MACOS && 'Linux (bwrap); macOS: a missing supervisor fails closed' }, async () => {
   const calls = [];
   const spawnImpl = (cmd, args) => { calls.push([cmd, args]); return fakeChild(); };
   const v = fakeVenv();
@@ -292,4 +299,103 @@ test('broker pdfToText: Markdown from the sandboxed pymupdf4llm, with no write t
     assert.equal(await p.pdfToText(Buffer.from('%PDF-1.4 not really')), '', 'a broken PDF is empty text, as before');
     await p.close?.();
   } finally { process.env.HOME = saved; rmSync(home, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------- macOS: the same properties in the Seatbelt profile
+
+const MAC_CANARY = String.raw`
+import os, sys, json, socket, resource
+paths = json.loads(sys.argv[1]); res = {}
+def attempt(name, fn):
+    try:
+        res[name] = ["ok", fn()]
+    except BaseException as e:
+        res[name] = ["err", type(e).__name__ + ":" + str(getattr(e, "errno", ""))]
+for i, p in enumerate(paths["secrets"]):
+    attempt("read%d" % i, lambda p=p: open(p).read())
+for i, p in enumerate(paths["writes"]):
+    def w(p=p):
+        with open(p, "w") as f: f.write("x")
+        return "written"
+    attempt("write%d" % i, w)
+def tmpw():
+    p = os.path.join(os.environ["TMPDIR"], "probe")
+    fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o600)
+    try: os.write(fd, b"x")
+    finally: os.close(fd)
+    return "wrote-bytes"
+attempt("tmp_bytes", tmpw)
+attempt("home", lambda: os.listdir(paths["home"]))
+attempt("repo", lambda: os.listdir(paths["repo"]))
+attempt("env", lambda: dict(os.environ))
+def tcp():
+    s = socket.create_connection(("127.0.0.1", paths["port"]), timeout=2); s.close(); return "connected"
+attempt("tcp", tcp)
+attempt("dns", lambda: socket.getaddrinfo("example.com", 443))
+attempt("signal", lambda: os.kill(paths["outside_pid"], 0))
+attempt("limits", lambda: [resource.getrlimit(r) for r in (resource.RLIMIT_CPU, resource.RLIMIT_FSIZE, resource.RLIMIT_CORE, resource.RLIMIT_NOFILE)])
+sys.stdout.write(json.dumps(res)); sys.stdout.flush()
+`;
+
+test('macOS canary in the PDF sandbox: no owner secrets, no writes, no host loopback or DNS, no other processes, clean environment', { skip: MACOS ? REAL : 'macOS only' }, async () => {
+  const token = `SECRET-CANARY-${process.pid}-${Date.now()}`;
+  const hostTmp = mkdtempSync(join(tmpdir(), 'pdf-canary-'));
+  const repoTmp = mkdtempSync(join(REPO, '.pdf-canary-'));
+  const secrets = [join(hostTmp, 'secret'), join(repoTmp, 'secret')];
+  for (const f of secrets) writeFileSync(f, token, { mode: 0o600 });
+  const probe = `pdf-canary-pwned-${process.pid}-${Date.now()}`;
+  const venvRoot = resolvePdfRuntime(PY).mounts[0];
+  const writes = [join(venvRoot, probe), join(repoTmp, probe), join(hostTmp, probe), join(homedir(), probe), `/private/tmp/${probe}`];
+  process.env.MINA_PDF_CANARY_SECRET = token;
+  let connections = 0;
+  const server = net.createServer((s) => { connections++; s.destroy(); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const out = await runSandboxedPython(Buffer.alloc(0), { python: PY, script: RLIMIT_PRELUDE + MAC_CANARY, maxMemoryBytes: 1024 ** 3, timeoutMs: 20000,
+      args: [JSON.stringify({ secrets, writes, home: homedir(), repo: REPO, port: server.address().port, outside_pid: process.pid })] });
+    assert.ok(!out.status, JSON.stringify(out));
+    assert.ok(!JSON.stringify(out).includes(token), 'secret token visible inside the sandbox');
+    for (let i = 0; i < secrets.length; i++) assert.equal(out[`read${i}`][0], 'err', secrets[i]);
+    for (let i = 0; i < writes.length; i++) assert.equal(out[`write${i}`][0], 'err', writes[i]);
+    for (const f of writes) assert.equal(existsSync(f), false, f);
+    assert.deepEqual(out.tmp_bytes, ['err', 'OSError:27'], 'RLIMIT_FSIZE=0 refuses bytes (EFBIG) in the private TMPDIR');
+    assert.equal(out.home[0], 'err'); assert.equal(out.repo[0], 'err');
+    assert.deepEqual(Object.keys(out.env[1]).filter((k) => !['__CF_USER_TEXT_ENCODING', 'PWD'].includes(k)).sort(),
+      ['HOME', 'LANG', 'LC_ALL', 'OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'ORT_DISABLE_TELEMETRY', 'PATH', 'TMPDIR'].sort());
+    assert.equal(out.env[1].HOME, out.env[1].TMPDIR.replace(/\/$/, ''), 'HOME is the private TMPDIR');
+    assert.equal(out.tcp[0], 'err'); assert.equal(connections, 0);
+    assert.equal(out.dns[0], 'err', 'no name resolution');
+    assert.equal(out.signal[0], 'err', 'no signal to a process outside the sandbox');
+    const [cpu, fsize, core, nofile] = out.limits[1];
+    assert.ok(cpu[0] >= 1 && cpu[0] <= 21, String(cpu)); assert.deepEqual(fsize, [0, 0]); assert.deepEqual(core, [0, 0]); assert.deepEqual(nofile, [64, 64]);
+  } finally {
+    delete process.env.MINA_PDF_CANARY_SECRET;
+    for (const f of writes) if (f.startsWith(venvRoot) || f.startsWith(homedir())) rmSync(f, { force: true });
+    server.close();
+    rmSync(hostTmp, { recursive: true, force: true }); rmSync(repoTmp, { recursive: true, force: true });
+  }
+});
+
+test('macOS: the memory bound stops the converter (RLIMIT_AS on Linux)', { skip: MACOS ? REAL : 'macOS only' }, async () => {
+  const hog = `${RLIMIT_PRELUDE}x = bytearray(600 * 1024 * 1024)\nfor i in range(0, len(x), 4096): x[i] = 1\nprint("{}")\n`;
+  const r = await runSandboxedPython(Buffer.alloc(0), { python: PY, script: hog, maxMemoryBytes: 256 * 1024 ** 2, timeoutMs: 20000 });
+  assert.equal(r.status, 'extractor_failed', JSON.stringify(r));
+});
+
+test('macOS: inside an instance without its sandbox supervisor the converter fails closed and nothing is spawned', { skip: MACOS ? false : 'macOS only' }, async () => {
+  const saved = process.env.MINA_SUPERVISOR_SOCKET, savedSandbox = process.env.MINA_SANDBOX;
+  let spawned = 0;
+  try {
+    process.env.MINA_SUPERVISOR_SOCKET = '/nonexistent/mina-supervisor';
+    process.env.MINA_SANDBOX = '1';
+    const v = fakeVenv();
+    try {
+      const r = await extractPdfText(buildPdf(['x']), { python: v.python, spawnImpl: () => { spawned++; return fakeChild(); } });
+      assert.equal(r.status, 'pdf_extractor_unavailable'); assert.equal(r.reason, 'isolation_unavailable');
+      assert.equal(spawned, 0);
+    } finally { v.cleanup(); }
+  } finally {
+    if (saved === undefined) delete process.env.MINA_SUPERVISOR_SOCKET; else process.env.MINA_SUPERVISOR_SOCKET = saved;
+    if (savedSandbox === undefined) delete process.env.MINA_SANDBOX; else process.env.MINA_SANDBOX = savedSandbox;
+  }
 });

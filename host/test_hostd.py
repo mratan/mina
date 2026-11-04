@@ -4,7 +4,9 @@
 An isolated broker instance runs with its own config, state, socket, slice and lock directory, so nothing here touches
 production locks or services. Each test has a positive and a negative control. Run: python3 -I host/test_hostd.py -v
 The broker tests need a systemd user session (systemctl --user) and some need bubblewrap with unprivileged user
-namespaces; without them they are skipped, with the reason.
+namespaces; without them they are skipped, with the reason. On macOS they run against launchd, resource coalitions and
+Seatbelt instead (run them as a user who is logged in to the Mac, so that the gui domain exists), and the macOS tests at
+the end run too. macOS has no flock(1): FLOCK is a stand-in with the same arguments.
 """
 import hashlib
 import base64
@@ -26,6 +28,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import hostlib  # noqa: E402
 import hostd  # noqa: E402
+if sys.platform == 'darwin':
+    import darwin  # noqa: E402
 
 CLIENT = r'''
 import json, socket, sys
@@ -48,10 +52,44 @@ def _works(argv):
         return False
 
 
-SYSTEMD_USER = _works(['systemctl', '--user', 'show-environment']) and shutil.which('systemd-run') is not None
-BWRAP = _works(['bwrap', '--ro-bind', '/', '/', '--unshare-net', 'true'])
-NEEDS_SYSTEMD = 'needs a systemd user session (systemctl --user)'
+DARWIN = sys.platform == 'darwin'
+SYSTEMD_USER = not DARWIN and _works(['systemctl', '--user', 'show-environment']) and shutil.which('systemd-run') is not None
+BWRAP = not DARWIN and _works(['bwrap', '--ro-bind', '/', '/', '--unshare-net', 'true'])
+LAUNCHD = DARWIN and _works(['/bin/launchctl', 'print', f'gui/{os.getuid()}'])
+SEATBELT = DARWIN and _works(['/usr/bin/sandbox-exec', '-p', '(version 1)(allow default)', '/usr/bin/true'])
+SERVICES = SYSTEMD_USER or LAUNCHD   # the host's service manager: systemd user units, or launchd jobs on macOS
+SANDBOX = BWRAP or SEATBELT          # the workload command sandbox: bwrap, or Seatbelt on macOS
+NEEDS_SYSTEMD = 'needs a systemd user session (systemctl --user), or launchd (a user logged in to the Mac)'
 NEEDS_BWRAP = 'needs bubblewrap with unprivileged user namespaces'
+NEEDS_SANDBOX = 'needs bubblewrap with unprivileged user namespaces, or sandbox-exec on macOS'
+NEEDS_MACOS = 'needs macOS with launchd and sandbox-exec'
+SANDBOX_EXEC = '/usr/bin/sandbox-exec'
+ALLOW_ALL = '(version 1)(allow default)'   # a Seatbelt sandbox that denies nothing: only the fact of a sandbox counts
+
+# flock(1): util-linux on Linux. macOS has none; this stand-in takes the same arguments (-x, -s, -n, a path, a command)
+# and, as flock(1), passes the locked descriptor to the command.
+FLOCK_PY = r'''
+import fcntl, os, subprocess, sys
+args, op, nb = sys.argv[1:], fcntl.LOCK_EX, 0
+while args and args[0].startswith('-'):
+    a = args.pop(0)
+    op = fcntl.LOCK_SH if a == '-s' else fcntl.LOCK_EX if a == '-x' else op
+    nb = fcntl.LOCK_NB if a == '-n' else nb
+fd = os.open(args.pop(0), os.O_RDONLY | os.O_CREAT, 0o644)
+try:
+    fcntl.flock(fd, op | nb)
+except BlockingIOError:
+    sys.exit(1)
+sys.exit(subprocess.call(args, pass_fds=(fd,)) if args else 0)
+'''
+if DARWIN:
+    _flock_dir = tempfile.mkdtemp(prefix='mina-flock-')
+    with open(os.path.join(_flock_dir, 'flock.py'), 'w') as _f:
+        _f.write(FLOCK_PY)
+    FLOCK = [sys.executable, '-I', os.path.join(_flock_dir, 'flock.py')]
+    __import__('atexit').register(shutil.rmtree, _flock_dir, True)
+else:
+    FLOCK = ['flock']
 
 
 def put(path, text):
@@ -71,7 +109,7 @@ def wait_for(fn, timeout=15, step=0.1):
 
 class Broker:
     def __init__(self):
-        self.tmp = tempfile.mkdtemp(prefix='mina-hostd-test-')
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix='mina-hostd-test-'))   # /var is a symlink on macOS
         self.tag = secrets.token_hex(3)
         self.project = os.path.join(self.tmp, 'project')
         self.locks = os.path.join(self.tmp, 'locks')
@@ -105,6 +143,15 @@ class Broker:
         hostlib.write_json(self.env['MINA_HOST_CONFIG'], {'version': 1, 'projects': {self.project: project_cfg}, **top})
 
     def unit(self, name, *argv, props=()):
+        if DARWIN:   # a launchd job that runs once, as a transient service without Restart=
+            label = f'minatest-{name}-{self.tag}'
+            plist = os.path.join(self.tmp, f'{label}.plist')
+            darwin.write_plist(plist, {'Label': label, 'ProgramArguments': list(argv), 'RunAtLoad': True,
+                                       'StandardOutPath': os.path.join(self.tmp, f'{label}.log'),
+                                       'StandardErrorPath': os.path.join(self.tmp, f'{label}.log')})
+            subprocess.run(['/bin/launchctl', 'bootstrap', f'gui/{os.getuid()}', plist], check=True)
+            self.units.append(label)
+            return label
         unit = f'minatest-{name}-{self.tag}.service'
         subprocess.run(['systemd-run', '--user', '--quiet', f'--unit={unit}', *[f'--property={p}' for p in props], '--', *argv], check=True)
         self.units.append(unit)
@@ -132,6 +179,22 @@ class Broker:
 
     def cleanup(self):
         self.stop()
+        if DARWIN:
+            # Every job of this broker, and every process left in a workload's coalition.
+            for u in self.units:
+                subprocess.run(['/bin/launchctl', 'bootout', f'gui/{os.getuid()}/{u}'], capture_output=True)
+            prefix = self.env['MINA_HOST_UNIT_PREFIX'] + '.'
+            for label in [x for x in darwin.jobs() if x.startswith(prefix)]:
+                subprocess.run(['/bin/launchctl', 'bootout', f'gui/{os.getuid()}/{label}'], capture_output=True)
+            wl = os.path.join(self.env['MINA_HOST_STATE'], 'workloads')
+            for wid in (os.listdir(wl) if os.path.isdir(wl) else []):
+                rec = hostlib.read_json(os.path.join(wl, wid, 'record.json')) or {}
+                if rec.get('coalition'):
+                    darwin.sweep([rec['coalition']])
+                if rec.get('tmpdir'):
+                    shutil.rmtree(rec['tmpdir'], ignore_errors=True)
+            shutil.rmtree(self.tmp, ignore_errors=True)
+            return
         for u in self.units:
             subprocess.run(['systemctl', '--user', 'stop', u], capture_output=True)
             subprocess.run(['systemctl', '--user', 'reset-failed', u], capture_output=True)
@@ -141,14 +204,14 @@ class Broker:
 
 def flock_holder(path, seconds=60):
     """A stand-in for a production campaign runner holding a lock (flock(1), as a campaign runner's fcntl.flock would)."""
-    p = subprocess.Popen(['flock', '-x', path, 'sleep', str(seconds)], start_new_session=True)
+    p = subprocess.Popen([*FLOCK, '-x', path, 'sleep', str(seconds)], start_new_session=True)
     p.kill = lambda: os.killpg(p.pid, signal.SIGKILL)   # flock's sleep child inherits the lock: end both
     assert wait_for(lambda: any(h['pid'] == p.pid and not h['waiting'] for h in hostlib.lock_holders(path)))
     return p
 
 
 def free(path):
-    return subprocess.run(['flock', '-n', '-x', path, 'true']).returncode == 0
+    return subprocess.run([*FLOCK, '-n', '-x', path, 'true']).returncode == 0
 
 
 class ApprovalTest(unittest.TestCase):
@@ -195,7 +258,8 @@ class ApprovalTest(unittest.TestCase):
         self.acquire = stack.enter_context(patch.object(hostlib, 'acquire', return_value=[]))
         stack.enter_context(patch.object(hostlib, 'resource_problems', return_value=[]))
         self.run = stack.enter_context(patch.object(hostd.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')))
-        self.systemctl = stack.enter_context(patch.object(hostd, 'systemctl', side_effect=self.stop_unit))
+        # The stop of a workload's unit: systemctl stop on Linux, stop_job (the coalition of its launchd job) on macOS.
+        self.systemctl = stack.enter_context(patch.object(hostd, 'stop_job' if DARWIN else 'systemctl', side_effect=self.stop_unit))
         self.restart = stack.enter_context(patch.object(hostd, 'restart_verified', return_value={'verified': True}))
         self.evaluate = stack.enter_context(patch.object(hostd, 'evaluate', return_value=None))
         self.reconcile = stack.enter_context(patch.object(hostd, 'reconcile_workload', side_effect=self.reconcile_record))
@@ -675,7 +739,11 @@ class ApprovalTest(unittest.TestCase):
                         elif op == 'workload_run':
                             self.run.assert_called_once()
                         elif op == 'workload_stop':
-                            self.systemctl.assert_called_once_with('stop', 'never-real.service', timeout=60)
+                            if DARWIN:
+                                self.systemctl.assert_called_once()
+                                self.assertEqual(self.systemctl.call_args[0][0]['unit'], 'never-real.service')
+                            else:
+                                self.systemctl.assert_called_once_with('stop', 'never-real.service', timeout=60)
                         elif op == 'monitor_add':
                             self.evaluate.assert_called_once()
                         elif op == 'monitor_remove':
@@ -755,7 +823,7 @@ class ApprovalTest(unittest.TestCase):
                     self.cfg['classes']['observe'] = 'ask'
 
 
-@unittest.skipUnless(SYSTEMD_USER, NEEDS_SYSTEMD)
+@unittest.skipUnless(SERVICES, NEEDS_SYSTEMD)
 class RequestBrokerTest(unittest.TestCase):
     """Public native/socket interfaces against a private broker, never production state or units."""
 
@@ -892,7 +960,7 @@ with ThreadPoolExecutor(max_workers=8) as pool:
         self.assertFalse(os.path.exists(self.marker))
 
 
-@unittest.skipUnless(SYSTEMD_USER, NEEDS_SYSTEMD)
+@unittest.skipUnless(SERVICES, NEEDS_SYSTEMD)
 class HostBrokerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -902,7 +970,7 @@ class HostBrokerTest(unittest.TestCase):
         cls.fail_flag = os.path.join(b.tmp, 'canary.fail')
         cls.canary_src = os.path.join(b.tmp, 'canary.py')
         shutil.copy(os.path.join(HERE, 'canary.py'), cls.canary_src)
-        cls.sup = b.unit('sup', 'sleep', 'infinity')
+        cls.sup = b.unit('sup', 'sleep', '86400' if DARWIN else 'infinity')
         cls.canary = b.unit('canary', sys.executable, cls.canary_src, cls.canary_log, cls.fail_flag)
         cls.resource = {'locks': [{'path': f'{L}/HOST_QUIET.lock', 'turnstile': f'{L}/TURNSTILE.lock'},
                                   {'path': f'{L}/MEASUREMENT.lock', 'turnstile': f'{L}/MTURN.lock'}, {'path': f'{L}/GPU_TEST.lock'}],
@@ -934,8 +1002,9 @@ class HostBrokerTest(unittest.TestCase):
                 'hold': {'argv': ['sleep', '300'], 'resources': ['GPU_TEST'], 'max_s': 300},
                 'deadline': {'argv': ['sleep', '300'], 'resources': [], 'max_s': 2},
                 # The leader exits at once; its grandchild left a new session (setsid) and would otherwise run on.
-                'orphan': {'argv': [sys.executable, '-c', 'import os,subprocess,sys\nsubprocess.Popen(["setsid","sleep","300"],'
-                                    'start_new_session=True)\nimport time; time.sleep(0.5)\nsys.exit(3)'], 'resources': ['GPU_TEST'], 'max_s': 60},
+                'orphan': {'argv': [sys.executable, '-c', 'import os,subprocess,sys\nsubprocess.Popen(' + ('["sleep","300"]' if DARWIN else
+                                    '["setsid","sleep","300"]') + ',start_new_session=True)\nimport time; time.sleep(0.5)\nsys.exit(3)'],
+                           'resources': ['GPU_TEST'], 'max_s': 60},   # macOS has no setsid(1); start_new_session is setsid()
                 'fresh': {'argv': ['true'], 'resources': [], 'max_s': 10, 'requires_fresh': ['canary']},
                 'cell': {'argv': [sys.executable, cls.runner, '{exp}', '{max_s}', '--', '{command}'], 'params': {'exp': '^[a-z0-9-]{1,20}$'},
                          'max_s': 30, 'pin': {cls.runner: cls.runner_sha},
@@ -980,6 +1049,8 @@ class HostBrokerTest(unittest.TestCase):
         return out['error']
 
     def canary_pid(self):
+        if DARWIN:
+            return darwin.job(self.canary)['pid'] or 0
         return int(subprocess.run(['systemctl', '--user', 'show', '-p', 'MainPID', '--value', self.canary], capture_output=True, text=True).stdout)
 
     # --- who may call --------------------------------------------------------------------------------------------
@@ -1161,7 +1232,7 @@ class HostBrokerTest(unittest.TestCase):
         return wait_for(lambda: (lambda s: s if s['state'] not in ('launching', 'starting', 'running') else None)(
             self.ok('workload_status', id=wid)), timeout=timeout)
 
-    @unittest.skipUnless(BWRAP, NEEDS_BWRAP)
+    @unittest.skipUnless(SANDBOX, NEEDS_SANDBOX)
     def test_retained_output_is_pageable_without_another_job_or_charge(self):
         w = self.ok('workload_run', workload='cell', params={'exp': 'output'}, command=[sys.executable, '-c',
             'import json; print("BEGIN_STRUCTURED"); print(json.dumps({"rows":list(range(1000)),"marker":"fixture"},indent=2))'])
@@ -1320,6 +1391,33 @@ class HostBrokerTest(unittest.TestCase):
         self.assertEqual(end['command'][0], 'bash')
         self.assertEqual(end['cleanup']['rc'], 0)
         self.assertTrue(os.path.exists(os.path.join(self.b.tmp, 'cleanup-ran')))
+
+    @unittest.skipUnless(SEATBELT, NEEDS_MACOS)
+    def test_parameterized_cell_runs_its_command_sandboxed_on_macos(self):
+        # The same checks with Seatbelt: the user's temporary folder is the private /tmp and runtime folder (b.tmp is in
+        # it); no launchctl stands for no user bus; the GPU is usable.
+        script = (f'echo env=$CELL_EXP/$CELL_MAX; echo inside; pwd; touch out-file; touch {self.control}/x 2>/dev/null || echo CONTROL_READ_ONLY; '
+                  f'test -e {self.host_marker} && echo SEES_HOST_TMP || echo PRIVATE_TMP; touch "$TMPDIR/t" && echo TMP_WRITABLE; '
+                  'launchctl list >/dev/null 2>&1 && echo LAUNCHCTL || echo NO_LAUNCHCTL; '
+                  'echo x | pbcopy 2>/dev/null && echo PASTEBOARD || echo NO_PASTEBOARD; '
+                  f'cat {self.secret}/key 2>/dev/null || echo SECRET_HIDDEN; '
+                  f'{sys.executable} -I -c "import socket; socket.create_connection((\'1.1.1.1\', 53), 3)" 2>/dev/null && echo NET_HOST || echo NET_OFFLINE; '
+                  f'/usr/bin/python3 -I -c "{METAL_CLIENT}"')
+        w = self.ok('workload_run', workload='cell', params={'exp': 'probe-2'}, max_s=20, command=['bash', '-c', script])
+        end = self.wait_end(w['id'])
+        self.assertEqual(end['state'], 'exited', end)
+        out = '\n'.join(end['output_tail'])
+        self.assertIn('runner exp=probe-2 max_s=20 host_tmp=True', out)
+        self.assertIn('env=exp-probe-2/20', out)
+        for word in ('inside', self.b.project, 'CONTROL_READ_ONLY', 'PRIVATE_TMP', 'TMP_WRITABLE', 'NO_LAUNCHCTL', 'NO_PASTEBOARD',
+                     'SECRET_HIDDEN', 'NET_OFFLINE', 'GPU_OK'):
+            self.assertIn(word, out)
+        self.assertNotIn('SECRETKEY', out)
+        self.assertTrue(os.path.exists(os.path.join(self.b.project, 'out-file')))
+        self.assertFalse(os.path.exists(os.path.join(self.control, 'x')))
+        rec = hostlib.read_json(os.path.join(self.b.env['MINA_HOST_STATE'], 'workloads', w['id'], 'record.json'))
+        self.assertTrue(rec['tmpdir'] and not os.path.exists(rec['tmpdir']), 'the private TMPDIR ends with the workload')
+        self.assertEqual(end['cleanup']['rc'], 0)
 
     def test_parameterized_cell_refusals(self):
         self.assertIn('must match', self.refused('INVALID', 'workload_run', workload='cell', params={'exp': 'x; rm -rf /'}, command=['true'])['message'])
@@ -1543,7 +1641,7 @@ for line in sys.stdin:
         self.assertIn(hashlib.sha256(token.encode()).hexdigest()[:24], text)
 
 
-@unittest.skipUnless(SYSTEMD_USER, NEEDS_SYSTEMD)
+@unittest.skipUnless(SERVICES, NEEDS_SYSTEMD)
 class MachineResourceTest(unittest.TestCase):
     """Machine-level resources: one lock protocol for every project on this machine. Temporary lock files only."""
 
@@ -1754,7 +1852,7 @@ class RunnerQueueTest(unittest.TestCase):
             put(p, '')
         self.ran = os.path.join(b.tmp, 'runner-ran')
         classes = {'observe': 'allow', 'reserve': 'allow', 'workload': 'allow', 'monitor': 'allow'}
-        runner = lambda lock, *cmd: ['flock', '-x', lock, *(cmd or ['touch', self.ran])]
+        runner = lambda lock, *cmd: [*FLOCK, '-x', lock, *(cmd or ['touch', self.ran])]
         queue = [b.locks + '/']
         self.cfg = {'version': 1, 'resources': {'GPU': {'locks': [{'path': self.gpu}]}}, 'projects': {
             b.project: {'classes': classes, 'workloads': {
@@ -1794,7 +1892,8 @@ class RunnerQueueTest(unittest.TestCase):
             self.assertTrue(q, 'workload_status shows queued')
             self.assertEqual(q['queued_by'], 'runner')
             self.assertEqual(q['waiting_for']['lock'], self.gpu)
-            self.assertEqual(q['waiting_for']['mode'], 'exclusive')
+            # macOS cannot tell the mode of a wait behind an exclusive holder (darwin.waits).
+            self.assertEqual(q['waiting_for']['mode'], 'unknown' if DARWIN else 'exclusive')
             held = [h for h in q['waiting_for']['holders'] if not h['waiting']]
             self.assertTrue(held, q)
             self.assertEqual(held[0].get('workload'), {'id': hold['id'], 'project': self.b.project, 'workload': 'hold', 'params': {}}, q)
@@ -1889,7 +1988,7 @@ class RunnerQueueTest(unittest.TestCase):
 
 
 def shared_free(path):
-    return subprocess.run(['flock', '-n', '-s', path, 'true']).returncode == 0
+    return subprocess.run([*FLOCK, '-n', '-s', path, 'true']).returncode == 0
 
 
 class LockEntriesTest(unittest.TestCase):
@@ -1950,7 +2049,7 @@ class LockEntriesTest(unittest.TestCase):
             holder.kill(); holder.wait()
 
 
-@unittest.skipUnless(SYSTEMD_USER, NEEDS_SYSTEMD)
+@unittest.skipUnless(SERVICES, NEEDS_SYSTEMD)
 class SharedLockBrokerTest(unittest.TestCase):
     """A BUILD resource holds the host-quiet lock shared; a timed measurement holds it exclusively."""
 
@@ -2076,7 +2175,7 @@ class DefaultsResolutionTest(unittest.TestCase):
         self.assertIn('defaults.', hostd.snippet(a, 'classes.workload', 'allow'))
 
 
-@unittest.skipUnless(SYSTEMD_USER, NEEDS_SYSTEMD)
+@unittest.skipUnless(SERVICES, NEEDS_SYSTEMD)
 class DefaultsBrokerTest(unittest.TestCase):
     """An unregistered project under a root of "defaults" gets the template, with {project} expanded for it."""
 
@@ -2156,7 +2255,7 @@ class DefaultsBrokerTest(unittest.TestCase):
         self.assertTrue(all(r.get('policy_source') == 'defaults' for r in mine), mine)
         self.assertFalse([r for r in records if r.get('policy_source') and r.get('project') != self.proj])
 
-    @unittest.skipUnless(BWRAP, NEEDS_BWRAP)
+    @unittest.skipUnless(SANDBOX, NEEDS_SANDBOX)
     def test_command_sandbox_writes_the_project(self):
         grant = self.b.open_session(self.proj)
         w = self.b.raw({'op': 'workload_run', 'grant': grant, 'workload': 'gpu-cell',
@@ -2188,6 +2287,21 @@ class DefaultsBrokerTest(unittest.TestCase):
         # (Its limited capabilities: host/test_policy.py BrokerPolicyTest. An older broker: test/host.test.mjs.)
         outside = out[self.outside]
         self.assertTrue(outside and outside['grantFile'] and outside['session'] != out[self.proj]['session'], out)
+
+
+def hidden_of(a):
+    """The paths that a command sandbox hides: bwrap's tmpfs and /dev/null binds, or the paths of the Seatbelt profile's
+    read and write denies (macOS)."""
+    if DARWIN:
+        params = dict(a[i + 1].split('=', 1) for i, x in enumerate(a) if x == '-D')
+        denies = [ln for ln in a[a.index('-p') + 1].splitlines() if ln.startswith('(deny file-read* file-write*')]
+        return {params[k] for k in re.findall(r'\(param "(P\d+)"\)', ' '.join(denies))}
+    return {a[i + 1] for i, x in enumerate(a) if x == '--tmpfs'} | {a[i + 2] for i, x in enumerate(a) if x == '--ro-bind' and a[i + 1] == '/dev/null'}
+
+
+def offline(a):
+    """Whether a command sandbox has no network: bwrap --unshare-net, or a Seatbelt profile that denies it (macOS)."""
+    return '(deny network*)' in a[a.index('-p') + 1].splitlines() if DARWIN else '--unshare-net' in a
 
 
 class WorkloadSandboxPolicyTest(unittest.TestCase):
@@ -2231,13 +2345,13 @@ class WorkloadSandboxPolicyTest(unittest.TestCase):
         with open(os.path.join(self.home, 'sandbox.json'), 'w') as f:
             json.dump({'hide': ['~/.config/old-tool']}, f)
         a = self.sandbox(MINA_SANDBOX_CONFIG=os.path.join(self.home, 'sandbox.json'), PI_CODING_AGENT_DIR=self.agent)
-        hidden = {a[i + 1] for i, x in enumerate(a) if x == '--tmpfs'} | {a[i + 2] for i, x in enumerate(a) if x == '--ro-bind' and a[i + 1] == '/dev/null'}
+        hidden = hidden_of(a)
         for p in ('.ssh', '.claude', '.claude-second', '.claude.json', '.claude.json.backup', 'accounts/work', '.config/old-tool', '.config/mina'):
             self.assertIn(os.path.join(self.home, p), hidden, p)
         # The owner's "hide" list comes from ~/.config/mina/sandbox.json by default.
         os.replace(os.path.join(self.home, 'sandbox.json'), os.path.join(self.home, '.config', 'mina', 'sandbox.json'))
         a = self.sandbox(PI_CODING_AGENT_DIR=self.agent)
-        self.assertIn(legacy, a)
+        self.assertIn(legacy, hidden_of(a))
         # A configuration mina cannot read is not guessed around.
         put(os.path.join(self.home, '.config', 'mina', 'sandbox.json'), '{')
         with self.assertRaises(hostd.Refusal) as e:
@@ -2245,9 +2359,9 @@ class WorkloadSandboxPolicyTest(unittest.TestCase):
         self.assertEqual(e.exception.code, 'BLOCKED')
 
     def test_workload_network_is_offline_unless_open(self):
-        self.assertIn('--unshare-net', self.sandbox({}))
-        self.assertIn('--unshare-net', self.sandbox({'network': 'offline'}))
-        self.assertNotIn('--unshare-net', self.sandbox({'network': 'open'}))
+        self.assertTrue(offline(self.sandbox({})))
+        self.assertTrue(offline(self.sandbox({'network': 'offline'})))
+        self.assertFalse(offline(self.sandbox({'network': 'open'})))
         with self.assertRaises(hostd.Refusal) as e:
             self.sandbox({'network': 'packages'})
         self.assertEqual(e.exception.code, 'INVALID')
@@ -2275,6 +2389,464 @@ class WorkloadSandboxPolicyTest(unittest.TestCase):
         with patch.object(hostd, 'STATE', state), self.assertRaises(OSError):
             hostd.audit({'op': 'test'})
         self.assertFalse(os.path.exists(os.path.join(self.home, 'elsewhere')))
+
+
+# --- Apple GPU users: a captured `ioreg -r -c IOGPUDeviceUserClient -l -w0` (macOS 27.2, M1 Pro), shortened ------------
+IOREG_CLIENTS = """+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x100000ed7, !registered, !matched, active, busy 0, retain 5>
+    {
+      "AppUsage" = ()
+      "IOUserClientCreator" = "pid 412, WindowServer"
+    }
+    
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x100000ed8, !registered, !matched, active, busy 0, retain 5>
+    {
+      "AppUsage" = ({"API"="Metal","lastSubmittedTime"=46547483017083,"accumulatedGPUTime"=3764783889000})
+      "IOUserClientCreator" = "pid 412, WindowServer"
+      "CommandQueueCount" = 3
+      "CommandQueueCountMax" = 3
+    }
+    
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x100000fbe, !registered, !matched, active, busy 0, retain 5>
+    {
+      "AppUsage" = ()
+      "IOUserClientCreator" = "pid 646, MenuBarAgent"
+    }
+    
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x100000fd1, !registered, !matched, active, busy 0, retain 5>
+    {
+      "AppUsage" = ()
+      "IOUserClientCreator" = "pid 703, VTDecoderXPCServ"
+      "CommandQueueCount" = 0
+      "CommandQueueCountMax" = 1
+    }
+"""
+METAL_CLIENT = (r"import ctypes, sys, time; m = ctypes.CDLL('/System/Library/Frameworks/Metal.framework/Metal'); "
+                r"m.MTLCreateSystemDefaultDevice.restype = ctypes.c_void_p; d = m.MTLCreateSystemDefaultDevice(); "
+                r"print('GPU_OK' if d else 'NO_GPU', flush=True); time.sleep(float(sys.argv[1]) if len(sys.argv) > 1 else 0)")
+
+
+class AppleGpuTest(unittest.TestCase):
+    """{"apple_gpu": true}: the users are the creators of the GPU user clients that ioreg lists."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='mina-gpu-test-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def fake_ioreg(self, text, rc=0):
+        path = os.path.join(self.tmp, 'ioreg')
+        put(os.path.join(self.tmp, 'out'), text)
+        put(path, f'#!/bin/sh\ncat {os.path.join(self.tmp, "out")}\nexit {rc}\n')
+        os.chmod(path, 0o755)
+        return path
+
+    def test_users_are_the_creators_of_the_clients(self):
+        if DARWIN:   # the fixture's pids can be real processes of this Mac (the window server): their paths are not read
+            p = patch.object(hostlib.darwin, 'pidpath', lambda pid: None)
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertEqual(hostlib.gpu_client_pids(IOREG_CLIENTS), [412, 646, 703])
+        with patch.dict(os.environ, {'MINA_HOST_IOREG': self.fake_ioreg(IOREG_CLIENTS)}):
+            self.assertEqual(hostlib.device_users({'apple_gpu': True}), [412, 646, 703])
+            problems = hostlib.resource_problems({'G': {'device': {'apple_gpu': True}}}, ['G'], ignore_pids=(412,))
+            self.assertEqual((problems[0]['kind'], problems[0]['pids']), ('device_busy', [646, 703]))
+        with patch.dict(os.environ, {'MINA_HOST_IOREG': self.fake_ioreg('')}):
+            self.assertEqual(hostlib.resource_problems({'G': {'device': {'apple_gpu': True}}}, ['G']), [])
+
+    def test_applications_and_macos_do_not_count(self):
+        # The window server and applications hold a GPU client to draw; a command-line program (Python runs as
+        # Python.app inside its framework) is a compute user; an executable that cannot be read counts, never missed.
+        paths = {1: '/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer',
+                 2: '/Applications/Safari.app/Contents/MacOS/Safari', 3: '/Users/me/Applications/Tool.app/Contents/MacOS/Tool',
+                 4: '/opt/homebrew/Cellar/python@3.13/3.13.1/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python',
+                 5: '/usr/libexec/remoted', 6: None, 7: '/Users/me/project/.venv/bin/python3'}
+        self.assertEqual(hostlib.compute_users(sorted(paths), paths.get), [4, 6, 7])
+
+    def test_unknown_users_are_a_problem(self):
+        for env in ({'MINA_HOST_IOREG': self.fake_ioreg('', rc=1)}, {'MINA_HOST_IOREG': os.path.join(self.tmp, 'none')}):
+            with self.subTest(env=env), patch.dict(os.environ, env):
+                problems = hostlib.resource_problems({'G': {'device': {'apple_gpu': True}}}, ['G'])
+                self.assertEqual(problems[0]['kind'], 'device_unknown')
+
+    @unittest.skipUnless(DARWIN, NEEDS_MACOS)
+    def test_a_metal_client_is_a_user_while_it_lives(self):
+        p = subprocess.Popen(['/usr/bin/python3', '-I', '-c', METAL_CLIENT, '30'], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(p.stdout.readline().strip(), 'GPU_OK')
+            self.assertIn(p.pid, hostlib.device_users({'apple_gpu': True}))
+        finally:
+            p.kill(); p.wait()
+        self.assertTrue(wait_for(lambda: p.pid not in hostlib.device_users({'apple_gpu': True}), timeout=10))
+
+
+@unittest.skipUnless(DARWIN, NEEDS_MACOS)
+class MacProcessTest(unittest.TestCase):
+    """libproc, coalitions, sandbox_check and the peer of a socket, as host/darwin.py reads them."""
+
+    def test_identity_is_pid_and_start_time(self):
+        p = subprocess.Popen(['sleep', '30'])
+        try:
+            ident = hostlib.identity(p.pid)
+            self.assertTrue(hostlib.alive(ident))
+            self.assertFalse(hostlib.alive({'pid': p.pid, 'start': ident['start'] + 1}), 'a reused pid is not the process')
+            self.assertEqual(hostlib.cmdline(p.pid), ['sleep', '30'])
+            self.assertEqual(hostlib.proc_stat(p.pid)['ppid'], os.getpid())
+            self.assertIn(p.pid, hostlib.own_processes())
+            self.assertLess(abs(ident['start'] / 1e6 - time.time()), 30)
+        finally:
+            p.kill()
+            time.sleep(0.2)
+        self.assertFalse(hostlib.alive(ident), 'a zombie is not alive')
+        p.wait()
+        self.assertFalse(hostlib.alive(ident))
+        self.assertRegex(hostlib.boot_id(), r'^[0-9A-F-]{36}$')
+        self.assertLess(darwin.boot_time(), time.time())
+
+    def test_a_child_stays_in_the_coalition_and_sandboxes_are_seen(self):
+        mine = hostlib.coalition_of(os.getpid())
+        p = subprocess.Popen(['sleep', '30'], start_new_session=True)
+        q = subprocess.Popen([SANDBOX_EXEC, '-p', ALLOW_ALL, 'sleep', '30'])
+        try:
+            time.sleep(0.3)
+            self.assertEqual(hostlib.coalition_of(p.pid), mine)
+            self.assertFalse(darwin.sandboxed(p.pid))
+            self.assertTrue(darwin.sandboxed(q.pid))
+            self.assertFalse(darwin.sandboxed(os.getpid()))
+        finally:
+            for x in (p, q):
+                x.kill(); x.wait()
+        self.assertTrue(darwin.sandboxed(p.pid), 'a process that is gone counts as sandboxed')
+
+    def test_peer_of_a_socket(self):
+        import socket
+        d = tempfile.mkdtemp(prefix='mina-peer-', dir='/tmp')
+        self.addCleanup(shutil.rmtree, d, True)
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(os.path.join(d, 's'))
+        srv.listen(1)
+        p = subprocess.Popen([sys.executable, '-c', f'import socket,time; s=socket.socket(socket.AF_UNIX); s.connect({os.path.join(d, "s")!r}); time.sleep(2)'])
+        try:
+            c, _ = srv.accept()
+            self.assertEqual(darwin.peer(c), (p.pid, os.getuid()))
+            c.close()
+        finally:
+            p.kill(); p.wait(); srv.close()
+
+
+@unittest.skipUnless(DARWIN, NEEDS_MACOS)
+class MacLockTest(unittest.TestCase):
+    """Lock holders and waits without /proc/locks: the open files of the user's processes."""
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix='mina-mlock-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.lock = os.path.join(self.tmp, 'GPU.lock')
+        put(self.lock, '')
+        self.procs = []
+        self.addCleanup(self.kill)
+
+    def kill(self):
+        for p in self.procs:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            p.wait()
+
+    def start(self, *args):
+        p = subprocess.Popen([*FLOCK, *args, self.lock, 'sleep', '60'], start_new_session=True)
+        self.procs.append(p)
+        return p
+
+    def test_holders_waiters_and_inherited_descriptors(self):
+        self.assertEqual(hostlib.lock_holders(self.lock), [])
+        holder = self.start('-x')
+        self.assertTrue(wait_for(lambda: hostlib.lock_holders(self.lock)))
+        waiter = self.start('-s')
+        found = wait_for(lambda: (lambda h: h if len(h) == 2 else None)(hostlib.lock_holders(self.lock)))
+        by = {h['pid']: h for h in found}
+        self.assertEqual(set(by), {holder.pid, waiter.pid}, 'the sleep child shares the holder\'s descriptor: it is not listed')
+        self.assertEqual((by[holder.pid]['mode'], by[holder.pid]['waiting']), ('WRITE', False))
+        self.assertTrue(by[waiter.pid]['waiting'])
+        self.assertIn('flock.py', ' '.join(by[holder.pid]['argv']))
+        waits = hostlib.blocked_waits([waiter.pid, holder.pid])
+        self.assertEqual([(w['pid'], w['lock'], w['mode']) for w in waits], [(waiter.pid, self.lock, 'unknown')])
+        self.assertEqual(waits[0]['key'], hostlib.lock_key(self.lock))
+        os.killpg(holder.pid, signal.SIGKILL)
+        # The shared waiter now holds it: a second shared holder joins; an exclusive waiter is seen as one.
+        second = self.start('-s')
+        self.assertTrue(wait_for(lambda: len([h for h in hostlib.lock_holders(self.lock) if not h['waiting']]) == 2))
+        self.assertEqual({h['mode'] for h in hostlib.lock_holders(self.lock)}, {'READ'})
+        late = self.start('-x')
+        w = wait_for(lambda: hostlib.blocked_waits([late.pid]))
+        self.assertEqual((w[0]['pid'], w[0]['mode']), (late.pid, 'exclusive'), 'a wait behind shared holders is exclusive')
+        for p in (waiter, second, late):
+            os.killpg(p.pid, signal.SIGKILL)
+        self.assertTrue(wait_for(lambda: hostlib.lock_holders(self.lock) == []))
+
+
+def detached_leader(pidfile, mode):
+    """A workload leader that leaves a descendant: a double fork, setsid, then sleep. mode: exit (the leader exits),
+    hold (it sleeps), kill-lockrun (it kills its lock holder, the main process of the job, and sleeps)."""
+    return [sys.executable, '-c', f"""
+import os, signal, sys, time
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        open({pidfile!r} + '.tmp', 'w').write(str(os.getpid())); os.rename({pidfile!r} + '.tmp', {pidfile!r})
+        os.execv('/bin/sleep', ['sleep', '300'])
+    os._exit(0)
+os.wait()
+while not os.path.exists({pidfile!r}):
+    time.sleep(0.05)
+if {mode!r} == 'kill-lockrun':
+    os.kill(os.getppid(), signal.SIGKILL)
+if {mode!r} != 'exit':
+    time.sleep(300)
+"""]
+
+
+@unittest.skipUnless(LAUNCHD, NEEDS_MACOS)
+class MacWorkloadTest(unittest.TestCase):
+    """macOS: a workload's processes are the members of its launchd job's coalition. A descendant that left the
+    session and the process tree (setsid, double fork) is still stopped, at the stop, at the end of the leader, at the
+    deadline and when the lock holder dies, and verified gone."""
+
+    @classmethod
+    def setUpClass(cls):
+        b = cls.b = Broker()
+        cls.pid = staticmethod(lambda name: os.path.join(b.tmp, f'{name}.pid'))
+        cls.cfg = {'classes': {'observe': 'allow', 'workload': 'allow', 'reserve': 'allow'},
+                   'resources': {'GPU': {'locks': [{'path': f'{b.locks}/GPU.lock'}]}},
+                   'workloads': {m: {'argv': detached_leader(os.path.join(b.tmp, f'{m}.pid'), m.removesuffix('-deadline')), 'resources': ['GPU'],
+                                     'max_s': 2 if m.endswith('deadline') else 60}
+                                 for m in ('hold', 'exit', 'kill-lockrun', 'hold-deadline')}}
+        b.config(cls.cfg)
+        b.start()
+        cls.grant = b.open_session()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.b.cleanup()
+
+    def ok(self, op, **kw):
+        out = self.b.raw({'op': op, 'grant': self.grant, **kw})
+        self.assertTrue(out['ok'], out)
+        return out['result']
+
+    def end(self, wid, timeout=40):
+        return wait_for(lambda: (lambda s: s if s['state'] not in hostd.LIVE else None)(self.ok('workload_status', id=wid)), timeout=timeout)
+
+    def run_detached(self, name):
+        if os.path.exists(self.pid(name)):
+            os.unlink(self.pid(name))
+        w = self.ok('workload_run', workload=name)
+        self.assertTrue(wait_for(lambda: os.path.exists(self.pid(name))), w)
+        d = hostlib.identity(int(open(self.pid(name)).read()))
+        self.assertTrue(d and hostlib.alive(d))
+        rec = hostlib.read_json(os.path.join(self.b.env['MINA_HOST_STATE'], 'workloads', w['id'], 'record.json'))
+        return w, d, rec
+
+    def gone(self, end, descendant, rec):
+        self.assertTrue(end['verification']['verified_exit'], end)
+        self.assertEqual(end['verification']['coalition_remaining'], [])
+        self.assertFalse(hostlib.alive(descendant), 'the detached descendant is stopped')
+        self.assertEqual(hostlib.coalition_members(rec['coalition']), [])
+        self.assertIsNone(darwin.job(rec['unit']), 'the job is removed')
+        self.assertTrue(free(f'{self.b.locks}/GPU.lock'))
+
+    def test_stop_ends_a_detached_descendant(self):
+        w, d, rec = self.run_detached('hold')
+        self.assertTrue(wait_for(lambda: self.ok('workload_status', id=w['id'])['state'] == 'running'))
+        rec = hostlib.read_json(os.path.join(self.b.env['MINA_HOST_STATE'], 'workloads', w['id'], 'record.json'))
+        self.assertEqual(hostlib.coalition_of(d['pid']), rec['coalition'], 'setsid and a double fork stay in the coalition')
+        self.assertNotEqual(rec['coalition'], hostlib.coalition_of(os.getpid()))
+        s = self.ok('workload_stop', id=w['id'])
+        self.assertEqual(s['state'], 'stopped', s)
+        self.gone(s, d, rec)
+
+    def test_the_end_of_the_leader_ends_a_detached_descendant(self):
+        w, d, rec = self.run_detached('exit')
+        end = self.end(w['id'])
+        self.assertEqual((end['state'], end['result']['rc']), ('exited', 0), end)
+        self.assertIn(d['pid'], [m['pid'] for m in end['result']['survivors']])
+        self.gone(end, d, self.record(w))
+
+    def test_the_deadline_ends_the_whole_coalition(self):
+        w, d, rec = self.run_detached('hold-deadline')
+        end = self.end(w['id'], timeout=30)
+        self.assertEqual(end['state'], 'deadline', end)
+        self.assertEqual(end['result']['signal'], signal.SIGTERM, 'as RuntimeMaxSec: SIGTERM first')
+        self.gone(end, d, self.record(w))
+
+    def test_a_killed_lock_holder_does_not_leave_the_workload_running(self):
+        w, d, rec = self.run_detached('kill-lockrun')
+        end = self.end(w['id'])
+        self.assertEqual(end['state'], 'terminated', end)
+        self.gone(end, d, self.record(w))
+
+    def record(self, w):
+        return hostlib.read_json(os.path.join(self.b.env['MINA_HOST_STATE'], 'workloads', w['id'], 'record.json'))
+
+
+FAKE_INSTANCE = r"""
+import json, os, subprocess, sys, time
+role, ctl = sys.argv[1], sys.argv[2]
+if role == 'main':      # the main process of the instance job (mina-instance): it starts the supervisor and waits
+    sys.exit(subprocess.call([sys.executable, '-I', __file__, 'supervisor', ctl]))
+cfg = json.load(open(os.path.join(ctl, 'config.json')))
+open(os.path.join(ctl, 'ready'), 'w').close()
+while not os.path.exists(os.path.join(ctl, 'stop')):   # the supervisor: it runs each request the way the request names
+    for name in sorted(n for n in os.listdir(ctl) if n.endswith('.req')):
+        req = json.load(open(os.path.join(ctl, name)))
+        client = [sys.executable, '-I', cfg['client'], cfg['sock']]
+        argv = {'pi': [cfg['sandbox_exec'], '-p', cfg['profile'], *client], 'plain': client,
+                'command': [cfg['sandbox_exec'], '-p', cfg['profile'], '/bin/sh', '-c', '"$@"; true', 'x', *client]}[req['how']]
+        r = subprocess.run(argv, input=req['line'] + '\n', capture_output=True, text=True, timeout=60)
+        with open(os.path.join(ctl, name[:-4] + '.tmp'), 'w') as f:
+            f.write(r.stdout or json.dumps({'ok': False, 'error': {'code': 'CLIENT', 'message': r.stderr[-300:]}}))
+        os.rename(os.path.join(ctl, name[:-4] + '.tmp'), os.path.join(ctl, name[:-4] + '.resp'))
+        os.unlink(os.path.join(ctl, name))
+    time.sleep(0.05)
+"""
+
+
+@unittest.skipUnless(LAUNCHD and SEATBELT, NEEDS_MACOS)
+class MacSessionTest(unittest.TestCase):
+    """macOS: who may open and use a host session. A stand-in instance job com.mina.instance.ID has the shape of Mina's:
+    launchd -> the job's main process -> the supervisor (no sandbox) -> Pi (in a sandbox) -> the agent's commands."""
+
+    def setUp(self):
+        import uuid
+        self.b = b = Broker()
+        self.addCleanup(b.cleanup)
+        b.config({'classes': {'observe': 'allow'}})
+        b.start()
+        self.id = str(uuid.uuid4())
+        self.label = f'com.mina.instance.{self.id}'
+        self.ctl = os.path.join(b.tmp, 'instance')
+        os.makedirs(self.ctl)
+        script = os.path.join(b.tmp, 'fake_instance.py')
+        put(script, FAKE_INSTANCE)
+        hostlib.write_json(os.path.join(self.ctl, 'config.json'), {'client': b.client, 'sock': b.sock, 'sandbox_exec': SANDBOX_EXEC, 'profile': ALLOW_ALL})
+        plist = os.path.join(b.tmp, 'instance.plist')
+        darwin.write_plist(plist, darwin.job_plist(self.label, [sys.executable, '-I', script, 'main', self.ctl], {}, os.path.join(b.tmp, 'instance.log')))
+        subprocess.run(['/bin/launchctl', 'bootstrap', f'gui/{os.getuid()}', plist], check=True)
+        self.addCleanup(self.stop_instance)
+        self.assertTrue(wait_for(lambda: os.path.exists(os.path.join(self.ctl, 'ready'))), 'the instance job did not start')
+        self.n = 0
+
+    def stop_instance(self):
+        put(os.path.join(self.ctl, 'stop'), '')
+        job = darwin.job(self.label)
+        subprocess.run(['/bin/launchctl', 'bootout', f'gui/{os.getuid()}/{self.label}'], capture_output=True)
+        if job and job['coalition']:
+            darwin.sweep([job['coalition']])
+
+    def via(self, how, req):
+        """One request from inside the instance: from 'pi' (a sandboxed child of the supervisor), 'plain' (a child of the
+        supervisor without a sandbox), or 'command' (a child of a sandboxed child: a command that Pi ran)."""
+        self.n += 1
+        name = os.path.join(self.ctl, f'{self.n:04d}')
+        hostlib.write_json(name + '.tmp', {'how': how, 'line': json.dumps(req)})
+        os.rename(name + '.tmp', name + '.req')
+        self.assertTrue(wait_for(lambda: os.path.exists(name + '.resp'), timeout=60))
+        return json.loads(open(name + '.resp').read())
+
+    def open(self, instance):
+        s = __import__('socket').socket(__import__('socket').AF_UNIX)
+        s.connect(self.b.sock)
+        s.sendall((json.dumps({'op': 'session_open', 'project': self.b.project, 'instance': instance}) + '\n').encode())
+        data = b''
+        while not data.endswith(b'\n'):
+            data += s.recv(65536)
+        s.close()
+        return json.loads(data)
+
+    def test_only_the_instances_pi_process_can_use_its_session(self):
+        out = self.open(self.id)
+        self.assertTrue(out['ok'], out)
+        req = {'op': 'capabilities', 'grant': out['result']['grant']}
+        self.assertTrue(self.via('pi', req)['ok'])
+        for how in ('plain', 'command'):
+            r = self.via(how, req)
+            self.assertEqual(r['error']['code'], 'UNAUTHENTICATED', (how, r))
+        outside = self.b.raw(req)                                                   # the launcher's own child
+        self.assertEqual(outside['error']['code'], 'UNAUTHENTICATED', outside)
+        sandboxed = self.b.raw(req, via=[SANDBOX_EXEC, '-p', ALLOW_ALL])            # in a sandbox, outside the coalition
+        self.assertEqual(sandboxed['error']['code'], 'UNAUTHENTICATED', sandboxed)
+        self.assertTrue(self.via('pi', req)['ok'], 'a new Pi process, after the first one exited')
+        self.stop_instance()
+        self.assertTrue(wait_for(lambda: darwin.job(self.label) is None))
+        r = self.b.raw(req)
+        self.assertIn('not running', r['error']['message'])
+
+    def test_a_session_without_an_instance_is_for_the_launchers_child(self):
+        out = self.open(None)
+        req = {'op': 'capabilities', 'grant': out['result']['grant']}
+        self.assertTrue(self.b.raw(req)['ok'])                                      # mina --nosandbox: Pi is its child
+        self.assertEqual(self.via('pi', req)['error']['code'], 'UNAUTHENTICATED')
+        self.assertEqual(self.b.raw(req, via=['/bin/sh', '-c', '"$@"; true', 'x'])['error']['code'], 'UNAUTHENTICATED')
+
+    def test_only_a_process_outside_every_sandbox_and_mina_job_can_open_a_session(self):
+        req = {'op': 'session_open', 'project': self.b.project, 'instance': self.id}
+        for how in ('pi', 'plain'):                       # plain: no sandbox, but in the coalition of a Mina instance
+            r = self.via(how, req)
+            self.assertEqual(r['error']['code'], 'UNAUTHENTICATED', (how, r))
+            self.assertIn('outside the sandbox', r['error']['message'])
+        r = self.b.raw(req, via=[SANDBOX_EXEC, '-p', ALLOW_ALL])
+        self.assertEqual(r['error']['code'], 'UNAUTHENTICATED', r)
+        self.assertEqual(self.b.raw({'op': 'capabilities', 'project': self.b.project}, via=[SANDBOX_EXEC, '-p', ALLOW_ALL])['error']['code'],
+                         'UNAUTHENTICATED', 'the user\'s view without a grant is for processes outside every sandbox too')
+        self.assertEqual(self.open('not-an-id')['error']['code'], 'INVALID')
+        self.assertTrue(self.open(self.id)['ok'])
+
+    def test_the_session_ends_with_its_launcher(self):
+        launcher = subprocess.run([sys.executable, '-c', f"""
+import json, socket
+s = socket.socket(socket.AF_UNIX); s.connect({self.b.sock!r})
+s.sendall((json.dumps({{'op': 'session_open', 'project': {self.b.project!r}, 'instance': {self.id!r}}}) + '\\n').encode())
+print(s.recv(65536).decode())"""], capture_output=True, text=True, timeout=30)
+        grant = json.loads(launcher.stdout)['result']['grant']
+        r = self.via('pi', {'op': 'capabilities', 'grant': grant})
+        self.assertIn('launcher exited', r['error']['message'])
+
+
+@unittest.skipUnless(DARWIN, NEEDS_MACOS)
+class MacInstallTest(unittest.TestCase):
+    """The broker's LaunchAgent and its socket path, without installing anything for the user."""
+
+    def test_install_writes_a_launch_agent_and_bootstraps_it(self):
+        import plistlib
+        home = os.path.realpath(tempfile.mkdtemp(prefix='mina-install-'))
+        self.addCleanup(shutil.rmtree, home, True)
+        calls = []
+        fake = lambda *a, **kw: calls.append(a) or subprocess.CompletedProcess(a, 0, '', '')
+        with patch.dict(os.environ, {'HOME': home}), patch.object(hostd, 'STATE', os.path.join(home, 'state')), \
+                patch.object(darwin, 'launchctl', side_effect=fake), patch.object(darwin, 'job', return_value={'state': 'running'}), \
+                patch('sys.stdout', new_callable=__import__('io').StringIO) as said:
+            hostd.install()
+        self.assertIn('com.mina.hostd is running', said.getvalue())
+        path = os.path.join(home, 'Library', 'LaunchAgents', 'com.mina.hostd.plist')
+        with open(path, 'rb') as f:
+            agent = plistlib.load(f)
+        # Started by mina-instance when it is built (privacy permissions belong to it, as for an instance).
+        args = agent['ProgramArguments']
+        if args[:1] == [darwin.HELPER]:
+            self.assertEqual(args[1:3], ['run', '--']); args = args[3:]
+        self.assertEqual(args, ['/usr/bin/python3', '-I', os.path.join(HERE, 'hostd.py'), 'serve'])
+        self.assertEqual((agent['Label'], agent['RunAtLoad'], agent['KeepAlive']), ('com.mina.hostd', True, {'SuccessfulExit': False}))
+        self.assertEqual(agent['StandardErrorPath'], os.path.join(home, 'state', 'hostd.log'))
+        uid = os.getuid()
+        self.assertEqual(calls, [('bootout', f'gui/{uid}/com.mina.hostd'), ('bootstrap', f'gui/{uid}', path)])
+
+    def test_a_socket_path_too_long_for_macos_is_refused(self):
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix='mina-sock-'))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        r = subprocess.run([sys.executable, os.path.join(HERE, 'hostd.py'), 'serve'], capture_output=True, text=True, timeout=30,
+                           env={**os.environ, 'MINA_HOST_RUNTIME': os.path.join(tmp, 'x' * 100), 'MINA_HOST_STATE': os.path.join(tmp, 'state')})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('at most 103', r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(tmp, 'x' * 100)))
 
 
 if __name__ == '__main__':

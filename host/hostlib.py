@@ -3,25 +3,39 @@
 Process identity is (pid, kernel start ticks), never a pid alone. Locks are the host's own flock files. The broker
 takes them non-blocking: a conflict is reported with the holders' evidence. A workload with queue_s > 0 waits for them
 in its lock holder (lockrun.py), in the queue of the host runner that shares them. Standard library only.
+On macOS the same facts come from host/darwin.py (libproc, resource coalitions, launchd), with the same results; the
+differences are in docs/host-profile.md, "macOS".
 """
 import fcntl
 import json
 import os
+import re
 import signal
 import subprocess
+import sys
 import tempfile
 import time
+
+DARWIN = sys.platform == 'darwin'
+if DARWIN:
+    import darwin  # noqa: E402  (host/ is on sys.path: hostd.py and lockrun.py put it there)
 
 # --- processes -------------------------------------------------------------------------------------------------------
 
 
 def boot_id():
+    if DARWIN:
+        return darwin.boot_id()
     with open('/proc/sys/kernel/random/boot_id') as f:
         return f.read().strip()
 
 
 def proc_stat(pid):
-    """{ppid, start, state, comm} of a live process, or None."""
+    """{ppid, start, state, comm} of a live process, or None. On macOS start is the start time in microseconds, and
+    only this user's processes can be read (a zombie gives None, so it is not alive there either)."""
+    if DARWIN:
+        st = darwin.bsdinfo(pid)
+        return {k: st[k] for k in ('pid', 'ppid', 'state', 'start', 'comm')} if st else None
     try:
         with open(f'/proc/{pid}/stat') as f:
             raw = f.read()
@@ -44,6 +58,8 @@ def alive(ident):
 
 
 def cmdline(pid):
+    if DARWIN:
+        return darwin.cmdline(pid)
     try:
         with open(f'/proc/{pid}/cmdline', 'rb') as f:
             return [a.decode(errors='replace') for a in f.read().split(b'\0') if a]
@@ -52,6 +68,8 @@ def cmdline(pid):
 
 
 def mnt_ns(pid='self'):
+    if DARWIN:
+        return None   # macOS has no mount namespaces: every process sees the same files
     try:
         return os.readlink(f'/proc/{pid}/ns/mnt')
     except OSError:
@@ -62,6 +80,13 @@ def own_processes():
     """Live processes of this user: {pid: argv}. Other users' processes are skipped (their /proc entries are not ours)."""
     out = {}
     uid = os.getuid()
+    if DARWIN:
+        for pid in darwin.all_pids():
+            st = darwin.bsdinfo(pid)
+            argv = cmdline(pid) if st and st['uid'] == uid and st['state'] != 'Z' else None
+            if argv:
+                out[pid] = argv
+        return out
     for name in os.listdir('/proc'):
         if not name.isdigit():
             continue
@@ -91,6 +116,22 @@ def cgroup_members(cgroup_dir):
             continue
         out += [i for i in (identity(p) for p in pids) if i]
     return out
+
+
+def coalition_members(cid):
+    """macOS: the processes of a resource coalition (the cgroup of a launchd job), as cgroup_members gives them: [] when
+    none remains. A member that this user cannot inspect has start None; it counts as alive."""
+    return darwin.members(cid) if cid else None
+
+
+def coalition_of(pid):
+    return darwin.coalition_of(pid)
+
+
+def stop_coalition(cid, grace_s, exclude=()):
+    """macOS: what systemd does to a unit's cgroup when it stops it (KillMode=control-group): SIGTERM to every process,
+    SIGKILL after grace_s seconds, repeated until none remains. Returns the processes that remain (none: verified)."""
+    return darwin.stop([cid], grace_s, exclude) if cid else []
 
 
 # --- files -----------------------------------------------------------------------------------------------------------
@@ -126,7 +167,10 @@ class LockConflict(Exception):
 
 
 def lock_holders(path):
-    """Processes that hold (or wait for) a flock on this file, from /proc/locks: [{pid, mode, waiting, argv}]."""
+    """Processes that hold (or wait for) a flock on this file, from /proc/locks: [{pid, mode, waiting, argv}].
+    macOS has no /proc/locks: darwin.lock_holders tells the same from the open files of this user's processes."""
+    if DARWIN:
+        return darwin.lock_holders(path)
     try:
         st = os.stat(path)
     except OSError:
@@ -175,7 +219,10 @@ def _fd_path(pid, key):
 def blocked_waits(pids):
     """The flocks that these processes wait for now, from /proc/locks: [{pid, lock, key, mode}] in /proc/locks order. The
     path comes from the waiter's own descriptors, so no lock list is needed; a wait whose file cannot be found is left out.
-    Compare key, not only the path, with a lock of the host (see _fd_path)."""
+    Compare key, not only the path, with a lock of the host (see _fd_path). On macOS, darwin.waits infers the waits
+    (macOS does not show a blocked flock)."""
+    if DARWIN:
+        return darwin.waits(pids, lock_key)
     pids = set(pids)
     out = []
     with open('/proc/locks') as f:
@@ -193,7 +240,9 @@ def blocked_waits(pids):
 
 
 def cgroup_of(pid):
-    """The cgroup v2 path of a process ("/user.slice/..."), or None."""
+    """The cgroup v2 path of a process ("/user.slice/..."), or None (always on macOS: see coalition_of)."""
+    if DARWIN:
+        return None
     try:
         with open(f'/proc/{pid}/cgroup') as f:
             return next((line[3:].strip() for line in f if line.startswith('0::')), None)
@@ -342,7 +391,9 @@ KFD_PROC = '/sys/class/kfd/kfd/proc'
 def device_users(device):
     """Processes that use a GPU, whoever owns them: [pid], or raises RuntimeError when that cannot be known.
     {'kfd': true}: every AMD compute user (/sys/class/kfd/kfd/proc lists them for all users).
-    {'nvidia': [bus ids]}: compute apps on those NVIDIA GPUs (nvidia-smi lists them for all users)."""
+    {'nvidia': [bus ids]}: compute apps on those NVIDIA GPUs (nvidia-smi lists them for all users).
+    {'apple_gpu': true}: the processes with an Apple GPU user client (ioreg lists them for all users) that are not
+    applications or parts of macOS (apple_gpu_users): the counterpart of the compute users of nvidia-smi and kfd."""
     users = []
     if device.get('kfd'):
         root = os.environ.get('MINA_HOST_KFD_PROC', KFD_PROC)
@@ -362,10 +413,60 @@ def device_users(device):
             parts = [p.strip() for p in line.split(',')]
             if len(parts) == 2 and parts[0].isdigit() and parts[1].lower()[-12:] in want:
                 users.append(int(parts[0]))
+    if device.get('apple_gpu'):
+        users += apple_gpu_users()
     return users
 
 
+GPU_CLIENT = re.compile(r'"IOUserClientCreator" = "pid (\d+), ')
+
+
+def gpu_client_pids(text):
+    """The creator pids of the GPU user clients in `ioreg -r -c IOGPUDeviceUserClient -l` output, sorted."""
+    return sorted({int(m.group(1)) for m in GPU_CLIENT.finditer(text)})
+
+
+# Executables that hold a GPU client only to draw: the window server and the other parts of macOS, and applications
+# (bundles). macOS lists no compute users of the GPU (nvidia-smi --query-compute-apps and kfd do on Linux); a command-line
+# program with a GPU client, such as a Python job on Metal, is the closest counterpart.
+# Applications are the bundles in the application folders; Python itself runs as Python.app inside its framework, so
+# a bundle elsewhere counts.
+DRAWING = re.compile(r'^(/(System|usr/libexec|usr/sbin|Library/Apple|Applications)/|/Users/[^/]+/Applications/)')
+
+
+def compute_users(pids, path_of):
+    """The pids whose executable is neither part of macOS nor an application. A process whose executable cannot be
+    read (another user's) counts, so that a busy GPU is never missed; the window server is a system path anyway."""
+    out = []
+    for pid in pids:
+        exe = path_of(pid)
+        if exe and DRAWING.search(exe):
+            continue
+        out.append(pid)
+    return out
+
+
+def apple_gpu_users():
+    """macOS: the compute users of the Apple GPU: the processes with a GPU user client (IOGPUDeviceUserClient, the
+    class of AGXDeviceUserClient), without applications and the parts of macOS that draw (compute_users).
+    MINA_HOST_IOREG replaces the program, for tests. Without ioreg (not macOS) the users cannot be known."""
+    try:
+        r = subprocess.run([os.environ.get('MINA_HOST_IOREG', '/usr/sbin/ioreg'), '-r', '-c', 'IOGPUDeviceUserClient', '-l', '-w0'],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f'ioreg: {e}')
+    if r.returncode != 0:
+        raise RuntimeError(f'ioreg exited {r.returncode}: {r.stderr.strip()[:200]}')
+    pids = gpu_client_pids(r.stdout)
+    return compute_users(pids, darwin.pidpath) if DARWIN else pids
+
+
 def unit_active(unit):
+    """'active' when the supervisor unit runs. On macOS a unit names a launchd job of the user (a label): 'active' when
+    its main process runs, 'inactive' when it is loaded and does not run, '' when it is not loaded."""
+    if DARWIN:
+        job = darwin.job(unit)
+        return '' if job is None else 'active' if job['state'] == 'running' and job['pid'] else 'inactive'
     r = subprocess.run(['systemctl', '--user', 'is-active', unit], capture_output=True, text=True, timeout=15)
     return r.stdout.strip()
 

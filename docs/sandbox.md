@@ -2,6 +2,7 @@
 
 This document tells what the sandbox of Mina protects, what it does not protect, which limits apply, and how to stop an instance.
 For the options and daily use, read [the sandbox](usage.md#the-sandbox) in the usage guide.
+The mechanisms below are those of Linux (bubblewrap, systemd, cgroups). On macOS, Seatbelt and launchd give the same boundary; [macOS](macos.md) tells how, and where the behavior differs.
 
 The harness controls authority and continuity. The agent selects its workflow.
 A passed project check proves what the check examines. It is not an independent acceptance or a scientific qualification.
@@ -97,7 +98,7 @@ These rules apply to the installation:
 - The terminal UI and RPC mode are the supported interfaces for long sessions. Print and JSON mode are Pi's one-shot interfaces.
 - To develop Mina with Mina, run an installed copy and edit a separate checkout.
 
-If bubblewrap or the systemd user session is missing, Mina refuses to start. There is no fallback without the sandbox.
+If bubblewrap or the systemd user session is missing (on macOS: the native helpers), Mina refuses to start. There is no fallback without the sandbox.
 `--nosandbox` leaves this boundary on purpose, and it also turns off the local limits.
 
 ## Limits and local stop

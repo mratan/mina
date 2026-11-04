@@ -9,6 +9,8 @@ import { withRetainedOutput, DEFAULT_MAX_INLINE_BYTES, WORKER_OUTPUTS_MOUNT } fr
 import { runFileOperation } from '../sandbox/worker-client.mjs';
 import { createSandboxTools } from '../extensions/sandbox/tools.mjs';
 import { needsSandbox } from './capabilities.mjs';
+import { MACOS } from '../sandbox/sandbox.mjs';
+import { realpathSync } from 'node:fs';
 
 const sha = (s) => createHash('sha256').update(s).digest('hex');
 const bytes = (s) => Buffer.byteLength(s, 'utf8');
@@ -50,7 +52,8 @@ test('oversized result becomes a bounded preview and its complete bytes are read
     assert.ok(visible.trimEnd().endsWith(UNTRUSTED_END), 'untrusted boundary closes after the preview');
     const r = out.details.retainedResult;
     assert.equal(out.details.server, 'pubmed'); assert.equal(out.details.outcome, 'ok'); assert.equal(out.isError, undefined);
-    assert.ok(r.path.startsWith(`${WORKER_OUTPUTS_MOUNT}/`) && r.path.endsWith('.txt'));
+    // Linux: the read-only mount of the store; macOS: the store's real path, read-only in each worker profile.
+    assert.ok(r.path.startsWith(`${MACOS ? realpathSync(f.outputs) : WORKER_OUTPUTS_MOUNT}/`) && r.path.endsWith('.txt'));
     assert.ok(visible.includes(r.path) && visible.includes(r.sha256));
     assert.equal(r.bytes, bytes(original)); assert.equal(r.sha256, sha(original)); assert.equal(r.complete, true);
     assert.ok(r.hostPath.startsWith(f.outputs));
@@ -76,7 +79,8 @@ test('the host path and broader mounts are not needed: only the existing outputs
   const { tool } = fakeTool(() => ({ content: [{ type: 'text', text: 'y'.repeat(80000) }] }));
   try {
     const r = (await withRetainedOutput(tool, { env: f.env }).execute('c', {})).details.retainedResult;
-    await assert.rejects(runFileOperation('read', { path: r.hostPath }, { cwd: f.cwd, env: f.env }), /ENOENT|no such file/i);
+    if (MACOS) assert.equal(realpathSync(r.hostPath), r.path, 'macOS: the handle is the real path of the store');
+    else await assert.rejects(runFileOperation('read', { path: r.hostPath }, { cwd: f.cwd, env: f.env }), /ENOENT|no such file/i);
     assert.equal((await runFileOperation('read', { path: r.path }, { cwd: f.cwd, env: f.env })).length, 80000);
   } finally { cleanup(f.cwd, f.outputs); }
 });

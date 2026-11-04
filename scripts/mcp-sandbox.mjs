@@ -23,7 +23,8 @@ import { homedir } from 'node:os';
 import { join, resolve, dirname, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createEgressProxy } from '../lib/egress-proxy.mjs';
-import { EGRESS_ENV, NETBRIDGE_PATH } from '../sandbox/sandbox.mjs';
+import { EGRESS_ENV, NETBRIDGE_PATH, MACOS, macEgressEnv, sandboxAvailable } from '../sandbox/sandbox.mjs';
+import { ensureSupervisor, relaySpawn } from '../sandbox/macos/client.mjs';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const install = join(repo, 'services/literature-mcp');
@@ -97,6 +98,21 @@ export function bwrapArgs({ home, socketPath, command }) {
     '--chdir', home, '--', '/usr/bin/node', `${EGRESS_RUN}/netbridge.mjs`, '--', ...command];
 }
 
+// macOS (docs/macos.md): the server runs as a call of the instance's supervisor, under a Seatbelt profile with the same
+// roots as bwrapArgs: system software and the pinned install (with the real folders of its venv, Node and Python)
+// read-only, its home writable, and one network endpoint: this script's own egress proxy, a TCP port with a token.
+export function macServiceRequest({ home, command, env, endpoint }) {
+  const venv = join(install, '.venv');
+  const reads = [install];
+  const prefix = (exe) => dirname(dirname(realpathSync(exe)));
+  if (existsSync(venv)) {
+    reads.push(realpathSync(venv));
+    for (const exe of ['node', 'python']) if (existsSync(join(venv, 'bin', exe))) reads.push(prefix(join(venv, 'bin', exe)));
+  }
+  return { kind: 'service', argv: command, cwd: home, reads: [...new Set(reads)], writes: [home], egressPort: endpoint.port,
+    env: { ...env, ...macEgressEnv(endpoint) } };
+}
+
 // Each server's private home and its egress log: ~/.cache/mina/mcp (XDG_CACHE_HOME is respected).
 export const mcpCacheDir = (env = process.env, home = homedir()) => join(env.XDG_CACHE_HOME || join(home, '.cache'), 'mina', 'mcp');
 
@@ -112,16 +128,22 @@ async function main() {
   for (const part of command) if (part.startsWith(install) && !existsSync(part)) die(`${part} is not installed: run npm run literature:install`);
   const { env, missing } = serverEnv(spec, { keys: readKeyDirs(keyDirs()), home });
   if (missing.length) process.stderr.write(`mcp-sandbox[${spec.name}]: not configured (runs without them): ${missing.join(', ')}\n`);
-  const proxy = createEgressProxy({ level: 'open', socketDir: join(cache, '.sockets'),
+  const proxy = createEgressProxy({ level: 'open', socketDir: join(cache, '.sockets'), listen: MACOS ? 'tcp' : 'unix',
     onEvent: (e) => { try { appendFileSync(log, `${JSON.stringify(e)}\n`, { mode: 0o600 }); } catch { /* diagnostic only */ } } });
   await proxy.start();
-  const child = spawn('bwrap', bwrapArgs({ home, socketPath: proxy.socketPath, command }), { stdio: 'inherit', env });
+  let child;
+  if (MACOS) {
+    // With --nosandbox there is no instance: a private supervisor serves this server (on Linux it runs in bwrap then too).
+    try { await ensureSupervisor({ allowedWrites: [cache] }); } catch (error) { die(error.message); }
+    const r = relaySpawn(macServiceRequest({ home, command, env, endpoint: proxy.endpoint }));
+    child = spawn(r.command, r.args, { stdio: 'inherit', env: r.env });
+  } else child = spawn('bwrap', bwrapArgs({ home, socketPath: proxy.socketPath, command }), { stdio: 'inherit', env });
   const stop = (signal) => { try { child.kill(signal); } catch { /* gone */ } };
   for (const s of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(s, () => stop(s));
   child.on('exit', async (code, signal) => { await proxy.close().catch(() => {}); process.exit(code ?? (signal ? 128 : 1)); });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (spawnSync('bwrap', ['--version']).status !== 0) die('bubblewrap (bwrap) is required');
+  if (MACOS ? process.env.MINA_SANDBOX === '1' && !sandboxAvailable() : spawnSync('bwrap', ['--version']).status !== 0) die(MACOS ? 'the sandbox supervisor of this Mina instance is not available' : 'bubblewrap (bwrap) is required');
   main();
 }

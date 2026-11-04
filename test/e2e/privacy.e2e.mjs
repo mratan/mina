@@ -68,6 +68,26 @@ function project() {
   return dir;
 }
 
+const PTY_BRIDGE = `import os, pty, select, struct, fcntl, termios, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], sys.argv[1:])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
+open_in = True
+while True:
+    r, _, _ = select.select([fd] + ([0] if open_in else []), [], [])
+    if fd in r:
+        try: data = os.read(fd, 65536)
+        except OSError: data = b''
+        if not data: break
+        os.write(1, data)
+    if 0 in r:
+        data = os.read(0, 65536)
+        if data: os.write(fd, data)
+        else: open_in = False
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status) if hasattr(os, 'waitstatus_to_exitcode') else status >> 8)`;
+
 // One mina launch. tui: a real interactive session on a pseudo-terminal, idle for `tui` seconds, then Ctrl+D.
 // The literature broker gets an empty cache in the project, so research calls really go out.
 function mina(args, { tui = 0, timeoutMs = 240_000 } = {}) {
@@ -77,8 +97,11 @@ function mina(args, { tui = 0, timeoutMs = 240_000 } = {}) {
     setTimeout(() => child.stdin.write('\x03\x03'), (tui + 10) * 1000 * SCALE);
     setTimeout(() => child.stdin.end(), (tui + 20) * 1000 * SCALE);
   } : undefined;
-  return observe((cwd) => (tui ? ['/usr/bin/script', ['-qfe', '-E', 'always', '-c', [process.execPath, MINA, ...args].map(quote).join(' '), '/dev/null']]
-    : [process.execPath, [MINA, ...args]]), { input, timeoutMs, env: (cwd) => ({ LIT_BROKER_CACHE_DIR: join(cwd, '.literature-cache') }) });
+  // util-linux script on Linux. macOS: BSD script needs a terminal on its own stdin, so a small pty bridge runs the
+  // command on a pseudo-terminal, passes stdin to it, copies its output, and exits with its status.
+  const tuiCommand = process.platform === 'darwin' ? ['/usr/bin/python3', ['-I', '-c', PTY_BRIDGE, process.execPath, MINA, ...args]]
+    : ['/usr/bin/script', ['-qfe', '-E', 'always', '-c', [process.execPath, MINA, ...args].map(quote).join(' '), '/dev/null']];
+  return observe((cwd) => (tui ? tuiCommand : [process.execPath, [MINA, ...args]]), { input, timeoutMs, env: (cwd) => ({ LIT_BROKER_CACHE_DIR: join(cwd, '.literature-cache') }) });
 }
 
 // Run a command in a fresh project directory and observe its egress, the research proxy logs and the onnxruntime files.

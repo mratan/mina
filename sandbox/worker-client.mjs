@@ -1,17 +1,30 @@
 // The only local execution transport for model-authored file operations and commands.
 import { spawn, spawnSync } from 'node:child_process';
 import { constants } from 'node:os';
-import { innerArgs, BWRAP_PATH, EGRESS_BRIDGE, BRIDGE_NODE_FLAGS, sandboxSettingsFromEnv } from './sandbox.mjs';
+import { innerArgs, BWRAP_PATH, EGRESS_BRIDGE, BRIDGE_NODE_FLAGS, sandboxSettingsFromEnv, MACOS, WORKER_NODE, WORKER_FILE, macWorkerRequest } from './sandbox.mjs';
+import { relaySpawn } from './macos/client.mjs';
+
+// The process that runs one worker: bwrap on Linux; on macOS the relay to the instance's supervisor, which runs the
+// call in a launchd job of its own (sandbox/macos). Both are a child process with stdio pipes, and killing it stops the
+// worker and every process the worker started.
+function workerCommand(argv, s) {
+  if (MACOS) {
+    const { command, args, env } = relaySpawn(macWorkerRequest(argv, s), s.env);
+    return { command, args, env };
+  }
+  const args = [...innerArgs(s), '--', ...(s.network === 'offline' ? argv : [WORKER_NODE, ...BRIDGE_NODE_FLAGS, EGRESS_BRIDGE, '--', ...argv])];
+  return { command: BWRAP_PATH, args, env: { PATH: '/usr/bin:/bin' } };
+}
 
 export function runWorker(argv, { cwd = process.cwd(), env = process.env, signal, input, timeout = 120,
   onData, egressSocket, network = 'offline' } = {}) {
   const s = { ...sandboxSettingsFromEnv(env, { cwd }), env, network, egressSocket };
-  const args = [...innerArgs(s), '--', ...(network === 'offline' ? argv : ['/run/mina-node', ...BRIDGE_NODE_FLAGS, EGRESS_BRIDGE, '--', ...argv])];
   return new Promise((resolve, reject) => {
     signal?.throwIfAborted();
-    const child = spawn(BWRAP_PATH, args, { env: { PATH: '/usr/bin:/bin' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const w = workerCommand(argv, s);
+    const child = spawn(w.command, w.args, { env: w.env, stdio: ['pipe', 'pipe', 'pipe'] });
     let out = [], err = [], size = 0, timedOut = false;
-    const kill = () => child.kill('SIGKILL'); // bwrap's PID namespace kills detached descendants too.
+    const kill = () => child.kill('SIGKILL'); // Linux: bwrap's PID namespace; macOS: the call's coalition. Descendants stop too.
     const timer = setTimeout(() => { timedOut = true; kill(); }, timeout * 1000);
     const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', kill); };
     signal?.addEventListener('abort', kill, { once: true });
@@ -41,8 +54,9 @@ export function runWorker(argv, { cwd = process.cwd(), env = process.env, signal
 
 export function runFileOperationSync(action, args, { cwd = process.cwd(), env = process.env } = {}) {
   const config = { ...sandboxSettingsFromEnv(env, { cwd }), env, network: 'offline' };
-  const child = spawnSync(BWRAP_PATH, [...innerArgs(config), '--', '/run/mina-node', '/run/mina-file-worker.mjs'], {
-    env: { PATH: '/usr/bin:/bin' }, input: JSON.stringify({ action, args }), encoding: 'utf8', timeout: 15_000, maxBuffer: 92 * 1024 ** 2,
+  const w = workerCommand([WORKER_NODE, WORKER_FILE], config);
+  const child = spawnSync(w.command, w.args, {
+    env: w.env, input: JSON.stringify({ action, args }), encoding: 'utf8', timeout: 15_000, maxBuffer: 92 * 1024 ** 2,
   });
   if (child.error) throw child.error;
   let out;
@@ -52,7 +66,7 @@ export function runFileOperationSync(action, args, { cwd = process.cwd(), env = 
 }
 
 export async function runFileOperation(action, args, options = {}) {
-  const out = await runWorker(['/run/mina-node', '/run/mina-file-worker.mjs'], {
+  const out = await runWorker([WORKER_NODE, WORKER_FILE], {
     ...options, network: 'offline', input: JSON.stringify({ action, args }),
   });
   let reply;

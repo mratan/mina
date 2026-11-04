@@ -501,6 +501,16 @@ test('no broker: request reports BLOCKED with the remediation; no profile: the e
 test('sandbox: only the broker socket folder and the grant enter the outer layer; both are hidden from commands', () => {
   const env = { XDG_RUNTIME_DIR: '/run/user/4242' };
   const hp = hostPaths({ uid: 4242, env });
+  if (process.platform === 'darwin') {
+    // macOS has no bind mounts: Pi uses the real socket and grant (its outer profile allows that socket only; see
+    // test/macos-host-session.test.mjs), and both folders are hidden from the commands.
+    assert.equal(hp.socket, join(hp.brokerDir, 'sock'));
+    const box = settings({ cwd: tmpdir(), env });
+    assert.ok(box.hidden.includes(hp.inside) && box.hidden.includes(hp.brokerDir));
+    assert.deepEqual(hostEnv({ brokerDir: '/b', grantFile: '/g/grant' }, { sandboxed: true, uid: 4242, env }), { MINA_HOST_SOCKET: '/b/sock', MINA_HOST_GRANT_FILE: '/g/grant' });
+    assert.deepEqual(hostEnv({ unavailable: 'down' }, { sandboxed: true, env }), { MINA_HOST_UNAVAILABLE: 'down' });
+    return;
+  }
   const a = outerArgs({ writable: [], cwd: '/p' }, { uid: 4242, env, host: { brokerDir: '/run/user/4242/mina-hostd', grantFile: '/run/user/4242/mina-grant-x/grant' } });
   const s = a.join(' ');
   assert.ok(s.includes(`--bind /run/user/4242/mina-hostd ${hp.inside}/hostd`));
@@ -746,7 +756,8 @@ test('openHostSession: an unregistered project gets a session only from a policy
   } finally { await b.close(); rmSync(runtime, { recursive: true, force: true }); }
 });
 
-test('the host policy folder is never writable for the agent: not in the outer layer\'s binds, read-only in a real sandbox', { skip: needsSandbox }, () => {
+// Linux: the outer bwrap layer. macOS: test/macos-profile.test.mjs checks the outer Seatbelt profile the same way.
+test('the host policy folder is never writable for the agent: not in the outer layer\'s binds, read-only in a real sandbox', { skip: process.platform === 'darwin' ? 'Linux outer layer (bwrap); macOS: test/macos-profile.test.mjs' : needsSandbox }, () => {
   // Read-only checks of the real path: the bind list, and access(2) through `test -w`. Nothing is written there.
   const home = homedir();
   const policyDir = join(home, '.config', 'mina');

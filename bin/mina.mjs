@@ -24,11 +24,12 @@
 //   Exit status: 0 done, 1 refused or failed, 2 usage error. The agent's sandbox cannot write the policy file.
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { hotCompactConfig } from '../extensions/handoff/policy.mjs';
 import { findMostRecentSession } from '../node_modules/@earendil-works/pi-coding-agent/dist/core/session-manager.js';
 import * as sandbox from '../sandbox/sandbox.mjs';
 import { unlinkGitObjects, formatUnlinkReport } from '../sandbox/git-objects.mjs';
+import { helperProblem, launchInstance } from '../sandbox/macos/launch.mjs';
 import { createInstance, scopeCommand, instanceLimits, instanceDirectory, artifactDirectory, loadInstance, inspectInstance, stopInstance, writeInstance } from '../lib/instance-runtime.mjs';
 import { request as hostRequest } from '../extensions/host/index.js';
 import { ownerSkills } from '../lib/skill-resources.mjs';
@@ -231,16 +232,18 @@ export function layerEnv(p, env = process.env, { home = homedir(), repoKeys = jo
 // a broker that speaks the policy protocol still gets a session: the agent can see the machine (inventory) and propose a
 // registration that the user approves (policy_propose); everything else stays refused. An older broker: off, as before.
 export const POLICY_PROTOCOL = 'mina-policy-v1';
-export async function openHostSession(project, env = process.env, { uid = process.getuid() } = {}) {
+export async function openHostSession(project, env = process.env, { uid = process.getuid(), instance = null } = {}) {
   if (env.MINA_HOST === '0') return null;
   const hp = sandbox.hostPaths({ uid, env });
   const socket = join(hp.brokerDir, 'sock');
   const configured = existsSync(env.MINA_HOST_CONFIG || join(homedir(), '.config', 'mina', 'host.json'));
   if (!existsSync(socket)) return configured ? { unavailable: `mina-hostd is not running (no ${socket})` } : null;
-  const out = await hostRequest(socket, { op: 'session_open', project, label: `mina ${process.pid}` }, { timeoutMs: 5000 });
+  // macOS: the broker accepts the session only from the Pi of this instance (its launchd job), so the request names it.
+  const out = await hostRequest(socket, { op: 'session_open', project, label: `mina ${process.pid}`, ...(sandbox.MACOS && instance ? { instance } : {}) }, { timeoutMs: 5000 });
   if (!out.ok) return { unavailable: `${out.error.code}: ${out.error.message}` };
   if (!out.result.registered && env.MINA_HOST !== '1' && out.result.policy_protocol !== POLICY_PROTOCOL) return null;
-  const dir = mkdtempSync(join(env.XDG_RUNTIME_DIR || `/run/user/${uid}`, 'mina-grant-'));
+  if (sandbox.MACOS) mkdirSync(hp.inside, { recursive: true, mode: 0o700 });
+  const dir = mkdtempSync(sandbox.MACOS ? join(hp.inside, 'grant-') : join(env.XDG_RUNTIME_DIR || `/run/user/${uid}`, 'mina-grant-'));
   chmodSync(dir, 0o700);
   const grantFile = join(dir, 'grant');
   writeFileSync(grantFile, `${out.result.grant}\n`, { mode: 0o600 });
@@ -252,7 +255,8 @@ export function hostEnv(host, { sandboxed, uid = process.getuid(), env = process
   if (!host) return {};
   if (host.unavailable) return { MINA_HOST_UNAVAILABLE: host.unavailable };
   const hp = sandbox.hostPaths({ uid, env });
-  return sandboxed ? { MINA_HOST_SOCKET: hp.socket, MINA_HOST_GRANT_FILE: hp.grant }
+  // macOS has no bind mounts: Pi uses the real paths, also in the sandbox.
+  return sandboxed && !sandbox.MACOS ? { MINA_HOST_SOCKET: hp.socket, MINA_HOST_GRANT_FILE: hp.grant }
     : { MINA_HOST_SOCKET: join(host.brokerDir, 'sock'), MINA_HOST_GRANT_FILE: host.grantFile };
 }
 
@@ -330,6 +334,9 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   let instance = null;
   if (!p.passthrough && !p.sandbox && !p.dryRun) process.stderr.write('mina: --nosandbox disables worker isolation and instance OS limits. This is not an unattended boundary.\n');
   if (p.sandbox && !p.dryRun) {
+    // Pi's agent folder must exist before the launch: the sandbox makes only existing folders writable for Pi, and a
+    // fresh installation has none yet (Pi would fail to create it).
+    mkdirSync(agentDir(env), { recursive: true, mode: 0o700 });
     try {
       sandbox.validateWritableRoots(p.sandbox.writable, { trustedRoots: [REPO, ...sandbox.defaultWritable(homedir(), env), instanceDirectory(env), artifactDirectory(env),
         dirname(p.sandbox.config || join(homedir(), '.config', 'mina', 'sandbox.json')),
@@ -382,16 +389,21 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       GIT_CONFIG_KEY_2: 'credential.helper', GIT_CONFIG_VALUE_2: '' });
     if (p.args.includes('--verbose')) process.stderr.write(`mina: instance ${instance.id}; local limit ${instance.limits.maxWallS ? `${instance.limits.maxWallS}s` : 'no wall-clock deadline'}, ${instance.limits.memoryBytes} bytes, ${instance.limits.maxProcesses} processes.\nmina: explicit local stop: mina stop ${instance.id}; broker jobs remain separate.\n`);
   }
-  const host = p.passthrough || p.dryRun ? null : await openHostSession(p.sandbox?.project ?? sandbox.projectRoot(env.MINA_CWD || process.cwd()), env);
+  const host = p.passthrough || p.dryRun ? null : await openHostSession(p.sandbox?.project ?? sandbox.projectRoot(env.MINA_CWD || process.cwd()), env, { instance: instance?.id ?? null });
   Object.assign(runEnv, hostEnv(host, { sandboxed: !!p.sandbox, env }));
   if (p.sandbox) {
     const problem = sandbox.projectProblem(p.sandbox.project);
     if (problem) { process.stderr.write(`mina: sandbox: ${problem}\n`); return 2; }
-    if (!sandbox.bwrapAvailable()) { process.stderr.write('mina: sandbox: bubblewrap (bwrap) is required; install it, or run mina --nosandbox\n'); return 2; }
-    command = [sandbox.BWRAP_PATH, ...sandbox.outerArgs(p.sandbox, { env: runEnv, host: host?.grantFile ? host : null }), '--', ...command];
+    if (sandbox.MACOS) {
+      const problem = helperProblem();
+      if (problem) { process.stderr.write(`mina: sandbox: ${problem}\n`); return 2; }
+    } else {
+      if (!sandbox.bwrapAvailable()) { process.stderr.write('mina: sandbox: bubblewrap (bwrap) is required; install it, or run mina --nosandbox\n'); return 2; }
+      command = [sandbox.BWRAP_PATH, ...sandbox.outerArgs(p.sandbox, { env: runEnv, host: host?.grantFile ? host : null }), '--', ...command];
+    }
   }
   Object.assign(runEnv, researchEnv(env));
-  if (instance) command = scopeCommand(instance, command);
+  if (instance && !sandbox.MACOS) command = scopeCommand(instance, command);
   if (p.dryRun) {
     process.stdout.write(`${JSON.stringify({ mode: p.mode, model: p.model, model_source: p.modelSource, tuning: p.tuning?.file ?? null,
       sandbox: p.sandbox ? { project: p.sandbox.project, network: p.sandbox.network, writable: p.sandbox.writable, hidden: p.sandbox.hidden.length, config: p.sandbox.config } : 'off',
@@ -399,20 +411,29 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       research: Object.fromEntries(RESEARCH_ENV.filter((k) => runEnv[k]).map((k) => [k, runEnv[k]])), command }, null, 2)}\n`);
     return 0;
   }
-  const child = spawn(command[0], command.slice(1), { stdio: 'inherit', env: runEnv });
-  // Pi handles its own signals. A terminal sends Ctrl+C to the whole process group, so Pi already has it; any other
-  // signal (kill, a closed terminal, a supervisor stopping mina) is passed on so Pi never outlives the launcher.
-  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { if (sig !== 'SIGINT' || !process.stdin.isTTY) child.kill(sig); });
-  return new Promise((done) => child.on('exit', (code, signal) => {
+  const finish = (code) => {
     if (host?.dir) rmSync(host.dir, { recursive: true, force: true }); // the broker ends the session when this process exits
     if (instance) {
       try { writeInstance(instance, { status: 'launcher_exited', observedAt: new Date().toISOString(), observation: inspectInstance(instance) }); }
       catch { writeInstance(instance, { status: 'exit_unverified', observedAt: new Date().toISOString() }); }
     }
-    done(code ?? (signal ? 128 : 1));
-  }));
+    return code;
+  };
+  if (sandbox.MACOS && instance) {
+    // macOS: the instance is a launchd job with the outer Seatbelt profile (sandbox/macos/launch.mjs).
+    const writable = [...p.sandbox.writable, ...sandbox.defaultWritable(homedir(), env)];
+    return finish(await launchInstance({ instance, command, runEnv, cwd: p.sandbox.cwd, writable, readable: p.sandbox.trustedPaths ?? [], env,
+      sockets: host?.grantFile ? [join(host.brokerDir, 'sock')] : [] }));
+  }
+  const child = spawn(command[0], command.slice(1), { stdio: 'inherit', env: runEnv });
+  // Pi handles its own signals. A terminal sends Ctrl+C to the whole process group, so Pi already has it; any other
+  // signal (kill, a closed terminal, a supervisor stopping mina) is passed on so Pi never outlives the launcher.
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { if (sig !== 'SIGINT' || !process.stdin.isTTY) child.kill(sig); });
+  return new Promise((done) => child.on('exit', (code, signal) => done(finish(code ?? (signal ? 128 : 1)))));
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// The real path: the install links ~/.local/bin/mina to this file, and Node gives the link as argv[1].
+const invoked = (() => { try { return realpathSync(process.argv[1] ?? ''); } catch { return null; } })();
+if (invoked && invoked === fileURLToPath(import.meta.url)) {
   main().then((code) => process.exit(code), (e) => { process.stderr.write(`mina: ${e.stack ?? e.message}\n`); process.exit(1); });
 }

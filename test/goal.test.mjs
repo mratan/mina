@@ -8,6 +8,7 @@ const REPO_ROOT = new URL('..', import.meta.url).pathname;
 import { parseGoalArgs, upstreamArgs, goalInstructions, rejectionFeedback, isMinaPath, isCheckPath, parseCheckLines, checkScriptsIn, unusedCheckScripts, dryRunVerdict, proposalSummary } from '../extensions/goal/checks.mjs';
 import { createMinaGoal, DRY_RUN_TIMEOUT_MS } from '../extensions/goal/mina-goal.mjs';
 import { observeWorkload, liveWorkload, toolEffect, nextStall, gitSnapshot } from '../extensions/goal/stall.mjs';
+import { MACOS } from '../sandbox/sandbox.mjs';
 
 test('protected planning requests check registration instead of falsely reporting unaccepted scripts as tampered', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'mina-minimal-planning-'));
@@ -102,7 +103,7 @@ test('all working-check execution paths use the inner sandbox and remove secret 
   assert.equal(seen.length, 3);
   for (const command of seen) {
     assert.match(command, /^exec \/usr\/bin\/env -i PATH=\/usr\/bin:\/bin/);
-    assert.match(command, /--unshare-net/);
+    assert.match(command, MACOS ? /"network":"offline"/ : /--unshare-net/); // macOS: the request to the supervisor
     assert.doesNotMatch(command, /must-not-appear-in-command|PROBE_API_KEY/);
   }
 });

@@ -11,6 +11,7 @@ import { runFileOperation, runWorker } from '../sandbox/worker-client.mjs';
 import { createSandboxTools } from '../extensions/sandbox/tools.mjs';
 import { validateWritableRoots } from '../sandbox/sandbox.mjs';
 import { needsSandbox } from './capabilities.mjs';
+import { MACOS, WORKER_NODE } from '../sandbox/sandbox.mjs';
 const fixture = () => {
   const cwd = mkdtempSync(join(tmpdir(), 'mina-worker-'));
   return { cwd, env: { MINA_SANDBOX_PROJECT: cwd, MINA_SANDBOX_WRITE: JSON.stringify([cwd]), MINA_SANDBOX_NET: 'offline' } };
@@ -263,22 +264,22 @@ test('host sockets are refused by preflight and detached descendants do not keep
 
 test('open networking still cannot dial a host loopback service directly', { skip: needsSandbox }, async () => {
   const f = fixture(), server = createServer((socket) => socket.end('host-visible'));
-  const proxy = createEgressProxy({ level: 'open' });
+  const proxy = createEgressProxy({ level: 'open', listen: MACOS ? 'tcp' : 'unix' });
   try {
     await new Promise((done) => server.listen(0, '127.0.0.1', done));
     await proxy.start();
     const script = `const s=require('net').connect(${server.address().port},'127.0.0.1'); s.on('connect',()=>{console.log('ESCAPED');s.destroy()});s.on('error',()=>console.log('blocked'))`;
-    const out = await runWorker(['/run/mina-node', '-e', script], { ...f, network: 'open', egressSocket: proxy.socketPath, timeout: 3 });
+    const out = await runWorker([WORKER_NODE, '-e', script], { ...f, network: 'open', egressSocket: proxy.endpoint, timeout: 3 });
     assert.equal(out.exitCode, 0, out.stderr.toString());
     assert.equal(out.stdout.toString().trim(), 'blocked');
   } finally { await proxy.close(); await new Promise((done) => server.close(done)); rmSync(f.cwd, { recursive: true }); }
 });
 
 test('the network bridge adds no Node proxy-agent warning to a sandboxed command (Node 22)', { skip: needsSandbox }, async () => {
-  const f = fixture(), proxy = createEgressProxy({ level: 'open' });
+  const f = fixture(), proxy = createEgressProxy({ level: 'open', listen: MACOS ? 'tcp' : 'unix' });
   try {
     await proxy.start();
-    const out = await runWorker(['/bin/bash', '-c', 'printf quiet'], { ...f, network: 'open', egressSocket: proxy.socketPath, timeout: 5 });
+    const out = await runWorker(['/bin/bash', '-c', 'printf quiet'], { ...f, network: 'open', egressSocket: proxy.endpoint, timeout: 5 });
     assert.equal(out.exitCode, 0, out.stderr.toString());
     assert.equal(out.stdout.toString(), 'quiet');
     assert.doesNotMatch(out.stderr.toString(), /EnvHttpProxyAgent|UNDICI-EHPA/);

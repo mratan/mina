@@ -9,6 +9,7 @@ software that Mina installs or runs.
 |---|---|---|---|
 | pi-claude-subscription 0.2.4, with Mina's patches | `vendor/pi-claude-subscription-0.2.4-mina.5.tgz`, `vendor/patches/` | npm `pi-claude-subscription`, github.com/jkeskikangas/pi-claude-subscription, Copyright (c) 2026 Jarno Keskikangas | MIT. The license text is in the tgz (`package/LICENSE`). [Vendor patches](docs/vendor-patches.md) describes the changes |
 | pi-research-search | `adapters/pi-research-search/` | A fork of npm `@bytetrue/pi-web-search` 0.5.1, Copyright (c) 2026 byte (ByteTrue). `pristine/` holds the unchanged upstream files | MIT, see `adapters/pi-research-search/LICENSE` and `ATTRIBUTION.md` |
+| Seatbelt profile rules (sysctl, device, platform, and deny lists) | `sandbox/macos/profile.mjs`, `scripts/macos-probe.py` | Adapted from github.com/openai/codex `codex-rs/sandboxing/src/seatbelt_base_policy.sbpl` and `seatbelt_read_only_platform_defaults.sbpl` (commit `3a2788e`), Copyright OpenAI, and from github.com/eugene1g/agent-safehouse `profiles/10-system-runtime.sb` (v0.12.0, commit `0812967`) | Apache-2.0, see https://www.apache.org/licenses/LICENSE-2.0 |
 | HTML extraction, URL guard, Brave and Exa clients | in `adapters/pi-research-search/` | Ported by the upstream above from npm `@juicesharp/rpiv-web-tools`, github.com/juicesharp/rpiv-mono, Copyright (c) 2026 juicesharp | MIT, see `adapters/pi-research-search/LICENSE` |
 
 ## Software that Mina installs or runs

@@ -25,7 +25,7 @@ sys.path.insert(0, HERE)
 import hostlib  # noqa: E402
 import hostd  # noqa: E402
 import policy as P  # noqa: E402
-from test_hostd import Broker, wait_for  # noqa: E402
+from test_hostd import FLOCK, Broker, wait_for  # noqa: E402
 
 SHA = 'a' * 64
 
@@ -107,6 +107,7 @@ class ValidateTest(Tmp):
             'no lock path': (lambda c: c['resources']['QUIET']['locks'][0].pop('path'), r'QUIET\.locks\[0\]: needs "path"'),
             'device kind': (lambda c: c['resources']['GPU_A'].update(device={'cuda': [0]}), r'device\.cuda: unknown device kind'),
             'kfd': (lambda c: c['resources']['GPU_A'].update(device={'kfd': 1}), r'device\.kfd: must be true'),
+            'apple_gpu': (lambda c: c['resources']['GPU_A'].update(device={'apple_gpu': 'yes'}), r'device\.apple_gpu: must be true'),
             'lockouts': (lambda c: c['resources']['GPU_A'].update(lockouts='x'), r'lockouts: must be a list'),
             'argv': (lambda c: c['projects'][p]['workloads']['smoke'].pop('argv'), r'workloads\.smoke\.argv: needs a nonempty list'),
             'pattern': (lambda c: c['projects'][p]['workloads']['cell']['params'].update(exp='(['), r'params\.exp: the pattern does not compile'),
@@ -540,8 +541,23 @@ class WriteTest(Tmp):
         self.assertFalse(os.path.exists(self.path))
 
 
+IOREG_ACCELERATOR = """+-o AGXAcceleratorG13X  <class AGXAcceleratorG13X, id 0x100000963, registered, matched, active, busy 0 (516 ms), retain 70>
+    {
+      "IOMatchedAtBoot" = Yes
+      "model" = "Apple M1 Pro"
+      "gpu-core-count" = 14
+      "IOClass" = "AGXAcceleratorG13X"
+    }
+"""
+
+
 def fixture_gpus(tmp):
-    """A fake nvidia-smi with two GPUs, and a KFD topology with a CPU node and one AMD GPU."""
+    """A fake nvidia-smi with two GPUs, a KFD topology with a CPU node and one AMD GPU, and a fake ioreg with one Apple
+    GPU (captured on macOS 27.2, shortened)."""
+    ioreg = os.path.join(tmp, 'ioreg')
+    put_text(os.path.join(tmp, 'ioreg.out'), IOREG_ACCELERATOR)
+    put_text(ioreg, f'#!/bin/sh\ncat {os.path.join(tmp, "ioreg.out")}\n')
+    os.chmod(ioreg, 0o755)
     smi = os.path.join(tmp, 'nvidia-smi')
     with open(smi, 'w') as f:
         f.write('#!/bin/sh\nprintf "0, 00000000:01:00.0, NVIDIA Fixture A\\n1, 00000000:02:00.0, NVIDIA Fixture B\\n"\n')
@@ -553,7 +569,7 @@ def fixture_gpus(tmp):
         put_text(os.path.join(topo, node, 'properties'), props)
         if name:
             put_text(os.path.join(topo, node, 'name'), name)
-    return {'MINA_HOST_NVIDIA_SMI': smi, 'MINA_HOST_KFD_TOPOLOGY': topo}
+    return {'MINA_HOST_NVIDIA_SMI': smi, 'MINA_HOST_KFD_TOPOLOGY': topo, 'MINA_HOST_IOREG': ioreg}
 
 
 class InventoryTest(Tmp):
@@ -562,7 +578,7 @@ class InventoryTest(Tmp):
         put_text(f'{self.tmp}/lockout-A', 'fault')
         held = f'{self.tmp}/locks/QUIET.lock'
         open(held, 'w').close()
-        holder = subprocess.Popen(['flock', '-x', held, 'sleep', '60'], start_new_session=True)
+        holder = subprocess.Popen([*FLOCK, '-x', held, 'sleep', '60'], start_new_session=True)
         self.addCleanup(lambda: (os.killpg(holder.pid, signal.SIGKILL), holder.wait()))
         self.assertTrue(wait_for(lambda: hostlib.lock_holders(held)))
         inv = P.inventory(self.cfg, env=env)
@@ -571,6 +587,12 @@ class InventoryTest(Tmp):
         self.assertEqual(by['00000000:02:00.0']['covered_by'], [])
         self.assertEqual((by['0000:03:00.0']['vendor'], by['0000:03:00.0']['name']), ('amd', 'gfx1100'))
         self.assertEqual(by['0000:03:00.0']['covered_by'], [f'project {self.tmp}/p1:GPU_A'])
+        self.assertEqual((by['AGXAcceleratorG13X']['vendor'], by['AGXAcceleratorG13X']['name']), ('apple', 'Apple M1 Pro (14 GPU cores)'))
+        self.assertEqual(by['AGXAcceleratorG13X']['covered_by'], [], 'no resource has {"apple_gpu": true}')
+        cfg = json.loads(json.dumps(self.cfg))
+        cfg['resources']['GPU_M'] = {'locks': [{'path': f'{self.tmp}/locks/GPU_M.lock'}], 'device': {'apple_gpu': True}}
+        self.assertEqual(P.validate(cfg), [])
+        self.assertEqual({g['bus_id']: g for g in P.inventory(cfg, env=env)['devices']}['AGXAcceleratorG13X']['covered_by'], ['machine:GPU_M'])
         locks = {rec['path']: rec for rec in inv['locks']}
         self.assertEqual(sorted(locks[held]['used_by']), ['machine:BUILD shared', 'machine:QUIET exclusive'])
         self.assertEqual([h['pid'] for h in locks[held]['holders'] if not h['waiting']][:1], [holder.pid])
@@ -585,10 +607,11 @@ class InventoryTest(Tmp):
         self.assertEqual(P.validate(P.apply_changes(self.cfg, sug)[0]), [], 'a suggestion is a valid change')
 
     def test_a_project_view_shows_no_other_project_and_a_missing_tool_is_a_note(self):
-        env = {'MINA_HOST_NVIDIA_SMI': os.path.join(self.tmp, 'no-such-smi'), 'MINA_HOST_KFD_TOPOLOGY': os.path.join(self.tmp, 'none')}
+        env = {'MINA_HOST_NVIDIA_SMI': os.path.join(self.tmp, 'no-such-smi'), 'MINA_HOST_KFD_TOPOLOGY': os.path.join(self.tmp, 'none'),
+               'MINA_HOST_IOREG': os.path.join(self.tmp, 'no-such-ioreg')}
         inv = P.inventory(self.cfg, project=f'{self.tmp}/work/q', env=env)
         self.assertEqual(inv['devices'], [])
-        self.assertEqual(len(inv['notes']), 2)
+        self.assertEqual(len(inv['notes']), 3)
         used = [u for rec in inv['locks'] + inv['lockouts'] for u in rec['used_by']]
         self.assertFalse([u for u in used if 'p1' in u], used)
         self.assertNotIn(f'{self.tmp}/lockout-A2', [rec['path'] for rec in inv['lockouts']])
@@ -858,7 +881,7 @@ class ProposeTest(unittest.TestCase):
         with patch.dict(os.environ, fixture_gpus(self.tmp)):
             inv = self.call('inventory')
         self.assertFalse(inv['registered'])
-        self.assertEqual(len(inv['devices']), 3)
+        self.assertEqual(len(inv['devices']), 4)
         self.assertEqual([rec['path'] for rec in inv['lockouts']], [f'{self.tmp}/lockout'])
         for op, args in (('workload_run', {'workload': 'old'}), ('reserve', {'resources': ['GPU_A']}), ('service_status', {'service': 's'})):
             with self.subTest(op):

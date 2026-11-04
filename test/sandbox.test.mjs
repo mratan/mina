@@ -1,20 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { outerArgs, innerArgs, wrapCommand, scrubEnv, insideAny, projectProblem, settings, loadConfig, claudeState, defaultWritable, defaultHidden, REPO, minaCode, validateTrustedResources, validateWritableRoots, validateReadableRoots, projectRoot, checkReadGrant, scanReadableRoot, missingRoots } from '../sandbox/sandbox.mjs';
+import { outerArgs, innerArgs, wrapCommand, scrubEnv, insideAny, projectProblem, settings, loadConfig, claudeState, defaultWritable, defaultHidden, REPO, minaCode, validateTrustedResources, validateWritableRoots, validateReadableRoots, projectRoot, checkReadGrant, scanReadableRoot, missingRoots, MACOS } from '../sandbox/sandbox.mjs';
 import minaSandbox, { sandboxNote, scanLine } from '../extensions/sandbox/index.js';
 import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { runWorker, runFileOperation } from '../sandbox/worker-client.mjs';
 import minaIdentity from '../extensions/identity/index.js';
 import { needsSandbox } from './capabilities.mjs';
+// The real temporary folder: on macOS tmpdir() is below /var, a symlink to /private/var, and the sandbox compares real paths.
+const TMP = realpathSync(tmpdir());
 
 const box = (over = {}) => ({ project: '/p', cwd: '/p', writable: ['/p'], hidden: [], network: 'open', ...over });
 
 test('outer layer: read-only root, private /tmp, then the writable binds that exist', () => {
-  const home = mkdtempSync(join(tmpdir(), 'mina-home-'));
+  const home = mkdtempSync(join(TMP, 'mina-home-'));
   const a = outerArgs(box({ writable: [home, '/does/not/exist'] }), { uid: 99999, env: {} });
   assert.deepEqual(a.slice(0, 2), ['--ro-bind', '/']);
   assert.ok(a.indexOf('--tmpfs') < a.indexOf(home));
@@ -23,7 +25,7 @@ test('outer layer: read-only root, private /tmp, then the writable binds that ex
 });
 
 test('Claude state (~/.claude, ~/.claude.json, ~/.claude-*): writable for the trusted controller, absent from workers', () => {
-  const home = mkdtempSync(join(tmpdir(), 'mina-claude-home-'));
+  const home = mkdtempSync(join(TMP, 'mina-claude-home-'));
   mkdirSync(join(home, '.claude')); writeFileSync(join(home, '.claude.json'), '{}');
   mkdirSync(join(home, '.claude-work'));
   const cwd = join(home, 'project'); mkdirSync(cwd);
@@ -39,12 +41,12 @@ test('Claude state (~/.claude, ~/.claude.json, ~/.claude-*): writable for the tr
     assert.ok(!s.writable.includes(path) && !s.readable.includes(path) && !s.readOnly.includes(path));
     assert.ok(!inner.includes(path)); // The positive-mount worker never imports controller state.
   }
-  const missing = mkdtempSync(join(tmpdir(), 'mina-noclaude-home-'));
+  const missing = mkdtempSync(join(TMP, 'mina-noclaude-home-'));
   assert.doesNotMatch(outerArgs(box({ home: missing }), { uid: 99999, env: {} }).join(' '), /\.claude/);
 });
 
 test('a second Claude account\'s state masks its symlink target if a worker data mount contains it', () => {
-  const home = mkdtempSync(join(tmpdir(), 'mina-second-link-'));
+  const home = mkdtempSync(join(TMP, 'mina-second-link-'));
   const data = join(home, 'data'); mkdirSync(data);
   const target = join(data, 'profile'); mkdirSync(target);
   symlinkSync(target, join(home, '.claude-work'));
@@ -56,7 +58,7 @@ test('a second Claude account\'s state masks its symlink target if a worker data
 
 test('root validation denies a second Claude account\'s writable/readable grants, ancestors, descendants and symlink aliases', () => {
   for (const linkedProfile of [false, true]) {
-    const root = mkdtempSync(join(tmpdir(), 'mina-second-roots-'));
+    const root = mkdtempSync(join(TMP, 'mina-second-roots-'));
     const home = join(root, 'home'); mkdirSync(home);
     const profile = join(home, '.claude-work');
     const target = linkedProfile ? join(root, 'profile-target') : profile;
@@ -87,7 +89,7 @@ function writeClaudeProfiles(agent, profiles) {
 
 test('owner-configured Claude directories are controller-writable, worker-private and denied as data roots', () => {
   for (const override of [false, true]) {
-    const home = mkdtempSync(join(tmpdir(), 'mina-custom-claude-'));
+    const home = mkdtempSync(join(TMP, 'mina-custom-claude-'));
     const agent = join(home, override ? 'owner-agent' : '.pi/agent');
     const env = override ? { PI_CODING_AGENT_DIR: agent } : {};
     const parent = join(home, 'accounts'); mkdirSync(parent);
@@ -121,7 +123,7 @@ test('owner-configured Claude directories are controller-writable, worker-privat
 });
 
 test('Claude profile configuration never comes from the project or sandbox configuration', () => {
-  const home = mkdtempSync(join(tmpdir(), 'mina-claude-spoof-'));
+  const home = mkdtempSync(join(TMP, 'mina-claude-spoof-'));
   const cwd = join(home, 'project'); mkdirSync(cwd);
   writeClaudeProfiles(join(cwd, '.pi'), [{ id: 'spoof', name: 'Spoof', configDir: '/' }]);
   const s = settings({ cwd, home, env: {}, config: { file: null, profiles: [{ configDir: '/' }] } });
@@ -135,9 +137,9 @@ test('Claude profile configuration never comes from the project or sandbox confi
 });
 
 test('custom Claude state rejects broad roots, runtime overlaps and symlink escapes, including missing targets', () => {
-  const home = mkdtempSync(join(tmpdir(), 'mina-claude-unsafe-'));
+  const home = mkdtempSync(join(TMP, 'mina-claude-unsafe-'));
   const agent = join(home, '.pi/agent');
-  const outside = mkdtempSync(join(tmpdir(), 'mina-claude-outside-'));
+  const outside = mkdtempSync(join(TMP, 'mina-claude-outside-'));
   symlinkSync(outside, join(home, 'escape'));
   symlinkSync(home, join(home, 'home-alias'));
   symlinkSync(REPO, join(home, 'runtime-alias'));
@@ -167,14 +169,14 @@ test('custom Claude state rejects broad roots, runtime overlaps and symlink esca
 
 test('fixed Claude profile symlinks cannot grant broad or runtime roots either', () => {
   for (const destination of ['/', '/usr', REPO, 'home']) {
-    const home = mkdtempSync(join(tmpdir(), 'mina-fixed-claude-unsafe-'));
+    const home = mkdtempSync(join(TMP, 'mina-fixed-claude-unsafe-'));
     symlinkSync(destination === 'home' ? home : destination, join(home, '.claude-work'));
     assert.throws(() => defaultWritable(home, {}), /unsafe Claude profile state root/);
   }
 });
 
 test('malformed owner Claude profiles fail closed', () => {
-  const home = mkdtempSync(join(tmpdir(), 'mina-claude-invalid-'));
+  const home = mkdtempSync(join(TMP, 'mina-claude-invalid-'));
   const agent = join(home, '.pi/agent');
   for (const profiles of [null, {}, [null], [{}], [{ configDir: 'relative' }], [{ configDir: '/bad\0path' }]]) {
     writeClaudeProfiles(agent, profiles);
@@ -186,7 +188,7 @@ test('malformed owner Claude profiles fail closed', () => {
 });
 
 test('inner layer: hidden paths masked (dirs as read-only tmpfs, files as /dev/null); network levels', () => {
-  const d = mkdtempSync(join(tmpdir(), 'mina-hide-'));
+  const d = mkdtempSync(join(TMP, 'mina-hide-'));
   mkdirSync(join(d, '.ssh')); writeFileSync(join(d, 'auth.json'), '{}');
   const a = innerArgs({ cwd: '/p', readable: [d], hidden: [join(d, '.ssh'), join(d, 'auth.json'), join(d, 'missing')] });
   assert.ok(a.join(' ').includes(`--tmpfs ${join(d, '.ssh')}`) && a.join(' ').includes(`--remount-ro ${join(d, '.ssh')}`));
@@ -198,11 +200,17 @@ test('inner layer: hidden paths masked (dirs as read-only tmpfs, files as /dev/n
 
 test('wrapped command keeps the original command as one quoted argument', () => {
   const w = wrapCommand(`echo "it's" && ls`, { cwd: '/p', hidden: [], network: 'offline' });
+  if (MACOS) {                     // the command is one element of the request's argv, which the relay sends to the supervisor
+    const call = /MINA_CALL='((?:[^']|'\\'')*)'/.exec(w)[1].replaceAll(`'\\''`, `'`);
+    assert.match(w, /^exec \/usr\/bin\/env -i PATH=\/usr\/bin:\/bin MINA_CALL=/);
+    assert.deepEqual(JSON.parse(call).argv, ['/bin/bash', '--noprofile', '--norc', '-c', `echo "it's" && ls`]);
+    return;
+  }
   assert.match(w, /^exec \/usr\/bin\/env -i PATH=\/usr\/bin:\/bin \/usr\/bin\/bwrap /); assert.ok(w.endsWith(`'/bin/bash' '--noprofile' '--norc' '-c' 'echo "it'\\''s" && ls'`));
 });
 
 test('trusted configuration cannot traverse a writable project alias', () => {
-  const root = mkdtempSync(join(tmpdir(), 'mina-config-alias-'));
+  const root = mkdtempSync(join(TMP, 'mina-config-alias-'));
   const project = join(root, 'project'); mkdirSync(project);
   const config = join(root, 'real.json'); writeFileSync(config, '{}');
   symlinkSync(config, join(project, 'alias.json'));
@@ -212,7 +220,7 @@ test('trusted configuration cannot traverse a writable project alias', () => {
 });
 
 test('project discovery never executes a workspace git from inherited PATH', () => {
-  const cwd = mkdtempSync(join(tmpdir(), 'mina-discovery-path-'));
+  const cwd = mkdtempSync(join(TMP, 'mina-discovery-path-'));
   const marker = join(cwd, 'escaped');
   writeFileSync(join(cwd, 'git'), `#!/bin/sh\nprintf escaped > '${marker}'\nprintf '%s' '${cwd}'`, { mode: 0o755 });
   const before = process.env.PATH; process.env.PATH = `${cwd}:${before}`;
@@ -225,7 +233,7 @@ test('secret-like variables are dropped from the commands environment', () => {
 });
 
 test('insideAny follows symlinks through the nearest existing ancestor', () => {
-  const d = mkdtempSync(join(tmpdir(), 'mina-in-'));
+  const d = mkdtempSync(join(TMP, 'mina-in-'));
   mkdirSync(join(d, 'proj')); symlinkSync('/etc', join(d, 'proj', 'escape'));
   assert.ok(insideAny('new/file.txt', [join(d, 'proj')], join(d, 'proj')));
   assert.ok(!insideAny('escape/passwd', [join(d, 'proj')], join(d, 'proj')));
@@ -233,13 +241,13 @@ test('insideAny follows symlinks through the nearest existing ancestor', () => {
 });
 
 test('the sandbox refuses a project that is or contains the home folder', () => {
-  const home = mkdtempSync(join(tmpdir(), 'mina-h-')); mkdirSync(join(home, 'proj'));
+  const home = mkdtempSync(join(TMP, 'mina-h-')); mkdirSync(join(home, 'proj'));
   assert.match(projectProblem(home, home), /home folder/);
   assert.equal(projectProblem(join(home, 'proj'), home), null);
 });
 
 test('settings: config file write/hide/network, flags win, hidden defaults include credentials', () => {
-  const home = mkdtempSync(join(tmpdir(), 'mina-cfg-'));
+  const home = mkdtempSync(join(TMP, 'mina-cfg-'));
   const cwd = join(home, 'project'); mkdirSync(cwd);
   const s = settings({ cwd, home, env: {}, write: ['~/out'], network: 'packages', config: { file: 'x', write: ['~/data'], network: 'offline', hide: ['~/secret'] } });
   assert.equal(s.network, 'packages');
@@ -248,7 +256,7 @@ test('settings: config file write/hide/network, flags win, hidden defaults inclu
 });
 
 test('the "hide" list of ~/.config/mina/sandbox.json (or MINA_SANDBOX_CONFIG) adds hidden paths; the built-in list is generic', () => {
-  const home = mkdtempSync(join(tmpdir(), 'mina-cfg-hide-'));
+  const home = mkdtempSync(join(TMP, 'mina-cfg-hide-'));
   const cwd = join(home, 'project'); mkdirSync(cwd);
   mkdirSync(join(home, '.config', 'mina'), { recursive: true });
   const legacy = ['~/.config/old-tool', '~/.local/share/old-tool/auth.json'];
@@ -301,7 +309,7 @@ test('identity: an <identity> section, with the sandbox note only when the sandb
 });
 
 test('a hidden symlink hides its target (bwrap cannot mount on a symlink)', () => {
-  const d = mkdtempSync(join(tmpdir(), 'mina-link-'));
+  const d = mkdtempSync(join(TMP, 'mina-link-'));
   writeFileSync(join(d, 'real-auth.json'), '{}'); symlinkSync(join(d, 'real-auth.json'), join(d, 'auth.json'));
   const a = innerArgs({ cwd: '/p', readable: [d], hidden: [join(d, 'auth.json'), join(d, 'real-auth.json')] });
   assert.equal(a.filter((x) => x === join(d, 'real-auth.json')).length, 1);
@@ -310,7 +318,7 @@ test('a hidden symlink hides its target (bwrap cannot mount on a symlink)', () =
 
 test("mina's own code is hidden from the agent, except its skills and Pi's docs; not when the project is mina itself", () => {
   // The live run read ~/projects/mina to learn how a gate decides, then wrote what would pass it (2026-10-07).
-  const home = mkdtempSync(join(tmpdir(), 'mina-cfg-'));
+  const home = mkdtempSync(join(TMP, 'mina-cfg-'));
   const cwd = join(home, 'project'); mkdirSync(cwd);
   const s = settings({ cwd, home, env: {}, config: { file: null } });
   assert.ok(s.hidden.includes(REPO));
@@ -337,7 +345,7 @@ test("the read tool refuses mina's code with its own reason, and reads a skill",
 
 test("Pi's agent folder is read-only to the agent: bound read-only before the credential masks, and refused to write and edit", () => {
   // The live run could write ~/.pi/agent (agents/*.md hold max_turns; settings.json the default model).
-  const home = mkdtempSync(join(tmpdir(), 'mina-cfg-'));
+  const home = mkdtempSync(join(TMP, 'mina-cfg-'));
   const agent = join(home, '.pi', 'agent'); mkdirSync(agent, { recursive: true }); writeFileSync(join(agent, 'auth.json'), '{}');
   const cwd = join(home, 'project'); mkdirSync(cwd);
   const s = settings({ cwd, home, env: {}, config: { file: null } });
@@ -354,7 +362,7 @@ test("Pi's agent folder is read-only to the agent: bound read-only before the cr
 });
 
 test('read grants: the --sandbox-read rules, no broad roots, no hidden credentials, canonical paths, already-visible paths', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'mina-grant-home-'));
+  const home = mkdtempSync(join(TMP, 'mina-grant-home-'));
   const data = join(home, 'envs', 'seq'); mkdirSync(join(data, 'bin'), { recursive: true });
   const ssh = join(home, '.ssh'); mkdirSync(ssh);
   const priv = join(home, '.pi', 'agent'); mkdirSync(priv, { recursive: true });
@@ -364,7 +372,7 @@ test('read grants: the --sandbox-read rules, no broad roots, no hidden credentia
     { path: data, already: false, scan: { root: data, folders: 2, files: 0, current: join(data, 'bin') } });
   assert.equal((await checkReadGrant(join(data, 'bin'), { ...opts, readable: [data] })).already, true);
   for (const [path, why] of [[join(home, 'missing'), /does not exist/], ['/', /too broad/], [home, /too broad/],
-    [join(home, '..'), /too broad/], ['/proc', /too broad/], [join(ssh), /hidden credential/], [priv, /private controller state/]]) {
+    [join(home, '..'), /too broad/], ...(existsSync('/proc') ? [['/proc', /too broad/]] : []), [join(ssh), /hidden credential/], [priv, /private controller state/]]) {
     await assert.rejects(checkReadGrant(path, opts), why, path);
   }
   const sock = join(data, 'agent.sock');
@@ -375,7 +383,7 @@ test('read grants: the --sandbox-read rules, no broad roots, no hidden credentia
 
 test('read grants: the scan refuses a socket or FIFO at any depth, at launch and in a session, and passes a plain tree', async () => {
   const deep = (root) => join(root, 'a', 'b', 'c');
-  const plain = mkdtempSync(join(tmpdir(), 'mina-scan-'));
+  const plain = mkdtempSync(join(TMP, 'mina-scan-'));
   for (const d of ['a/b/c', 'a/x', 'y']) mkdirSync(join(plain, d), { recursive: true });
   writeFileSync(join(plain, 'a', 'b', 'c', 'counts.tsv'), 'x'); writeFileSync(join(plain, 'top.txt'), 'x');
   symlinkSync('/run', join(plain, 'a', 'run-link'));                                         // links are not followed
@@ -386,12 +394,12 @@ test('read grants: the scan refuses a socket or FIFO at any depth, at launch and
   assert.equal(validateReadableRoots([plain]), true);
   assert.deepEqual(await scanReadableRoot(join(plain, 'top.txt')), { root: join(plain, 'top.txt'), folders: 0, files: 1, current: join(plain, 'top.txt') });
 
-  const fifoRoot = mkdtempSync(join(tmpdir(), 'mina-scan-fifo-')); mkdirSync(deep(fifoRoot), { recursive: true });
+  const fifoRoot = mkdtempSync(join(TMP, 'mina-scan-fifo-')); mkdirSync(deep(fifoRoot), { recursive: true });
   assert.equal(spawnSync('mkfifo', [join(deep(fifoRoot), 'pipe')]).status, 0);
   await assert.rejects(scanReadableRoot(fifoRoot), /special file[^]*pipe/);
   assert.throws(() => validateReadableRoots([fifoRoot]), /special file[^]*pipe/);
 
-  const sockRoot = mkdtempSync(join(tmpdir(), 'mina-scan-sock-')); mkdirSync(deep(sockRoot), { recursive: true });
+  const sockRoot = mkdtempSync(join(TMP, 'mina-scan-sock-')); mkdirSync(deep(sockRoot), { recursive: true });
   const server = createServer().listen(join(deep(sockRoot), 'agent.sock'));
   await new Promise((r) => server.once('listening', r));
   try {
@@ -401,7 +409,7 @@ test('read grants: the scan refuses a socket or FIFO at any depth, at launch and
 });
 
 test('read grants: the scan does not block the event loop and stops at the abort signal', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'mina-scan-wide-'));
+  const root = mkdtempSync(join(TMP, 'mina-scan-wide-'));
   for (let i = 0; i < 300; i++) mkdirSync(join(root, `d${i}`, 'sub'), { recursive: true });
   let ticks = 0;
   const timer = setInterval(() => ticks++, 0);
@@ -423,8 +431,8 @@ const grantEnv = (project) => ({ MINA_SANDBOX: '1', MINA_SANDBOX_PROJECT: projec
   MINA_SANDBOX_HIDE: '[]', MINA_SANDBOX_NET: 'offline', MINA_SANDBOX_PRIVATE: '[]' });
 
 test('mina_sandbox_request: the user allows or denies in the dialog; invalid requests never reach the user; the prompt lists grants', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'mina-grant-project-'));
-  const data = mkdtempSync(join(tmpdir(), 'mina-grant-data-'));
+  const project = mkdtempSync(join(TMP, 'mina-grant-project-'));
+  const data = mkdtempSync(join(TMP, 'mina-grant-data-'));
   const env = grantEnv(project);
   const f = grantPi(); minaSandbox(f.pi, { env, available: true });
   const asked = [];
@@ -446,14 +454,14 @@ test('mina_sandbox_request: the user allows or denies in the dialog; invalid req
   assert.match((await call({ path: data, reason: 'again' })).content[0].text, /already visible/);
   assert.equal(asked.length, 1);
   answer = 'Deny';
-  const other = mkdtempSync(join(tmpdir(), 'mina-grant-other-'));
+  const other = mkdtempSync(join(TMP, 'mina-grant-other-'));
   assert.match((await call({ path: other, reason: 'more' })).content[0].text, /denied[^]*Do not work around it/);
   assert.deepEqual(JSON.parse(env.MINA_SANDBOX_READ), [data]);
 });
 
 test('mina_sandbox_request: unanswered or without a terminal, the request waits for /mina-sandbox, which applies it and tells the agent', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'mina-grant-project-'));
-  const data = mkdtempSync(join(tmpdir(), 'mina-grant-data-'));
+  const project = mkdtempSync(join(TMP, 'mina-grant-project-'));
+  const data = mkdtempSync(join(TMP, 'mina-grant-data-'));
   const env = grantEnv(project);
   const f = grantPi(); minaSandbox(f.pi, { env, available: true, grantWaitMs: 60 });
   const notes = [];
@@ -476,8 +484,8 @@ test('mina_sandbox_request: unanswered or without a terminal, the request waits 
 
 test('mina_sandbox_request: parallel requests and /mina-sandbox show one dialog at a time; each gets its own timeout; abort closes it', async () => {
   // Pi has one dialog slot: a second select() replaces the first, whose countdown later closes the other one (2026-10-28 stall).
-  const project = mkdtempSync(join(tmpdir(), 'mina-grant-project-'));
-  const [a, b, c] = [1, 2, 3].map(() => mkdtempSync(join(tmpdir(), 'mina-grant-data-')));
+  const project = mkdtempSync(join(TMP, 'mina-grant-project-'));
+  const [a, b, c] = [1, 2, 3].map(() => mkdtempSync(join(TMP, 'mina-grant-data-')));
   const env = grantEnv(project);
   const f = grantPi(); minaSandbox(f.pi, { env, available: true, grantWaitMs: 200 });
   let open = 0, most = 0;
@@ -490,30 +498,31 @@ test('mina_sandbox_request: parallel requests and /mina-sandbox show one dialog 
   const call = (path) => f.tools.mina_sandbox_request.execute('id', { path, reason: 'r' }, undefined, null, ctx);
   const [ra, rb] = await Promise.all([call(a), call(b)]);
   assert.match(ra.content[0].text, /allowed/); assert.match(rb.content[0].text, /allowed/);
-  assert.deepEqual(shown, [a, b]); assert.equal(most, 1); assert.deepEqual(timeouts, [200, 200]);
-  assert.deepEqual(JSON.parse(env.MINA_SANDBOX_READ), [a, b]);
+  // The dialogs come in the order in which the scans finish (the thread pool decides); one is open at a time.
+  assert.deepEqual([...shown].sort(), [a, b].sort()); assert.equal(most, 1); assert.deepEqual(timeouts, [200, 200]);
+  assert.deepEqual(JSON.parse(env.MINA_SANDBOX_READ), shown);
 
   // A queued request decided with /mina-sandbox while the agent asks again: still one dialog at a time.
   const away = { cwd: project, hasUI: true, ui: { notify: () => {}, select: (_t, _o, opts) => new Promise((r) => setTimeout(() => r(undefined), opts.timeout)) } };
   await f.tools.mina_sandbox_request.execute('id', { path: c, reason: 'r' }, undefined, null, away);   // times out: queued
   shown.length = 0; most = 0;
-  const d = mkdtempSync(join(tmpdir(), 'mina-grant-data-'));
+  const d = mkdtempSync(join(TMP, 'mina-grant-data-'));
   await Promise.all([f.commands['mina-sandbox'].handler('', ctx), call(d)]);
   assert.deepEqual(shown.sort(), [c, d].sort()); assert.equal(most, 1);
 
   // Esc in Pi aborts the turn: the dialog gets the signal and the tool returns.
   const ac = new AbortController();
-  const e = mkdtempSync(join(tmpdir(), 'mina-grant-data-'));
+  const e = mkdtempSync(join(TMP, 'mina-grant-data-'));
   const held = { cwd: project, hasUI: true, ui: { notify: () => {}, select: (_t, _o, opts) => new Promise((r) => opts.signal.addEventListener('abort', () => r(undefined))) } };
   const pending = f.tools.mina_sandbox_request.execute('id', { path: e, reason: 'r' }, ac.signal, null, held);
   ac.abort();
   assert.match((await pending).content[0].text, /cancelled[^]*Nothing changed/);
-  assert.deepEqual(JSON.parse(env.MINA_SANDBOX_READ), [a, b, d]);
+  assert.deepEqual(JSON.parse(env.MINA_SANDBOX_READ).sort(), [a, b, d].sort());
 });
 
 test('mina_sandbox_request: shows the progress of a long scan, can be cancelled during it, and does not scan a checked path again', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'mina-grant-project-'));
-  const data = mkdtempSync(join(tmpdir(), 'mina-grant-data-'));
+  const project = mkdtempSync(join(TMP, 'mina-grant-project-'));
+  const data = mkdtempSync(join(TMP, 'mina-grant-data-'));
   for (let i = 0; i < 400; i++) mkdirSync(join(data, `run${i}`, 'images'), { recursive: true });
   const env = grantEnv(project);
   const f = grantPi(); minaSandbox(f.pi, { env, available: true, scanUpdateMs: 1 });
@@ -543,9 +552,9 @@ test('mina_sandbox_request: shows the progress of a long scan, can be cancelled 
 // 2026-10-30: a deleted sibling repository with a read grant stopped every local tool of another session (bwrap: Can't
 // find source path). A root that no longer exists is not mounted; the project itself still is, so its loss stays loud.
 test('inner layer: a read or write root that was deleted is not mounted; the project still is', () => {
-  const project = mkdtempSync(join(tmpdir(), 'mina-gone-project-'));
-  const reads = mkdtempSync(join(tmpdir(), 'mina-gone-read-'));
-  const writes = mkdtempSync(join(tmpdir(), 'mina-gone-write-'));
+  const project = mkdtempSync(join(TMP, 'mina-gone-project-'));
+  const reads = mkdtempSync(join(TMP, 'mina-gone-read-'));
+  const writes = mkdtempSync(join(TMP, 'mina-gone-write-'));
   const args = () => innerArgs({ cwd: project, project, writable: [project, writes], readable: [reads], env: {} }).join(' ');
   assert.ok(args().includes(`--ro-bind ${reads} ${reads}`) && args().includes(`--bind ${writes} ${writes}`));
   rmSync(reads, { recursive: true }); rmSync(writes, { recursive: true });
@@ -556,7 +565,7 @@ test('inner layer: a read or write root that was deleted is not mounted; the pro
 });
 
 test('missingRoots: the read and write roots of a launch that do not exist, never the project', () => {
-  const home = mkdtempSync(join(tmpdir(), 'mina-missing-'));
+  const home = mkdtempSync(join(TMP, 'mina-missing-'));
   const cwd = join(home, 'project'); mkdirSync(cwd); mkdirSync(join(home, 'data'));
   const s = settings({ cwd, home, env: {}, read: ['~/gone-read'], write: ['~/gone-write'], config: { file: null, read: ['~/data'] } });
   assert.deepEqual(missingRoots(s), [{ path: join(home, 'gone-write'), kind: 'write' }, { path: join(home, 'gone-read'), kind: 'read' }]);
@@ -565,8 +574,8 @@ test('missingRoots: the read and write roots of a launch that do not exist, neve
 });
 
 test('real worker: a read grant whose folder is deleted does not stop the next command', { skip: needsSandbox }, async () => {
-  const project = mkdtempSync(join(tmpdir(), 'mina-gone-project-'));
-  const sibling = mkdtempSync(join(tmpdir(), 'mina-gone-sibling-'));
+  const project = mkdtempSync(join(TMP, 'mina-gone-project-'));
+  const sibling = mkdtempSync(join(TMP, 'mina-gone-sibling-'));
   writeFileSync(join(project, 'a.txt'), 'alive\n');
   const env = { ...grantEnv(project), MINA_SANDBOX_READ: JSON.stringify([sibling]) };
   const sh = () => runWorker(['/bin/bash', '-c', 'cat a.txt 2>&1'], { cwd: project, env, network: 'offline', timeout: 10 });
@@ -579,16 +588,16 @@ test('real worker: a read grant whose folder is deleted does not stop the next c
 });
 
 test('real worker: a read grant applies to the next command without a restart', { skip: needsSandbox }, async () => {
-  const project = mkdtempSync(join(tmpdir(), 'mina-grant-project-'));
-  const data = mkdtempSync(join(tmpdir(), 'mina-grant-data-'));
+  const project = mkdtempSync(join(TMP, 'mina-grant-project-'));
+  const data = mkdtempSync(join(TMP, 'mina-grant-data-'));
   writeFileSync(join(data, 'counts.tsv'), 'gene\t42\n');
   const env = grantEnv(project);
   const f = grantPi(); minaSandbox(f.pi, { env, available: true });
   const cat = () => runWorker(['/bin/bash', '-c', `cat ${join(data, 'counts.tsv')} 2>&1`], { cwd: project, env, network: 'offline', timeout: 10 });
-  assert.match((await cat()).stdout.toString(), /No such file/);                                // not visible before
+  assert.match((await cat()).stdout.toString(), MACOS ? /Operation not permitted/ : /No such file/);   // not visible before
   const ctx = { cwd: project, hasUI: true, ui: { notify: () => {}, select: async () => 'Allow read-only access until mina exits' } };
   await f.tools.mina_sandbox_request.execute('id', { path: data, reason: 'counts' }, null, null, ctx);
   assert.equal((await cat()).stdout.toString(), 'gene\t42\n');                              // visible at the next call
   const write = await runWorker(['/bin/bash', '-c', `{ echo x > ${join(data, 'new')}; } 2>&1; echo rc=$?`], { cwd: project, env, network: 'offline', timeout: 10 });
-  assert.match(write.stdout.toString(), /Read-only file system[^]*rc=1/);                      // and read-only
+  assert.match(write.stdout.toString(), MACOS ? /Operation not permitted[^]*rc=1/ : /Read-only file system[^]*rc=1/);                      // and read-only
 });

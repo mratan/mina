@@ -28,7 +28,10 @@ try:
     _rl_mem, _rl_cpu = int(sys.argv[1]), int(sys.argv[2])
     if _rl_mem <= 0 or _rl_cpu <= 0:
         raise ValueError("limits must be positive")
-    for _rl_res, _rl_soft, _rl_hard in ((resource.RLIMIT_AS, _rl_mem, _rl_mem), (resource.RLIMIT_CPU, _rl_cpu, _rl_cpu + 1),
+    # macOS does not lower RLIMIT_AS (setrlimit fails): there the sandbox supervisor enforces the memory bound on the
+    # call's coalition instead (literature/supplements/pdf-sandbox.mjs sends it with the request).
+    _rl_list = ((resource.RLIMIT_AS, _rl_mem, _rl_mem),) if sys.platform != "darwin" else ()
+    for _rl_res, _rl_soft, _rl_hard in _rl_list + ((resource.RLIMIT_CPU, _rl_cpu, _rl_cpu + 1),
             (resource.RLIMIT_FSIZE, 0, 0), (resource.RLIMIT_CORE, 0, 0), (resource.RLIMIT_NOFILE, 64, 64)):
         _rl_cur = resource.getrlimit(_rl_res)[1]
         if _rl_cur != resource.RLIM_INFINITY:

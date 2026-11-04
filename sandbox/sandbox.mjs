@@ -6,9 +6,15 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { relaySpawn } from './macos/client.mjs';
 
 export const NETWORK_LEVELS = ['open', 'packages', 'offline'];
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+// macOS has no bwrap: each worker is a Seatbelt sandbox in a launchd job of its own (sandbox/macos, docs/macos.md).
+export const MACOS = process.platform === 'darwin';
+// How a worker runs Node and the file worker: bind mounts at fixed paths on Linux, the real paths on macOS.
+export const WORKER_NODE = MACOS ? process.execPath : '/run/mina-node';
+export const WORKER_FILE = MACOS ? join(REPO, 'sandbox', 'worker.mjs') : '/run/mina-file-worker.mjs';
 export const NETBRIDGE_PATH = join(REPO, 'lib', 'netbridge.mjs');
 // Under the outer layer's private /tmp: the read-only root cannot take a new mount point under /run.
 export const EGRESS_DIR = '/tmp/.mina-egress';
@@ -140,6 +146,32 @@ export function projectProblem(project, home = homedir()) {
 
 export const BWRAP_PATH = existsSync('/usr/bin/bwrap') ? '/usr/bin/bwrap' : '/bin/bwrap';
 export const bwrapAvailable = () => spawnSync(BWRAP_PATH, ['--version'], { env: { PATH: '/usr/bin:/bin' } }).status === 0;
+// Whether workers can start: bwrap on Linux; on macOS the native helper and the supervisor of this instance.
+export function sandboxAvailable(env = process.env) {
+  if (!MACOS) return bwrapAvailable();
+  const socket = env.MINA_SUPERVISOR_SOCKET || process.env.MINA_SUPERVISOR_SOCKET;
+  return !!socket && existsSync(socket) && existsSync(env.MINA_HELPER || process.env.MINA_HELPER || join(REPO, 'build', 'macos', 'mina-instance'));
+}
+
+// The proxy variables of a worker on macOS. The proxy is a TCP port on localhost with a token of the instance (any local
+// process can reach the port; on Linux only the worker's own bridge reaches the proxy's Unix socket).
+export function macEgressEnv({ port, token }) {
+  const url = `http://mina:${token}@127.0.0.1:${port}`;
+  return { HTTP_PROXY: url, HTTPS_PROXY: url, http_proxy: url, https_proxy: url, ALL_PROXY: url,
+    NO_PROXY: 'localhost,127.0.0.1', no_proxy: 'localhost,127.0.0.1', NODE_USE_ENV_PROXY: '1' };
+}
+
+// The request for one worker call on macOS (sandbox/macos/supervisor.mjs builds the profile from it; the same settings as
+// innerArgs). HOME, TMPDIR and the XDG folders come from the supervisor: they are paths of the instance and of the call.
+export function macWorkerRequest(argv, { cwd, project = cwd, writable = [project], readable = [], hidden = [], exposed = [], readOnly = [],
+  network = 'offline', egressSocket = null, env = process.env, frozen = null }) {
+  if (network !== 'offline' && !egressSocket?.port) throw new Error(`mina sandbox: ${network} network needs the egress proxy`);
+  const commandEnv = { ...scrubEnv(env), PATH: env.MINA_WORKER_PATH || env.PATH || '/usr/bin:/bin:/usr/sbin:/sbin',
+    ...(network !== 'offline' ? macEgressEnv(egressSocket) : {}) };
+  return { kind: 'worker', argv, cwd, roots: { cwd, project, writable, readable, hidden, exposed, readOnly }, network,
+    egressPort: network !== 'offline' ? egressSocket.port : null, env: commandEnv, frozen,
+    home: env.MINA_WORKER_HOME || null, outputs: env.MINA_WORKER_OUTPUTS || null };
+}
 
 // The resolved sandbox settings, from flags, the config file and defaults.
 export function settings({ cwd, home = homedir(), env = process.env, write = [], read = [], network = null, config = loadConfig(home, env) }) {
@@ -149,7 +181,8 @@ export function settings({ cwd, home = homedir(), env = process.env, write = [],
   const writable = [...new Set([project, ...(config.write ?? []).map((p) => expand(p, home)), ...write.map((p) => expand(p, home))])];
   validateTrustedResources([claudeConfigFile(home, env)], writable);
   const code = minaCode(project);
-  const hidden = [...new Set([...defaultHidden(home, env), ...code.hidden, hostPaths({ env }).inside, ...(config.hide ?? []).map((p) => expand(p, home))])];
+  const hp = hostPaths({ env });
+  const hidden = [...new Set([...defaultHidden(home, env), ...code.hidden, hp.inside, ...(MACOS ? [hp.brokerDir] : []), ...(config.hide ?? []).map((p) => expand(p, home))])];
   const readable = [...new Set([...(config.read ?? []).map((p) => expand(p, home)), ...read.map((p) => expand(p, home))])];
   const problem = projectProblem(project, home);
   if (problem) throw new Error(`mina sandbox: ${problem}`);
@@ -160,6 +193,14 @@ export function settings({ cwd, home = homedir(), env = process.env, write = [],
 // The host broker (host/hostd.py, docs/host-profile.md): its socket folder on the host, and where the Pi process sees it
 // and its session grant inside the outer layer. The agent's commands never see either (hidden in the inner layer).
 export function hostPaths({ uid = process.getuid(), env = process.env } = {}) {
+  if (MACOS) {
+    // macOS has no runtime folder and no bind mounts: the broker's socket folder is the one host/hostd.py names
+    // (MACOS_RUNTIME), and Pi uses the real paths. `inside` is the private folder of the launchers' grant files.
+    const run = join(homedir(), '.local', 'state', 'mina', 'run');
+    const brokerDir = env.MINA_HOSTD_RUNTIME || env.MINA_HOST_RUNTIME || join(run, 'hostd');
+    const inside = join(run, 'host-grants');
+    return { brokerDir, inside, socket: join(brokerDir, 'sock'), grant: null };
+  }
   const runtime = env.XDG_RUNTIME_DIR || `/run/user/${uid}`;
   const inside = join(runtime, 'mina-host');
   return { brokerDir: env.MINA_HOSTD_RUNTIME || join(runtime, 'mina-hostd'), inside, socket: join(inside, 'hostd', 'sock'), grant: join(inside, 'grant') };
@@ -183,7 +224,18 @@ export function outerArgs(s, { uid = process.getuid(), env = process.env, host =
 // Explicit roots are owner declarations, not model-controlled configuration. A project cannot
 // encompass the controller or its state. Symlink aliases are resolved before overlap checks.
 const contains = (root, p) => root === p || p.startsWith(root === '/' ? '/' : `${root}/`);
-const canonical = (p) => { try { return realpathSync(p); } catch { return resolve(p); } };
+// The real path; for a path that does not exist yet, the real path of its nearest existing ancestor plus the rest (on
+// macOS /var and /tmp are symlinks, so a lexical path would miss an overlap).
+const canonical = (p) => {
+  let at = resolve(p);
+  const tail = [];
+  for (;;) {
+    try { return join(realpathSync(at), ...tail); } catch {
+      if (dirname(at) === at) return resolve(p);
+      tail.unshift(basename(at)); at = dirname(at);
+    }
+  }
+};
 const runtimeFiles = [fileURLToPath(import.meta.url), join(REPO, 'sandbox/worker.mjs'), NETBRIDGE_PATH, process.execPath];
 export function validateRootPolicy(roots, trustedRoots = []) {
   const reserved = ['/usr', '/etc', '/dev', '/proc', '/sys', '/run', '/home/mina', ...runtimeFiles, ...trustedRoots].map(canonical);
@@ -478,10 +530,12 @@ export function sandboxSettingsFromEnv(env = process.env, { cwd = process.cwd() 
 // Every worker has an empty root. /usr is trusted OS/runtime software, not a host
 // filesystem passthrough. Legacy distro aliases are reproduced, with old non-merged
 // /bin and /lib directories mounted read-only when necessary.
-export function innerArgs({ cwd, project = cwd, writable = [project], readable = [], hidden = [], exposed = [], readOnly = [],
-  network = 'offline', egressSocket = null, env = process.env, protectedChecksSnapshot = null, projectionMounts = [] }) {
+// The roots of a worker, validated: the same rules for the bwrap mounts (innerArgs) and the macOS Seatbelt profile
+// (sandbox/macos/profile.mjs). `egress` is the proxy endpoint: a Unix socket on Linux, a TCP port on macOS.
+export function workerRoots({ cwd, project = cwd, writable = [project], readable = [], hidden = [], exposed = [], readOnly = [],
+  network = 'offline', egress = null, env = process.env }) {
   if (!NETWORK_LEVELS.includes(network)) throw new Error('mina sandbox: invalid network level');
-  if (network !== 'offline' && !egressSocket) throw new Error(`mina sandbox: ${network} network needs the egress proxy`);
+  if (network !== 'offline' && !egress) throw new Error(`mina sandbox: ${network} network needs the egress proxy`);
   if (!cwd || !project) throw new Error('mina sandbox: cwd and project required');
   // A root that no longer exists is not mounted: bwrap refuses a missing bind source, so one deleted folder (a read grant
   // for a sibling repository) would stop every command and file operation. The project stays: its loss must be loud.
@@ -491,10 +545,19 @@ export function innerArgs({ cwd, project = cwd, writable = [project], readable =
   validateRootPolicy(writes, defaultWritable(homedir(), env));
   // Refuse broad data mounts that would import host control sockets or runtime paths.
   for (const p of reads) {
-    if (['/', '/dev', '/proc', '/sys', '/run', '/tmp', homedir()].some((r) => contains(p, canonical(r)))) {
+    if (['/', '/dev', '/proc', '/sys', '/run', '/tmp', '/private/var', homedir()].some((r) => contains(p, canonical(r)))) {
       throw new Error(`mina sandbox: unsafe readable root: ${p}`);
     }
   }
+  const visible = [...writes, ...reads];
+  const targets = [...new Set(hidden.filter(existsSync).map(canonical))]
+    .filter((p) => visible.some((r) => contains(r, p)));
+  return { writes, reads, hidden: targets, exposed: [...new Set(exposed.filter(existsSync).map(canonical))], readOnly: [...new Set(readOnly.filter(existsSync).map(canonical))] };
+}
+
+export function innerArgs({ cwd, project = cwd, writable = [project], readable = [], hidden = [], exposed = [], readOnly = [],
+  network = 'offline', egressSocket = null, env = process.env, protectedChecksSnapshot = null, projectionMounts = [] }) {
+  const { writes, reads, hidden: targets } = workerRoots({ cwd, project, writable, readable, hidden, exposed, readOnly, network, egress: egressSocket, env });
   const a = ['--unshare-user', '--disable-userns', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--unshare-net',
     '--cap-drop', 'ALL', '--new-session', '--die-with-parent', '--hostname', 'mina-worker',
     '--ro-bind', '/usr', '/usr'];
@@ -521,9 +584,6 @@ export function innerArgs({ cwd, project = cwd, writable = [project], readable =
   a.push(...projectionMounts);
   if (projectionMounts.length) for (const p of reads.filter((p) => contains(canonical(project), p))) a.push('--ro-bind', p, p);
   if (protectedChecksSnapshot) a.push('--ro-bind', protectedChecksSnapshot.source, protectedChecksSnapshot.target);
-  const visible = [...writes, ...reads];
-  const targets = [...new Set(hidden.filter(existsSync).map(canonical))]
-    .filter((p) => visible.some((r) => contains(r, p)));
   for (const p of targets) a.push(...(statSync(p).isDirectory() ? ['--tmpfs', p] : ['--ro-bind', '/dev/null', p]));
   for (const p of exposed.filter(existsSync).map(canonical)) a.push('--ro-bind', p, p);
   for (const p of targets.filter((p) => statSync(p).isDirectory())) a.push('--remount-ro', p);
@@ -545,6 +605,15 @@ const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
 export function wrapCommand(command, options) {
   const { shell = '/bin/bash', node = process.execPath, network = 'offline' } = options;
+  if (MACOS) {
+    // A protected check runs the accepted bytes in place: the supervisor verifies them before and after the run and keeps
+    // .mina/checks unchangeable during it (sandbox/macos/supervisor.mjs, docs/macos.md).
+    const snap = options.protectedChecksSnapshot;
+    const source = options.env ?? process.env;
+    const frozen = snap ? { checks: snap.target, source: snap.source, hashes: snap.hashes ?? {}, staging: source.MINA_WORKER_OUTPUTS || join(dirname(snap.source), 'check-runs') } : null;
+    const r = relaySpawn(macWorkerRequest([shell, '--noprofile', '--norc', '-c', command], { ...options, frozen }), source);
+    return `exec /usr/bin/env -i PATH=/usr/bin:/bin MINA_CALL=${q(r.env.MINA_CALL)} ${[r.command, ...r.args].map(q).join(' ')}`;
+  }
   if (options.protectedChecksSnapshot) {
     const source = options.env ?? process.env;
     const env = { ...scrubEnv(source) };

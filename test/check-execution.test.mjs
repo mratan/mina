@@ -8,6 +8,7 @@ import { checkCommand } from '../extensions/goal/check-execution.mjs';
 import { createHash } from 'node:crypto';
 import { runFileOperation } from '../sandbox/worker-client.mjs';
 import { needsSandbox } from './capabilities.mjs';
+import { MACOS } from '../sandbox/sandbox.mjs';
 
 test('check execution refuses missing protection and does not silently open package networking', () => {
   // A folder of its own, not /tmp itself: a repository checked out under /tmp would overlap it (trusted runtime).
@@ -18,7 +19,7 @@ test('check execution refuses missing protection and does not silently open pack
     assert.match(refused, /exit 126/);
     assert.doesNotMatch(refused, /touch should-not-run/);
     const command = checkCommand('true', cwd, { env: { MINA_SANDBOX: '1', MINA_SANDBOX_NET: 'packages' }, available: true });
-    assert.match(command, /--unshare-net/);
+    assert.match(command, MACOS ? /"network":"offline"/ : /--unshare-net/); // macOS: the request to the supervisor
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
@@ -49,7 +50,7 @@ test('protected checks execute accepted immutable bytes despite a later workspac
     const out = spawnSync('/bin/bash', ['-c', command], { encoding: 'utf8', timeout: 10_000 });
     assert.equal(out.status, 0, out.stderr);
     assert.equal(out.stdout, 'original');
-    assert.match(out.stderr, /Read-only file system/);
+    assert.match(out.stderr, MACOS ? /Operation not permitted/ : /Read-only file system/);
   } finally { rmSync(cwd, { recursive: true }); rmSync(cache, { recursive: true }); }
 });
 
@@ -85,9 +86,16 @@ test('a concurrent worker cannot reroute an already running protected checker', 
     child.stdout.on('data', (data) => { stdout += data; });
     await new Promise((done, fail) => { const timer = setTimeout(() => fail(new Error('checker did not start')), 5000);
       child.stderr.on('data', (data) => { stderr += data; if (stderr.includes('CHECK_READY')) { clearTimeout(timer); done(); } }); });
-    await runFileOperation('rename', { path: join(cwd, '.mina'), target: join(cwd, '.mina-moved') }, { cwd, env });
-    await runFileOperation('mkdir', { path: join(cwd, '.mina', 'checks') }, { cwd, env });
-    await runFileOperation('write', { path: join(cwd, '.mina', 'checks', 'probe.sh'), data: Buffer.from('printf forged').toString('base64') }, { cwd, env });
+    if (MACOS) {
+      // macOS cannot pin the checker's paths (no mount namespaces): while a protected check runs, no worker can rename
+      // .mina or change .mina/checks (docs/macos.md). On Linux the rename succeeds and the pinned checker does not see it.
+      await assert.rejects(runFileOperation('rename', { path: join(cwd, '.mina'), target: join(cwd, '.mina-moved') }, { cwd, env }), /EPERM|not permitted/);
+      await assert.rejects(runFileOperation('write', { path: join(cwd, '.mina', 'checks', 'probe.sh'), data: Buffer.from('printf forged').toString('base64') }, { cwd, env }), /EPERM|not permitted/);
+    } else {
+      await runFileOperation('rename', { path: join(cwd, '.mina'), target: join(cwd, '.mina-moved') }, { cwd, env });
+      await runFileOperation('mkdir', { path: join(cwd, '.mina', 'checks') }, { cwd, env });
+      await runFileOperation('write', { path: join(cwd, '.mina', 'checks', 'probe.sh'), data: Buffer.from('printf forged').toString('base64') }, { cwd, env });
+    }
     await runFileOperation('write', { path: join(cwd, 'sync', 'proceed'), data: '' }, { cwd, env });
     assert.equal(await ended, 0, stderr);
     assert.equal(stdout, 'original');

@@ -4,6 +4,8 @@ Mina is a research and engineering harness for the [Pi](https://pi.dev) coding a
 It lets a model work for hours on a real project: it does research before it builds, it proves its work with checks,
 and it stays inside a sandbox that you control.
 
+Mina runs on **Linux** and on **macOS 27 "Golden Gate"** (27.2 or later) on Apple silicon. Both systems give the same sandbox; [macOS](docs/macos.md) tells how it works there and the few places where its behavior differs.
+
 ## Why Mina
 
 A coding agent that works alone for a long time has four problems:
@@ -23,11 +25,12 @@ It sends no telemetry: traffic goes only to your model provider and to the resea
 
 ## Requirements
 
-- Linux with a systemd user session and cgroup v2
-- Node.js 22 or newer
-- [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`)
+- One of these systems:
+  - Linux with a systemd user session, cgroup v2, and [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`)
+  - macOS 27 "Golden Gate", version 27.2 or later (27.2 fixes several Sandbox escapes), on Apple silicon, with the Command Line Tools (`xcode-select --install`). Tested on macOS 27.2. See [macOS](docs/macos.md)
+- Node.js 22 or newer (on macOS: 24 or newer, for example `brew install node`)
 - An account for a model provider, for example a Claude subscription with Claude Code, or a ChatGPT plan for Codex
-- For the literature tools: [uv](https://docs.astral.sh/uv/) and Node.js 24 or newer (the installer can supply Node.js 24, see step 2)
+- For the literature tools: [uv](https://docs.astral.sh/uv/) and Node.js 24 or newer (on Linux the installer can supply Node.js 24, see step 2)
 
 ## Install
 
@@ -38,6 +41,12 @@ It sends no telemetry: traffic goes only to your model provider and to the resea
    npm ci
    ```
 
+   On macOS, also build the two small native helpers of the sandbox:
+
+   ```bash
+   npm run macos:helpers
+   ```
+
 2. Install the literature servers:
 
    ```bash
@@ -46,14 +55,17 @@ It sends no telemetry: traffic goes only to your model provider and to the resea
 
    If your system Node.js or Python is too old, run `npm run literature:runtime` first.
    This command puts a newer Node.js and Python in the install folder. It does not change the system versions.
+   On macOS the installer puts a Python in the install folder itself.
 
    The installer also installs PyMuPDF, which converts PDF papers to text. PyMuPDF is licensed under the GNU AGPL-3.0 and is not part of Mina ([third-party notices](THIRD_PARTY_NOTICES.md)).
 
 3. Put `mina` on your PATH:
 
    ```bash
-   ln -s "$PWD/bin/mina.mjs" ~/.local/bin/mina
+   mkdir -p ~/.local/bin && ln -s "$PWD/bin/mina.mjs" ~/.local/bin/mina
    ```
+
+   If `~/.local/bin` is not on your PATH yet (the default on macOS), add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile (`~/.zshrc` on macOS).
 
 4. Optional: add keys for the search services to `~/.config/mina/keys/`, or to the `keys/` folder of the checkout. All keys are optional.
    See [keys and services](docs/usage.md#keys-and-services).
@@ -68,6 +80,8 @@ Mina includes its own pinned copy of Pi. Its sign-ins and settings are the same 
    cd ~/projects/report
    ```
 
+   On macOS, a project in `~/Documents`, `~/Desktop`, `~/Downloads`, or iCloud Drive makes macOS ask once whether `mina-instance` may access that folder. Allow it ([privacy permissions](docs/macos.md#privacy-permissions)).
+
 2. Start Mina with a cloud model:
 
    ```bash
@@ -75,7 +89,8 @@ Mina includes its own pinned copy of Pi. Its sign-ins and settings are the same 
    mina --model openai-codex/gpt-6.1-sol       # OpenAI Codex, through your ChatGPT plan
    ```
 
-   For Claude, sign in to Claude Code first (`claude auth login --claudeai`).
+   For Claude, sign in to Claude Code first (`claude auth login --claudeai`). If you do not have Claude Code, install it first (on macOS: `brew install --cask claude-code`).
+   On macOS, Claude Code keeps the sign-in in your Keychain. The first time Mina uses it, macOS can ask whether `claude` may use it: select Always Allow.
    For Codex, type `/login` in Mina and select ChatGPT.
 
 3. Give the agent a goal:
@@ -233,6 +248,7 @@ Guides:
 - [The sandbox boundary](docs/sandbox.md): what the sandbox protects, its limits, and how to stop an instance.
 - [The host profile](docs/host-profile.md): the configuration of the host broker.
 - [Delegation](docs/delegation.md): how Mina records the work of subagents.
+- [macOS](docs/macos.md): how the sandbox works on macOS, and where it differs from Linux.
 
 Reference:
 

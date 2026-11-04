@@ -154,7 +154,11 @@ test('discover with fixture GPUs: names, bus IDs, coverage, lock files, lockouts
     writeFileSync(lockout, '');
     assert.equal(t.mina(['apply', t.change('r.json', [{ kind: 'resource_set', scope: 'machine', name: 'GPU_A',
       resource: { locks: [{ path: lockFile }], lockouts: [lockout], device: { nvidia: ['00000000:01:00.0'] } } }]), '--yes']).code, 0);
-    const extraEnv = { MINA_HOST_NVIDIA_SMI: smi, MINA_HOST_KFD_TOPOLOGY: topo };
+    // macOS: an ioreg that lists no Apple GPU (MINA_HOST_IOREG), so that only the fixture GPUs are found.
+    const ioreg = join(t.tmp, 'ioreg');
+    writeFileSync(ioreg, '#!/bin/sh\n');
+    chmodSync(ioreg, 0o755);
+    const extraEnv = { MINA_HOST_NVIDIA_SMI: smi, MINA_HOST_KFD_TOPOLOGY: topo, MINA_HOST_IOREG: ioreg };
     const before = readFileSync(t.config);
     let r = t.mina(['discover'], { extraEnv });
     assert.equal(r.code, 0, r.out);
@@ -172,7 +176,7 @@ test('discover with fixture GPUs: names, bus IDs, coverage, lock files, lockouts
     assert.deepEqual(readFileSync(t.config), before, 'discover is read-only');
     // The suggestions are a valid change list for apply.
     assert.equal(t.mina(['apply', t.change('s.json', inv.suggestions), '--dry-run']).code, 0);
-    r = t.mina(['discover']);
+    r = t.mina(['discover'], { extraEnv: { MINA_HOST_IOREG: ioreg } });
     assert.equal(r.code, 0);
     assert.match(r.out, /GPUs: none found/);
   } finally { t.done(); }

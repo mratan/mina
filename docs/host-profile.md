@@ -25,6 +25,7 @@ The host profile adds one narrow, audited route out of the sandbox. The sandbox 
 - [Deployment verification](#deployment-verification)
 - [Monitoring and alarms](#monitoring-and-alarms)
 - [Who can call the broker](#who-can-call-the-broker)
+- [macOS](#macos)
 - [Tests](#tests)
 - [Limits](#limits)
 
@@ -732,6 +733,8 @@ Each workload is a transient user service: `systemd-run --user` in `mina.slice`,
 - When the main process exits, systemd stops the unit and kills the processes that are left.
 - systemd enforces the deadline, also when the broker is down.
 
+On macOS, each workload is a launchd job with its own coalition. See [macOS](#macos).
+
 ## Parameterized workloads
 
 A project's work often does not fit fixed commands. Its own launcher can also need host access that the sandbox removes, for example the host lock files or the user bus.
@@ -825,6 +828,93 @@ The broker accepts a grant only from the Pi process of the session that opened i
 
 The broker appends each request, decision, verification, and alarm delivery to `~/.local/state/mina/hostd/audit.jsonl`. It never logs grants.
 
+macOS has no mount namespaces. The same rules use other facts there: see [macOS](#macos).
+
+## macOS
+
+The broker runs on macOS 27.2 or later, with the system Python (`/usr/bin/python3`) and no other packages.
+It does the same operations with the same results as on Linux. Where macOS cannot do the same thing, the broker uses the closest replacement that keeps each protection.
+The code is in `host/darwin.py`. The differences are at the end of this section.
+
+### Install on macOS
+
+- Build the helpers first (`npm run macos:helpers`), then run `/usr/bin/python3 -I host/hostd.py install`. It writes `~/Library/LaunchAgents/com.mina.hostd.plist` and loads it with `launchctl bootstrap gui/UID`. It removes a loaded earlier version first.
+- launchd starts the broker at login. It starts the broker again when it fails (`KeepAlive` with `SuccessfulExit` false, as `Restart=on-failure`).
+- The output of the broker goes to `~/.local/state/mina/hostd/hostd.log`.
+- The socket is `~/.local/state/mina/run/hostd/sock`, because macOS has no runtime folder such as `/run/user/UID`. `MINA_HOST_RUNTIME` sets another folder.
+- A socket path can have at most 103 bytes. With a longer path, the broker does not start, and it tells why.
+- The launcher must use the same folder: `MINA_HOSTD_RUNTIME`, else `~/.local/state/mina/run/hostd`.
+
+### What replaces what
+
+| Linux | macOS |
+|---|---|
+| `/proc/PID/stat` and `cmdline` | `proc_pidinfo` and `sysctl` `KERN_PROCARGS2`. A process is identified by its PID and its start time in microseconds, so a reused PID does not confuse the broker. |
+| The boot ID | `kern.bootsessionuuid` |
+| A transient user service for each workload | A launchd job `com.mina.hostd.workload.TAG-ID` in `gui/UID`. It runs `lockrun.py` once (`RunAtLoad`, `LaunchOnlyOnce`, no `KeepAlive`). Its plist is in the folder of the workload in the state folder. |
+| The cgroup of the unit | The resource coalition of the job. launchd gives each job its own coalition. No process can leave it, also with `setsid` or a double fork. |
+| `KillMode=control-group` and `TimeoutStopSec=5` | SIGTERM to each process of the coalition, then SIGKILL after 5 seconds, in rounds (SIGSTOP, then SIGKILL) until none remains. `lockrun.py` does this when the command ends and when it gets SIGTERM. The broker does it for `workload_stop`, and when `lockrun.py` is gone. |
+| `RuntimeMaxSec` | `lockrun.py` enforces the deadline with a timer. If it does not, the broker stops the job one second after the deadline. |
+| The cgroup check after the end | The coalition must have no process left, and each process that the broker saw must have exited. The record shows `coalition_remaining`. |
+| The bwrap command sandbox | A Seatbelt profile with `sandbox-exec`. See [the command sandbox on macOS](#the-command-sandbox-on-macos). |
+| `/proc/locks` | The open files of your processes (`proc_pidfdinfo`), and `F_GETLK`. See the differences. |
+| KFD and `nvidia-smi` | `{"apple_gpu": true}`: each process that has a GPU user client (`ioreg -r -c IOGPUDeviceUserClient`), except applications and the parts of macOS. |
+| `SO_PEERCRED` | `LOCAL_PEERPID` and `LOCAL_PEERCRED` |
+| The mount namespace of the caller | `sandbox_check` and coalitions. See [who can call the broker on macOS](#who-can-call-the-broker-on-macos). |
+| A systemd user service in `services` | A launchd job in `gui/UID`: `unit` is its label. `requires_active` names labels too. |
+| `systemctl restart` | `launchctl kickstart -k`, then the same verification. |
+| The journal of a service | The files of the job (`StandardOutPath`, `StandardErrorPath`). launchd keeps no journal. |
+
+### The command sandbox on macOS
+
+The command of a parameterized workload runs as `sandbox-exec -p PROFILE -D NAME=PATH ... -- COMMAND`. Paths go in as `-D` parameters, never into the profile text.
+
+- Everything is readable and the GPU is usable, as with the read-only root of bwrap.
+- Writes go only to the writable folders of the workload and to a private `TMPDIR`. The private `TMPDIR` is new for each workload, and it is removed at its end.
+- `/private/tmp` and your temporary folder (`getconf DARWIN_USER_TEMP_DIR`) are hidden. They are the private `/tmp` and runtime folder of Linux. Writable folders inside them stay visible.
+- The read-only folders and the hidden paths come after the writable folders. Your Keychain folder is hidden too, because on Linux the private runtime folder hides the user bus and its secret service.
+- A writable folder cannot be renamed or deleted, as a mount point cannot.
+- Unix sockets: only the system log, and sockets inside the writable folders and `TMPDIR`. With `"network": "open"`, also `mDNSResponder` (DNS).
+- `offline`: no IP network and no listening on a port.
+- The pasteboard, `open` (LaunchServices), AppleEvents, and `launchctl` are denied. On Linux the command has no user bus, so it has no `systemctl --user`.
+- The command starts in the project, as with `bwrap --chdir`.
+
+### Who can call the broker on macOS
+
+- Only a process outside every sandbox can open a session. The broker requires two facts: `sandbox_check` finds no sandbox, and the process is not in the coalition of a running Mina instance or call job (`com.mina.instance.*`, `com.mina.call.*`).
+- The launcher sends the ID of the instance in `session_open` (`instance`). Then a request with the grant is accepted only from a process with three facts:
+  - It is in a sandbox.
+  - It is in the coalition of the job `com.mina.instance.ID`.
+  - Its parent is the supervisor of the instance: a process without a sandbox, in the same coalition, and a child of the main process of the job.
+- In practice, that is the Pi process. The session binds to its identity, as on Linux.
+- A command of the agent is refused. It is a child of Pi, or it runs in a call job with its own coalition.
+- Without `instance` (`mina --nosandbox`), the launcher's child is accepted, as on Linux.
+- The session ends when the launcher exits.
+
+### Differences from Linux
+
+- **Lock waits.** macOS does not show a blocked `flock`: `lsof` shows no lock state, and `ps` shows no wait channel.
+  The broker counts a process as waiting for a lock file when it has the file open without a lock, another open file holds the lock, and none of its threads runs.
+  When the lock is held exclusively, the mode of the wait is `unknown`.
+- **Lock holders.** The kernel marks an open file that took a lock. The mark stays after `LOCK_UN`, until the file is closed. Such a file shows as a holder while another process holds the lock.
+  Processes that share one locked open file, for example a child that inherited it, are one holder: the topmost process.
+  Only your own processes are examined. On Linux, `/proc/locks` shows the locks of all users.
+- **Apple GPU.** macOS has no list of compute users, as `nvidia-smi` and KFD have. The window server and each app that draws have a GPU user client too. Thus, the broker does not count applications (programs in `/Applications` or `~/Applications`) and the parts of macOS (`/System`, `/usr/libexec`, `/usr/sbin`, `/Library/Apple`). It counts each other program with a GPU client, for example a Python job on Metal, and each process whose program it cannot read. `mina host discover` lists the Apple GPU, but it suggests no resource for it.
+- **podman.** podman runs its containers in a virtual machine, outside the coalition. `delegate` has no effect. The broker does not stop the containers, and it does not verify that they ended. The record and the capability say so.
+- **setuid programs.** A setuid program in a workload runs as another user. The broker cannot signal it or read its start time. It counts as alive, so the state becomes `containment_unknown` if it stays.
+- **The deadline.** `lockrun.py` and the broker enforce it, not the kernel or launchd. If both are stopped, the deadline waits.
+- **offline.** On Linux the command has a private loopback interface. Seatbelt cannot give one: a port that the command opened would be open to the host and the LAN. Thus, the command cannot listen on a port. Unix sockets in its writable folders work.
+- **Unix sockets.** On Linux the command can connect to each socket that it can see. On macOS, only to the sockets listed above.
+- **Hidden paths.** A hidden path gives "Operation not permitted", not an empty folder or file.
+- **The private `/tmp`.** The command gets `TMPDIR`, not a private `/tmp`. Some Apple tools ignore `TMPDIR`, and `xcrun` writes a warning about its cache.
+- **launchctl.** The program `launchctl` is denied. A program that speaks the launchd protocol itself can still stop or restart your launchd jobs. Bootstrapping or submitting a job is refused by launchd.
+- **A sandbox inside the sandbox.** A command in a Seatbelt sandbox cannot start a sandbox of its own. The broker sets `SWIFTPM_DISABLE_SANDBOX=1`. Do not register a command that starts `sandbox-exec`.
+- **`--die-with-parent`.** It has no counterpart. The stop of the coalition at the end of the workload covers it.
+- **Privacy permissions.** The program of the broker's LaunchAgent and of each workload job is `mina-instance` (`run`), when it is built (`npm run macos:helpers`). It starts Python and stays its parent. Thus, for a project in `~/Documents`, `~/Desktop`, or iCloud Drive, macOS asks once for `mina-instance`, the same permission as for an instance, and not for every program that runs the Python of the Command Line Tools (see [macOS](macos.md#privacy-permissions)).
+- **Service figures.** `restarts` counts each start after the first one, also a start by `kickstart`. The memory is the footprint of the live processes of the job. The CPU time includes processes that exited.
+- **Names in records.** The verification has `coalition_remaining` instead of `cgroup_remaining`. A restart result has `launchctl_rc` instead of `systemctl_rc`.
+- **`PATH`.** The `PATH` of a workload starts with `/opt/homebrew/bin`, the place of `/usr/local/bin` on Apple silicon.
+
 ## Tests
 
 - `python3 host/test_hostd.py` runs an isolated broker against real systemd units, cgroups, file locks, and process trees. It uses no installed state. The tests cover:
@@ -846,6 +936,11 @@ The broker appends each request, decision, verification, and alarm delivery to `
   - Each risk flag, the stable diff, and escaped control characters.
   - The write: a new private file with `version` 1, backups and their pruning, and a refusal after a concurrent change.
   - The inventory, and `policy_propose` with a real broker: the dialog, a write after approval, the audit record, and unregistered projects.
+- On macOS, `/usr/bin/python3 -I host/test_hostd.py` runs the same tests against launchd jobs, coalitions, and Seatbelt. Run it as a user who is logged in to the Mac. The macOS tests also cover:
+  - A detached descendant (`setsid` and a double fork) that is stopped and verified gone: at a stop, at the end of the leader, at the deadline, and after the lock holder was killed.
+  - The command sandbox: the private `TMPDIR`, hidden paths, no network, no `launchctl`, no pasteboard, and a usable GPU.
+  - Sessions: a sandboxed opener and an opener in a Mina job are refused. Only the Pi process of the instance can use the session. A process outside the coalition and a command of the agent are refused.
+  - Lock holders and waits, Apple GPU users (from a real Metal client and from captured `ioreg` output), the LaunchAgent, and the limit of the socket path.
 - `node --test test/host.test.mjs` covers the capability text, the exclusion of subagents, the handoff successor, delivery before acknowledgement, approval that the model cannot forge, and the sandbox binds.
   It also covers `policy_propose`, `inventory`, the one-line manifest of a project that is not registered, and the complete dialog text.
   A test with a real sandbox shows that the agent cannot write `~/.config/mina`.

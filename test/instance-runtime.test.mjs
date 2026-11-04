@@ -7,6 +7,7 @@ import { execFile, spawn } from 'node:child_process';
 import { createInstance, scopeCommand, inspectInstance, stopInstance, instanceLimits, instanceDirectory } from '../lib/instance-runtime.mjs';
 import { REPO } from '../bin/mina.mjs';
 import { needsSystemd } from './capabilities.mjs';
+import { MACOS } from '../sandbox/sandbox.mjs';
 
 const run = (command, options = {}) => new Promise((resolve) => execFile(command[0], command.slice(1), options,
   (error, stdout, stderr) => resolve({ error, stdout, stderr })));
@@ -28,7 +29,7 @@ test('an instance keeps a protected identity and validated limits, with no defau
   const dir = mkdtempSync(join(tmpdir(), 'mina-instance-'));
   const instance = createInstance({ cwd: dir, stateDir: join(dir, 'state') });
   assert.match(instance.id, /^[a-f0-9-]{36}$/);
-  assert.equal(instance.unit, `mina-${instance.id}.scope`);
+  assert.equal(instance.unit, MACOS ? `com.mina.instance.${instance.id}` : `mina-${instance.id}.scope`); // macOS: a launchd job label
   assert.equal(instance.limits.maxWallS, undefined);
   assert.ok(!scopeCommand(instance, ['/bin/true']).some((arg) => arg.startsWith('--property=RuntimeMaxSec=')));
   assert.ok(scopeCommand({ ...instance, limits: { maxWallS: 60 } }, ['/bin/true']).includes('--property=RuntimeMaxSec=60'));

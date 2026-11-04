@@ -17,7 +17,8 @@ import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSy
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { defaultHidden, hostPaths } from '../../sandbox/sandbox.mjs';
+import { defaultHidden, hostPaths, MACOS, sandboxAvailable } from '../../sandbox/sandbox.mjs';
+import { ensureSupervisor, relaySpawn } from '../../sandbox/macos/client.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const BWRAP = ['/usr/bin/bwrap', '/bin/bwrap'].find((p) => existsSync(p)) ?? '/usr/bin/bwrap';
@@ -30,7 +31,9 @@ export class PdfIsolationError extends Error {
 const contains = (root, p) => root === p || p.startsWith(root === '/' ? '/' : `${root}/`);
 const canon = (p) => { try { return realpathSync(p); } catch { return resolve(p); } };
 // A runtime root may not be, or contain, any of these.
-const BROAD = ['/', '/home', '/root', '/tmp', '/var', '/var/tmp', '/run', '/etc', '/proc', '/sys', '/dev', '/mnt', '/media', '/srv', '/boot', '/opt'];
+const BROAD = ['/', '/home', '/root', '/tmp', '/var', '/var/tmp', '/run', '/etc', '/proc', '/sys', '/dev', '/mnt', '/media', '/srv', '/boot', '/opt',
+  // macOS: the system and user roots (/var and /tmp resolve to /private/...).
+  '/private', '/Users', '/Library', '/System', '/Applications', '/Volumes'];
 
 /** Why this bubblewrap cannot be trusted (null = it can): absolute, under /usr, root-owned, not group/other-writable. */
 export function bwrapProblem(path) {
@@ -119,7 +122,16 @@ const positive = (n) => Number.isSafeInteger(n) && n > 0;
  * The whole sandbox (descendants included: the pid namespace dies with its init) is SIGKILLed on deadline, output cap
  * and abort.
  */
-export function runSandboxedPython(buf, { python, script, args = [], timeoutMs = 30000, maxStdoutBytes = 4 * 1024 * 1024,
+export function runSandboxedPython(buf, options = {}) {
+  // macOS outside an instance (--nosandbox; on Linux the converter runs in bwrap then too): a private supervisor first.
+  if (MACOS && !sandboxAvailable() && process.env.MINA_SANDBOX !== '1') {
+    return ensureSupervisor().then(() => runIsolated(buf, options),
+      (e) => unavailable('isolation_unavailable', `the sandbox supervisor did not start: ${e.message}`));
+  }
+  return runIsolated(buf, options);
+}
+
+function runIsolated(buf, { python, script, args = [], timeoutMs = 30000, maxStdoutBytes = 4 * 1024 * 1024,
   maxMemoryBytes = 1536 * 1024 * 1024, signal, spawnImpl = spawn, bwrap = BWRAP } = {}) {
   return new Promise((resolvePromise, reject) => {
     if (signal?.aborted) { reject(abortError(signal)); return; }
@@ -127,19 +139,28 @@ export function runSandboxedPython(buf, { python, script, args = [], timeoutMs =
       || !args.every((x) => typeof x === 'string' && !x.includes('\0'))) {
       resolvePromise(unavailable('invalid_limits', 'extractor limits must be positive integers')); return;
     }
-    const problem = bwrapProblem(bwrap);
+    const problem = MACOS ? (sandboxAvailable() ? null : 'the sandbox supervisor of a Mina instance is not available') : bwrapProblem(bwrap);
     if (problem) { resolvePromise(unavailable('isolation_unavailable', problem)); return; }
-    let argv;
+    let argv, command = bwrap, spawnEnv = { PATH: '/usr/bin:/bin' };
     try {
       const rt = resolvePdfRuntime(python);
-      argv = [...pdfSandboxArgs(rt), '--', rt.exec, '-I', '-B', '-c', script, String(maxMemoryBytes), String(Math.max(1, Math.ceil(timeoutMs / 1000))), ...args];
+      const run = [rt.exec, '-I', '-B', '-c', script, String(maxMemoryBytes), String(Math.max(1, Math.ceil(timeoutMs / 1000))), ...args];
+      if (MACOS) {
+        // macOS (docs/macos.md): a call of the instance's supervisor with the same roots, no network, no writable folder
+        // but its private TMPDIR, and the memory bound that RLIMIT_AS gives on Linux, enforced on the call's coalition.
+        const r = relaySpawn({ kind: 'service', argv: run, cwd: '/', reads: rt.mounts, writes: [], egressPort: null, homeIsTmp: true,
+          limits: { memoryBytes: maxMemoryBytes },
+          env: { PATH: '/usr/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', ORT_DISABLE_TELEMETRY: '1', OPENBLAS_NUM_THREADS: '1', OMP_NUM_THREADS: '1' } });
+        command = r.command; argv = r.args; spawnEnv = r.env;
+      } else argv = [...pdfSandboxArgs(rt), '--', ...run];
     } catch (e) {
       resolvePromise(unavailable(e instanceof PdfIsolationError ? e.reason : 'isolation_unavailable', e.message)); return;
     }
     let child;
     try {
-      // detached: bwrap leads its own process group, so the whole group can be killed; env: bwrap clears it anyway.
-      child = spawnImpl(bwrap, argv, { cwd: '/', stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true, detached: true, env: { PATH: '/usr/bin:/bin' } });
+      // detached: bwrap (or the macOS relay) leads its own process group, so the whole group can be killed; env: bwrap
+      // clears it anyway, and the relay passes only the request.
+      child = spawnImpl(command, argv, { cwd: '/', stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true, detached: true, env: spawnEnv });
     } catch (e) {
       resolvePromise(unavailable('isolation_unavailable', `cannot start bubblewrap: ${e.code ?? 'spawn_failed'}`)); return;
     }

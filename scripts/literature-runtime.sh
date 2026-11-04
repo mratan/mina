@@ -14,12 +14,19 @@ case "$(uname -m)" in
   *) echo "literature-runtime: unsupported machine $(uname -m)" >&2; exit 1 ;;
 esac
 
-tarball="node-$node_version-linux-$arch.tar.xz"
+case "$(uname -s)" in
+  Linux) os=linux ;;
+  Darwin) os=darwin ;;
+  *) echo "literature-runtime: unsupported system $(uname -s)" >&2; exit 1 ;;
+esac
+tarball="node-$node_version-$os-$arch.tar.xz"
 download="$(mktemp -d)"
 trap 'rm -rf "$download"' EXIT
 curl -fsSL -o "$download/$tarball" "https://nodejs.org/dist/$node_version/$tarball"
 curl -fsSL -o "$download/SHASUMS256.txt" "https://nodejs.org/dist/$node_version/SHASUMS256.txt"
-(cd "$download" && grep " $tarball\$" SHASUMS256.txt | sha256sum -c --quiet -)
+# macOS has shasum, not sha256sum.
+if command -v sha256sum >/dev/null; then check() { sha256sum -c --quiet -; } else check() { shasum -a 256 -c --quiet -; }; fi
+(cd "$download" && grep " $tarball\$" SHASUMS256.txt | check)
 rm -rf "$runtime/node"
 mkdir -p "$runtime/node"
 tar -xf "$download/$tarball" -C "$runtime/node" --strip-components=1

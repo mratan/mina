@@ -1,7 +1,7 @@
 // Trusted Pi control plane. All supported local tools, including user bash, use kernel workers.
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { bwrapAvailable, insideAny, REPO, sandboxSettingsFromEnv, checkReadGrant } from '../../sandbox/sandbox.mjs';
+import { sandboxAvailable, insideAny, REPO, sandboxSettingsFromEnv, checkReadGrant, MACOS } from '../../sandbox/sandbox.mjs';
 import { createEgressProxy } from '../../lib/egress-proxy.mjs';
 import { oneDialog } from '../../lib/dialog-lock.mjs';
 import { runFileOperation, workerBashOperations } from '../../sandbox/worker-client.mjs';
@@ -19,11 +19,16 @@ const ALLOW = 'Allow read-only access until mina exits';
 const DENY = 'Deny';
 
 // What the agent's commands and file tools can see, from the live settings (read grants included).
-export function sandboxNote(s, readable) {
+export function sandboxNote(s, readable, { macos = MACOS, home = process.env.MINA_WORKER_HOME } = {}) {
   const list = (xs) => (xs.length ? xs.join(', ') : 'none');
+  const paths = macos
+    ? 'Other host paths are refused ("Operation not permitted"). '
+      + `HOME is ${home || 'a private folder of this instance'} and lasts only until mina exits; TMPDIR is a private folder that is emptied after every command `
+      + '(/tmp itself is not available: use $TMPDIR); a server cannot listen on a port; '
+    : 'Other host paths do not exist for them ("No such file or directory"). HOME is /home/mina and lasts only until mina exits; '
+      + '/tmp is emptied after every command; ';
   return `Your commands and file tools see: writable ${list(s.writable)}; read-only ${list(readable)}; and read-only system software. `
-    + 'Other host paths do not exist for them ("No such file or directory"). HOME is /home/mina and lasts only until mina exits; '
-    + '/tmp is emptied after every command; environment variables you set last only for that command. Keep what must last in a writable folder.\n'
+    + paths + 'environment variables you set last only for that command. Keep what must last in a writable folder.\n'
     + 'If the task needs a file or folder outside these, ask with mina_sandbox_request: read-only access, decided by the user, applied from your '
     + 'next command (subagents and checks included) until mina exits. Write access elsewhere needs the user to restart mina with '
     + '--sandbox-write PATH: say which path and why.';
@@ -37,7 +42,7 @@ export function scanLine(path, { folders, files, current }, ms) {
     + `${count(files, 'file')} · ${clock(ms)}${where} · Esc cancels`;
 }
 
-export default function minaSandbox(pi, { env = process.env, available = bwrapAvailable(), makeProxy = createEgressProxy, grantWaitMs = GRANT_WAIT_MS,
+export default function minaSandbox(pi, { env = process.env, available = sandboxAvailable(env), makeProxy = createEgressProxy, grantWaitMs = GRANT_WAIT_MS,
   scanUpdateMs = SCAN_UPDATE_MS } = {}) {
   const s = sandboxSettings(env);
   if (!s.on) return;
@@ -66,7 +71,7 @@ export default function minaSandbox(pi, { env = process.env, available = bwrapAv
     name: 'mina_sandbox_request',
     label: 'Request access',
     description: 'Ask the user for read-only access to a host file or folder that your commands and file tools cannot see. Give the absolute '
-      + 'host path (~ is the owner\'s home, not /home/mina) and why the task needs it. If allowed, it applies from your next call until mina exits. '
+      + `host path (~ is the owner's home, not ${MACOS ? 'the HOME of your commands' : '/home/mina'}) and why the task needs it. If allowed, it applies from your next call until mina exits. `
       + 'Write access outside the writable folders cannot be granted here.',
     parameters: { type: 'object', additionalProperties: false, required: ['path', 'reason'],
       properties: { path: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } } },
@@ -121,17 +126,18 @@ export default function minaSandbox(pi, { env = process.env, available = bwrapAv
     return undefined;
   });
   let proxy = null;
-  const getEgressSocket = () => proxy?.socketPath ?? null;
+  // The proxy endpoint for the workers: a Unix socket path on Linux, { port, token } on macOS.
+  const getEgressSocket = () => proxy?.endpoint ?? proxy?.socketPath ?? null;
   globalThis[Symbol.for('mina:worker-egress')] = getEgressSocket;
   for (const tool of createSandboxTools({ env, getEgressSocket })) {
-    if (!available) tool.execute = async () => { throw new Error('mina sandbox: bubblewrap is unavailable; tool refused.'); };
+    if (!available) tool.execute = async () => { throw new Error(`mina sandbox: ${MACOS ? 'the sandbox supervisor' : 'bubblewrap'} is unavailable; tool refused.`); };
     pi.registerTool(tool);
   }
   const operations = workerBashOperations({ env, getEgressSocket });
   pi.on('user_bash', () => ({ operations }));
   pi.on('session_start', async () => {
     if (s.network === 'offline' || proxy) return;
-    const next = makeProxy({ level: s.network, socketDir: join(env.XDG_CACHE_HOME || join(homedir(), '.cache'), 'mina', 'egress') });
+    const next = makeProxy({ level: s.network, socketDir: join(env.XDG_CACHE_HOME || join(homedir(), '.cache'), 'mina', 'egress'), listen: MACOS ? 'tcp' : 'unix' });
     await next.start();
     proxy = next;
   });

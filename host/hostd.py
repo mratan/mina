@@ -20,6 +20,9 @@ Who may call: a request carries a session grant. The mina launcher (a process ou
 as this broker) opens the session and passes the grant into the sandbox; the broker accepts it only from that
 launcher's own Pi process (its child, or its grandchild through bwrap), never from a command the agent runs.
 
+On macOS the broker is the LaunchAgent com.mina.hostd, each workload is a launchd job with its own resource coalition,
+and the command sandbox is Seatbelt (host/darwin.py; docs/host-profile.md, "macOS").
+
 usage: hostd.py serve | install | status [PROJECT]
 """
 import copy
@@ -31,6 +34,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import stat
 import socket
@@ -46,6 +50,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import hostlib  # noqa: E402
 import policy as hostpolicy  # noqa: E402
+DARWIN = hostlib.DARWIN
+if DARWIN:
+    import darwin  # noqa: E402
 from confirmations import Confirmations, PROTOCOL, MUTATION_OP  # noqa: E402
 from budgets import AdmissionBudgets, BudgetExceeded, BudgetUnknown, limits as budget_limits  # noqa: E402
 
@@ -53,12 +60,19 @@ VERSION = '1'
 UID = os.getuid()
 CONFIG = os.path.expanduser(os.environ.get('MINA_HOST_CONFIG', '~/.config/mina/host.json'))
 STATE = os.path.expanduser(os.environ.get('MINA_HOST_STATE', '~/.local/state/mina/hostd'))
-RUNTIME = os.environ.get('MINA_HOST_RUNTIME', f'/run/user/{UID}/mina-hostd')
+# The broker's socket folder. macOS has no runtime folder (/run/user/UID): the default there is a folder in the user's
+# state folder, short enough for a socket path (sun_path: at most 103 bytes). The launcher (sandbox/sandbox.mjs
+# hostPaths) must name the same folder.
+MACOS_RUNTIME = '~/.local/state/mina/run/hostd'
+RUNTIME = os.environ.get('MINA_HOST_RUNTIME', os.path.expanduser(MACOS_RUNTIME) if DARWIN else f'/run/user/{UID}/mina-hostd')
 SOCKET = os.path.join(RUNTIME, 'sock')
 SLICE = os.environ.get('MINA_HOST_SLICE', 'mina.slice')
-UNIT_PREFIX = os.environ.get('MINA_HOST_UNIT_PREFIX', 'mina-wl')
+# A workload's unit: {UNIT_PREFIX}-{tag}-{id}.service on Linux; the launchd label {UNIT_PREFIX}.{tag}-{id} on macOS.
+UNIT_PREFIX = os.environ.get('MINA_HOST_UNIT_PREFIX', 'com.mina.hostd.workload' if DARWIN else 'mina-wl')
+LABEL = 'com.mina.hostd'   # the broker's own LaunchAgent (macOS)
+STOP_GRACE_S = 5           # TimeoutStopSec of a workload unit; on macOS the broker and lockrun.py wait as long
 LOCKRUN = os.path.join(HERE, 'lockrun.py')
-LOCKRUN_ENV = ('MINA_HOST_KFD_PROC',)   # broker settings that lockrun.py (hostlib) reads too
+LOCKRUN_ENV = ('MINA_HOST_KFD_PROC', 'MINA_HOST_IOREG')   # broker settings that lockrun.py (hostlib) reads too
 TICK_S = float(os.environ.get('MINA_HOST_TICK_S', '2'))
 CLASSES = hostpolicy.CLASSES
 POLICY_PROTOCOL = hostpolicy.POLICY_PROTOCOL
@@ -296,14 +310,25 @@ SESSIONS = os.path.join(STATE, 'sessions.json')
 
 
 def peer_of(conn):
+    if DARWIN:
+        return darwin.peer(conn)   # LOCAL_PEERPID and LOCAL_PEERCRED
     pid, uid, _gid = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
     return pid, uid
 
 
 def host_peer(pid):
-    """A process outside every sandbox: it shares this broker's mount namespace. Sandboxed Mina processes do not."""
+    """A process outside every sandbox: it shares this broker's mount namespace. Sandboxed Mina processes do not.
+    macOS has no mount namespaces: a process outside every sandbox is one that is not in a Seatbelt sandbox and not in
+    the coalition of a running Mina job (an instance or a call: no process can leave its coalition)."""
+    if DARWIN:
+        return (hostlib.proc_stat(pid) is not None and not darwin.sandboxed(pid)
+                and darwin.coalition_of(pid) not in darwin.mina_coalitions())
     ns = hostlib.mnt_ns(pid)
     return ns is not None and ns == hostlib.mnt_ns()
+
+
+NOT_MINA = ('the caller is not the Mina process of this session (a command run by the agent or by a subagent cannot use '
+            'the host session)')
 
 
 def session_for(grant, pid):
@@ -317,13 +342,16 @@ def session_for(grant, pid):
     st = hostlib.proc_stat(pid)
     if not st:
         raise Refusal('UNAUTHENTICATED', 'caller vanished')
-    parent = hostlib.proc_stat(st['ppid'])
-    lp = s['launcher']['pid']
-    direct = st['ppid'] == lp
-    via_bwrap = bool(parent) and parent['ppid'] == lp and parent['comm'] == 'bwrap'
-    if not (direct or via_bwrap):
-        raise Refusal('UNAUTHENTICATED', 'the caller is not the Mina process of this session (a command run by the agent '
-                      'or by a subagent cannot use the host session)')
+    if DARWIN:
+        why = macos_caller_problem(s, pid, st)
+    else:
+        parent = hostlib.proc_stat(st['ppid'])
+        lp = s['launcher']['pid']
+        direct = st['ppid'] == lp
+        via_bwrap = bool(parent) and parent['ppid'] == lp and parent['comm'] == 'bwrap'
+        why = None if direct or via_bwrap else NOT_MINA
+    if why:
+        raise Refusal('UNAUTHENTICATED', why)
     me = {'pid': pid, 'start': st['start']}
     with state_lock:
         sessions = hostlib.read_json(SESSIONS, {})
@@ -336,9 +364,34 @@ def session_for(grant, pid):
     return sid, s
 
 
+INSTANCE_ID = re.compile(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}')
+
+
+def macos_caller_problem(s, pid, st):
+    """macOS: why pid is not the Pi process of the session's launcher (None: it is). With an instance (the launcher ran
+    Pi in the launchd job com.mina.instance.ID): the caller is in a sandbox, in the coalition of that job, and its
+    parent is the instance's supervisor: outside every sandbox, in the same coalition, a child of the job's main
+    process (mina-instance). A command that Pi runs is a child of Pi, or runs in a call job with its own coalition.
+    Without an instance (mina --nosandbox): the caller is a child of the launcher, as on Linux."""
+    if not s.get('instance'):
+        return None if st['ppid'] == s['launcher']['pid'] else NOT_MINA
+    job = darwin.job(f'com.mina.instance.{s["instance"]}')
+    if not job or not job['pid'] or not job['coalition']:
+        return 'the Mina instance of this host session is not running'
+    parent = hostlib.proc_stat(st['ppid'])
+    if not (darwin.sandboxed(pid) and darwin.coalition_of(pid) == job['coalition'] and parent
+            and parent['ppid'] == job['pid'] and not darwin.sandboxed(st['ppid'])
+            and darwin.coalition_of(st['ppid']) == job['coalition']):
+        return NOT_MINA
+    return None
+
+
 def op_session_open(req, pid):
     if not host_peer(pid):
         raise Refusal('UNAUTHENTICATED', 'only a process outside the sandbox (the mina launcher) can open a host session')
+    instance = req.get('instance') if DARWIN else None
+    if instance is not None and not (isinstance(instance, str) and INSTANCE_ID.fullmatch(instance)):
+        raise Refusal('INVALID', 'instance must be the ID of a Mina instance (a lower-case UUID)')
     project = os.path.realpath(req.get('project') or '')
     if not os.path.isdir(project):
         raise Refusal('INVALID', f'project {project} is not a folder')
@@ -348,6 +401,8 @@ def op_session_open(req, pid):
         sessions = hostlib.read_json(SESSIONS, {})
         sessions = {k: v for k, v in sessions.items() if hostlib.alive(v['launcher'])}
         sessions[sid] = {'project': project, 'launcher': hostlib.identity(pid), 'opened': now(), 'label': str(req.get('label', ''))[:80]}
+        if instance:
+            sessions[sid]['instance'] = instance
         hostlib.write_json(SESSIONS, sessions)
     budgets.open((project, sid))
     audit({'op': 'session_open', 'session': sid, 'project': project, 'launcher': pid})
@@ -369,6 +424,9 @@ SHOW = ['LoadState', 'ActiveState', 'SubState', 'MainPID', 'ExecMainStartTimesta
 
 
 def show(unit, props=SHOW):
+    if DARWIN:
+        info = launchd_show(unit, usage='MemoryCurrent' in props)
+        return {k: v for k, v in info.items() if k in props}
     r = systemctl('show', '--property', ','.join(props), unit)
     out = {}
     for line in r.stdout.splitlines():
@@ -381,6 +439,27 @@ def num(v):
     return int(v) if v and v.isdigit() and int(v) < 2 ** 63 else None
 
 
+def launchd_show(label, usage=True):
+    """macOS: the systemctl show properties of a launchd job in the user's gui domain (a service's unit is its label).
+    MemoryCurrent, CPUUsageNSec and TasksCurrent come from the job's coalition: the footprint and the number of its live
+    processes, and the CPU time of all its processes. NRestarts counts every start after the first one (runs - 1)."""
+    job = darwin.job(label)
+    if job is None:
+        return {'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead', 'MainPID': '0'}
+    running = job['state'] == 'running' and bool(job['pid'])
+    last = job['last_exit'] or ''
+    failed = bool(job.get('last_signal')) or (bool(last) and last not in ('0', '(never exited)'))
+    state = ('active' if running else 'activating' if job['state'] in ('spawn scheduled', 'spawning') else
+             'failed' if failed else 'inactive')
+    use = darwin.usage(job['coalition']) if usage and running and job['coalition'] else {}
+    text = lambda v: '' if v is None else str(v)
+    return {'LoadState': 'loaded', 'ActiveState': state, 'SubState': job['state'] or '', 'MainPID': text(job['pid'] if running else 0),
+            'Coalition': text(job['coalition']), 'MemoryCurrent': text(use.get('memory')), 'CPUUsageNSec': text(use.get('cpu_ns')),
+            'TasksCurrent': text(use.get('tasks')), 'NRestarts': text(job['runs'] - 1 if job['runs'] else None),
+            'Result': 'exit-code' if failed else 'success', 'ExecStart': ' '.join(job['arguments'] or [job['program'] or '']),
+            'FragmentPath': job['path'] or '', 'StandardOutPath': job['stdout'] or '', 'StandardErrorPath': job['stderr'] or ''}
+
+
 # --- services --------------------------------------------------------------------------------------------------------
 
 
@@ -389,7 +468,8 @@ def service_config(project, name):
     if not s:
         names = sorted(((project_config(project) or {}).get('services') or {}))
         raise Refusal('REQUIRES_AUTHORIZATION', f'service "{name}" is not registered for {project} (registered: {names or "none"})',
-                      remediation=snippet(project, f'services.{name}', {'unit': f'{name}.service', 'sources': ['<files it runs>']}))
+                      remediation=snippet(project, f'services.{name}', {'unit': f'<launchd label of {name}>' if DARWIN else f'{name}.service',
+                                                                        'sources': ['<files it runs>']}))
     return s
 
 
@@ -400,7 +480,10 @@ def source_files(project, s):
 
 def boot_time():
     """Boot time (epoch seconds) to 10 ms, from /proc/uptime. /proc/stat's btime is truncated to whole seconds, which put
-    a process started up to a second after a source change *before* that change: a fresh restart read as STALE."""
+    a process started up to a second after a source change *before* that change: a fresh restart read as STALE.
+    macOS: kern.boottime."""
+    if DARWIN:
+        return darwin.boot_time()
     with open('/proc/uptime') as f:
         return time.time() - float(f.read().split()[0])
 
@@ -413,7 +496,8 @@ def deployment(project, name, s, info=None):
     st = hostlib.proc_stat(pid) if pid else None
     started = None
     if st:
-        started = boot_time() + st['start'] / os.sysconf('SC_CLK_TCK')
+        # macOS: the start time is in microseconds since the epoch.
+        started = st['start'] / 1e6 if DARWIN else boot_time() + st['start'] / os.sysconf('SC_CLK_TCK')
     files = []
     for path in source_files(project, s):
         try:
@@ -482,11 +566,19 @@ def op_service_logs(project, sess, req):
     name = req.get('service')
     s = service_config(project, name)
     n = max(1, min(int(req.get('lines') or 50), 500))
-    r = subprocess.run(['journalctl', '--user', '-u', s['unit'], '-n', str(n), '--no-pager', '-o', 'short-iso'],
-                       capture_output=True, text=True, timeout=30)
-    out = {'service': name, 'journal': r.stdout.splitlines()[-n:]}
-    if r.returncode != 0:
-        out['journal_error'] = r.stderr.strip()[:300]
+    if DARWIN:
+        # launchd keeps no journal: the output of a job goes to the files of its plist (StandardOutPath, StandardErrorPath).
+        info = launchd_show(s['unit'], usage=False)
+        paths = list(dict.fromkeys(p for p in (info.get('StandardOutPath'), info.get('StandardErrorPath')) if p and p != '/dev/null'))
+        out = {'service': name, 'journal': [ln for p in paths for ln in tail(p, n)][-n:], 'journal_files': paths}
+        if not paths:
+            out['journal_error'] = f'{s["unit"]} writes its output to no file (no StandardOutPath or StandardErrorPath)'
+    else:
+        r = subprocess.run(['journalctl', '--user', '-u', s['unit'], '-n', str(n), '--no-pager', '-o', 'short-iso'],
+                           capture_output=True, text=True, timeout=30)
+        out = {'service': name, 'journal': r.stdout.splitlines()[-n:]}
+        if r.returncode != 0:
+            out['journal_error'] = r.stderr.strip()[:300]
     for path in s.get('logs', []):
         out.setdefault('files', {})[path] = tail(path, n)
     return out
@@ -529,9 +621,13 @@ def restart_verified(project, sess, name, s, req):
         t0 = now()
         hlog = (s.get('health') or {}).get('log')
         offset = os.path.getsize(hlog) if hlog and os.path.exists(hlog) else 0
-        r = systemctl('restart', s['unit'], timeout=int(s.get('restart_timeout_s', 60)))
-        result = {'service': name, 'unit': s['unit'], 'requested_at': iso(t0), 'systemctl_rc': r.returncode,
-                  'systemctl_stderr': r.stderr.strip()[:300], 'approval': public_confirmation(req.get('approval')), 'old_process': old}
+        if DARWIN:   # kill the running process, then start the job again
+            r = darwin.launchctl('kickstart', '-k', f'{darwin.domain()}/{s["unit"]}', timeout=int(s.get('restart_timeout_s', 60)))
+        else:
+            r = systemctl('restart', s['unit'], timeout=int(s.get('restart_timeout_s', 60)))
+        tool = 'launchctl' if DARWIN else 'systemctl'
+        result = {'service': name, 'unit': s['unit'], 'requested_at': iso(t0), f'{tool}_rc': r.returncode,
+                  f'{tool}_stderr': r.stderr.strip()[:300], 'approval': public_confirmation(req.get('approval')), 'old_process': old}
         result.update(verify_restart(project, name, s, old, t0, offset))
     finally:
         for fd in fds:
@@ -751,7 +847,7 @@ def user_hidden(home=None, env=None):
     return [re.sub(r'^~(?=$|/)', lambda _m: home, p) for p in hide]
 
 
-def command_sandbox(project, sb):
+def command_sandbox(project, sb, tmpdir=None, log=None):
     """bwrap arguments for a workload's command: read-only root, GPUs available, private /tmp and runtime folder (no user
     bus, no host lock files), credential paths hidden (mina's list, the owner's sandbox "hide" list, the workload's own);
     only the registered folders writable, and the registered read-only folders inside them bound back read-only (the
@@ -764,6 +860,8 @@ def command_sandbox(project, sb):
     except ConfigError as e:
         raise Refusal('BLOCKED', f'cannot tell which credential paths to hide: {e}') from e
     sub_ = lambda p: os.path.expanduser(p.replace('{project}', project))
+    if DARWIN:
+        return seatbelt_sandbox(project, sb, hidden, sub_, network, tmpdir, log)
     a = ['bwrap', '--ro-bind', '/', '/', '--dev-bind', '/dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp', '--tmpfs', f'/run/user/{UID}']
     for p in map(sub_, sb.get('write', ['{project}'])):
         if os.path.exists(p):
@@ -783,6 +881,38 @@ def command_sandbox(project, sb):
     return a + ['--die-with-parent', '--chdir', project, '--']
 
 
+def workload_tmpdir():
+    """macOS: a new private TMPDIR for a workload's command, in the user's temporary folder (which the command does not
+    see otherwise). lockrun.py makes it and removes it; the broker removes it too, if lockrun did not."""
+    user_tmp = darwin.user_temp_dir()
+    if not user_tmp:
+        raise Refusal('BLOCKED', 'cannot find the user\'s temporary folder (getconf DARWIN_USER_TEMP_DIR)')
+    return os.path.join(user_tmp, f'mina-wl-{secrets.token_hex(8)}')
+
+
+def seatbelt_sandbox(project, sb, hidden, sub_, network, tmpdir, log):
+    """macOS: the arguments of command_sandbox with Seatbelt (darwin.workload_profile): sandbox-exec with the profile and
+    its path parameters, then a shell that enters the project (bwrap --chdir) and sets the private TMPDIR (the private
+    /tmp of Linux), and executes the command. The owner's Keychain folder is hidden too: on Linux the private runtime
+    folder hides the user bus and its secret service. The command's output log (its stdout and stderr) is in the hidden
+    state folder: only its metadata is visible. Paths are resolved, because Seatbelt checks resolved paths. A
+    command in a Seatbelt sandbox cannot start a sandbox of its own (sandbox_apply fails): SwiftPM is told not to."""
+    real = os.path.realpath
+    user_tmp = darwin.user_temp_dir()
+    tmp = tmpdir or os.path.join(user_tmp or '/private/var/empty', 'mina-wl-unused')
+    writes = [real(p) for p in map(sub_, sb.get('write', ['{project}'])) if os.path.exists(p)]
+    readonly = [real(p) for p in map(sub_, sb.get('readonly', [])) if os.path.exists(p)]
+    hide = [real(p) for p in hidden + list(map(sub_, sb.get('hide', []))) + [os.path.expanduser('~/Library/Keychains')]
+            if os.path.exists(p)]
+    try:
+        profile = darwin.workload_profile(writes, readonly, list(dict.fromkeys(hide)), real(tmp), user_tmp, network,
+                                          [real(log)] if log else [])
+    except ValueError as e:
+        raise Refusal('INVALID', f'command sandbox: {e}') from e
+    enter = ('cd -- "$1" || exit 1; export TMPDIR="$2/" TMPPREFIX="$2/zsh" SWIFTPM_DISABLE_SANDBOX=1; shift 2; exec "$@"')
+    return profile.args() + ['--', '/bin/sh', '-c', enter, 'mina-workload', project, real(tmp)]
+
+
 def sha256_file(path):
     try:
         return hashlib.sha256(open(path, 'rb').read()).hexdigest()
@@ -790,7 +920,7 @@ def sha256_file(path):
         return None
 
 
-def workload_argv(project, name, w, req):
+def workload_argv(project, name, w, req, tmpdir=None, log=None):
     """The registered argv with its placeholders filled: {project}; {max_s}; {NAME} from req.params, each matching its
     registered pattern; {command} becomes the sandbox and then req.command. Pinned files must have the approved hash,
     because the host side of a workload runs outside every sandbox and the agent can edit project files."""
@@ -827,7 +957,7 @@ def workload_argv(project, name, w, req):
         if tok == '{command}':
             # command_sandbox false: the command already runs in a sandbox of its own (a podman container started by a
             # pinned script); bwrap would also stop rootless podman from starting (no_new_privs blocks newuidmap).
-            out += (command_sandbox(project, w.get('sandbox', {})) if w.get('command_sandbox', True) else []) + command
+            out += (command_sandbox(project, w.get('sandbox', {}), tmpdir, log) if w.get('command_sandbox', True) else []) + command
             continue
         out.append(fill(tok, project, max_s, params))
     env = {k: fill(str(v), project, max_s, params) for k, v in (w.get('env') or {}).items()}
@@ -1017,10 +1147,13 @@ def launch_workload(project, sess, req):
                          f'Run registered workload {name} for {project} '
                          f'with params {req.get("params") or {}}, command {req.get("command")}, '
                          f'and max_s {max_s} (plus queue ceiling {queue_s}s)?')
-    argv, max_s, params, command, env = workload_argv(project, name, w, req)  # retain the final pre-launch pin check
     wid = f'{time.strftime("%Y%m%d%H%M%S")}-{secrets.token_hex(3)}'
-    unit = f'{UNIT_PREFIX}-{tag(project)}-{wid}.service'
     d = os.path.join(WL, wid)
+    sandboxed = '{command}' in w['argv'] and w.get('command_sandbox', True)
+    tmpdir = workload_tmpdir() if DARWIN and sandboxed else None
+    argv, max_s, params, command, env = workload_argv(project, name, w, req, tmpdir,   # retain the final pre-launch pin check
+                                                      os.path.join(d, 'output.log') if DARWIN else None)
+    unit = f'{UNIT_PREFIX}.{tag(project)}-{wid}' if DARWIN else f'{UNIT_PREFIX}-{tag(project)}-{wid}.service'
     if 'request_id' in req and not create_request_intent(project, sess, req, wid):
         return observe_request(project, sess, req['request_id'], request_digest(req), replayed=True)
     admission = check_workload_budget(project, sess, name, max_s + queue_s, wid)
@@ -1028,26 +1161,25 @@ def launch_workload(project, sess, req):
     spec = {'argv': argv, 'cwd': w.get('cwd', project), 'env': env, 'result': os.path.join(d, 'result.json'),
             'log': os.path.join(d, 'output.log'), 'locks': hostlib.lock_entries(resources, names), 'queue_s': queue_s,
             'resources': {n: resources[n] for n in names}, 'resource_names': names}
+    if DARWIN:   # lockrun.py enforces the deadline and makes the private TMPDIR; the broker marks its own stops
+        spec.update(deadline=now() + max_s + queue_s, stop_marker=os.path.join(d, 'stop'), tmpdir=tmpdir)
     hostlib.write_json(os.path.join(d, 'spec.json'), spec)
     rec = {'id': wid, 'workload': name, 'project': project, 'policy_source': policy_source(project), 'session': sess, 'unit': unit, 'resources': names,
            'max_s': max_s, 'params': params, 'command': command, 'request_id': req.get('request_id'), 'admission': admission, 'state': 'launching', 'launched': now(), 'deadline': now() + max_s + queue_s, 'members_seen': [],
            'queue_s': queue_s, **({'runner_queue': list(w['runner_queue'])} if w.get('runner_queue') else {})}
+    if DARWIN:
+        rec['tmpdir'] = tmpdir
+        if w.get('delegate'):
+            rec['delegate'] = PODMAN_NOTE
     hostlib.write_json(os.path.join(d, 'record.json'), rec)   # recorded before launch: an interrupted launch is found
-    r = subprocess.run(['systemd-run', '--user', '--quiet', '--collect', f'--unit={unit}', f'--slice={SLICE}',
-                        '--property=Type=exec', f'--property=RuntimeMaxSec={max_s + queue_s}', '--property=KillMode=control-group',
-                        '--property=TimeoutStopSec=5', '--property=SendSIGKILL=yes',
-                        # Delegation lets podman --cgroups=split keep its containers inside this unit, so stopping the unit
-                        # stops them (by default rootless podman moves a container into a scope of its own).
-                        *(['--property=Delegate=yes'] if w.get('delegate') else []), f'--description=mina workload {name} {wid}',
-                        # lockrun re-checks the resources inside the unit, which does not inherit the broker's environment:
-                        # a relocated GPU user list (MINA_HOST_KFD_PROC) must reach it, or the two checks disagree.
-                        *[f'--setenv={k}={os.environ[k]}' for k in LOCKRUN_ENV if k in os.environ],
-                        '--', sys.executable, LOCKRUN, os.path.join(d, 'spec.json')],
-                       capture_output=True, text=True, timeout=30, env={**os.environ, 'XDG_RUNTIME_DIR': f'/run/user/{UID}'})
+    if DARWIN:
+        r = launch_job(d, unit)
+    else:
+        r = launch_unit(d, unit, w, name, wid, max_s, queue_s)
     if r.returncode != 0:
         rec.update(state='launch_failed', error=r.stderr.strip()[:500])
         hostlib.write_json(os.path.join(d, 'record.json'), rec)
-        raise Refusal('FAILED', f'systemd-run refused the workload: {rec["error"]}')
+        raise Refusal('FAILED', f'{"launchctl bootstrap" if DARWIN else "systemd-run"} refused the workload: {rec["error"]}')
     for _ in range(50):   # until lockrun has taken (or failed to take) the locks
         res = hostlib.read_json(spec['result'])
         if res:
@@ -1070,6 +1202,38 @@ def launch_workload(project, sess, req):
     return out
 
 
+def launch_unit(d, unit, w, name, wid, max_s, queue_s):
+    """Linux: the workload's transient systemd user service, whose main process is lockrun.py."""
+    return subprocess.run(['systemd-run', '--user', '--quiet', '--collect', f'--unit={unit}', f'--slice={SLICE}',
+                           '--property=Type=exec', f'--property=RuntimeMaxSec={max_s + queue_s}', '--property=KillMode=control-group',
+                           '--property=TimeoutStopSec=5', '--property=SendSIGKILL=yes',
+                           # Delegation lets podman --cgroups=split keep its containers inside this unit, so stopping the unit
+                           # stops them (by default rootless podman moves a container into a scope of its own).
+                           *(['--property=Delegate=yes'] if w.get('delegate') else []), f'--description=mina workload {name} {wid}',
+                           # lockrun re-checks the resources inside the unit, which does not inherit the broker's environment:
+                           # a relocated GPU user list (MINA_HOST_KFD_PROC) must reach it, or the two checks disagree.
+                           *[f'--setenv={k}={os.environ[k]}' for k in LOCKRUN_ENV if k in os.environ],
+                           '--', sys.executable, LOCKRUN, os.path.join(d, 'spec.json')],
+                          capture_output=True, text=True, timeout=30, env={**os.environ, 'XDG_RUNTIME_DIR': f'/run/user/{UID}'})
+
+
+# podman delegation (Delegate=yes) keeps a container in the workload's cgroup on Linux. On macOS podman runs its
+# containers in a virtual machine, outside the coalition: they are not stopped with the workload.
+PODMAN_NOTE = ('not contained on macOS: podman runs containers in a virtual machine outside the workload\'s coalition, '
+               'so the broker does not stop them and does not verify that they ended')
+
+
+def launch_job(d, label):
+    """macOS: the workload's launchd job (the transient unit of Linux): it runs lockrun.py once, in the user's gui domain,
+    with a coalition of its own. The property list stays in the workload's folder."""
+    plist = os.path.join(d, 'job.plist')
+    env = {'HOME': os.path.expanduser('~'), **{k: os.environ[k] for k in LOCKRUN_ENV if k in os.environ}}
+    darwin.write_plist(plist, darwin.job_plist(label, darwin.via_helper([sys.executable, LOCKRUN, os.path.join(d, 'spec.json')]), env,
+                                               os.path.join(d, 'lockrun.log')))
+    return subprocess.run([darwin.LAUNCHCTL, 'bootstrap', darwin.domain(), plist], capture_output=True, text=True,
+                          timeout=30, env=darwin.ENV)
+
+
 def workload_dir(wid):
     if not re.fullmatch(r'[0-9]{14}-[0-9a-f]{6}', str(wid or '')):
         raise Refusal('INVALID', f'not a workload id: {wid}')
@@ -1088,12 +1252,34 @@ WL_UNIT = re.compile(r'/' + re.escape(UNIT_PREFIX) + r'-[0-9a-f]{8}-(\d{14}-[0-9
 
 
 def holder_workload(pid):
-    """The broker workload whose unit contains this process: {id, project, workload, params}, or None."""
-    m = WL_UNIT.search(hostlib.cgroup_of(pid) or '')
-    rec = hostlib.read_json(os.path.join(WL, m.group(1), 'record.json')) if m else None
+    """The broker workload whose unit contains this process: {id, project, workload, params}, or None. macOS: the
+    workload whose job has the coalition of the process."""
+    if DARWIN:
+        rec = coalition_workload(hostlib.coalition_of(pid))
+    else:
+        m = WL_UNIT.search(hostlib.cgroup_of(pid) or '')
+        rec = hostlib.read_json(os.path.join(WL, m.group(1), 'record.json')) if m else None
     if not rec:
         return None
     return {'id': rec['id'], 'project': rec['project'], 'workload': rec['workload'], 'params': rec.get('params') or {}}
+
+
+_coalitions = {}   # macOS: coalition ID -> workload id, as reconcile_workload learns them
+
+
+def coalition_workload(cid):
+    """macOS: the record of the workload whose launchd job has this coalition, or None. A coalition ID is not reused
+    before a reboot, so a record of this boot with that coalition is the right one."""
+    if not cid:
+        return None
+    wid = _coalitions.get(cid)
+    if wid is None and os.path.isdir(WL):
+        for w in sorted(os.listdir(WL))[-200:]:
+            rec = hostlib.read_json(os.path.join(WL, w, 'record.json'))
+            if rec and rec.get('coalition'):
+                _coalitions[rec['coalition']] = w
+        wid = _coalitions.get(cid)
+    return hostlib.read_json(os.path.join(WL, wid, 'record.json')) if wid else None
 
 
 def attributed(holders):
@@ -1146,23 +1332,78 @@ def note_runner_wait(rec, wait):
     if enforced and now() >= rec['queue_deadline'] and not rec.get('runner_queue_expired'):
         rec['runner_queue_expired'] = {'lock': wait['lock'], 'holders': holders, 'waited_s': round(now() - rec['launched'], 1),
                                        'why': f'queue_s {rec.get("queue_s", 0)} ended while the runner waited for this lock'}
-        systemctl('stop', '--no-block', rec['unit'])
+        if DARWIN:
+            start_stop(rec)
+        else:
+            systemctl('stop', '--no-block', rec['unit'])
         audit({'op': 'workload_queue_end', 'id': rec['id'], 'project': rec['project'], 'workload': rec['workload'],
                'lock': wait['lock'], 'waited_s': rec['runner_queue_expired']['waited_s']})
 
 
+_stops = {}   # macOS: workload id -> the thread that stops its coalition
+
+
+def stop_job(rec):
+    """macOS: stop a workload's launchd job as `systemctl stop` stops its unit: SIGTERM to every process of its
+    coalition, SIGKILL after STOP_GRACE_S, until none remains; then remove the job. The stop marker tells lockrun.py
+    that the broker stops the coalition, so it does not signal the processes a second time. Returns what remains."""
+    try:
+        Path(WL, rec['id'], 'stop').touch()
+    except OSError:
+        pass   # lockrun then signals the processes too: a second SIGTERM, never a missed stop
+    cid = rec.get('coalition') or (darwin.job(rec['unit']) or {}).get('coalition')
+    left = hostlib.stop_coalition(cid, STOP_GRACE_S)
+    darwin.launchctl('bootout', f'{darwin.domain()}/{rec["unit"]}')
+    return left
+
+
+def start_stop(rec):
+    """macOS: stop_job in a thread (systemctl stop --no-block), at most one at a time for a workload. Returns it."""
+    with state_lock:
+        t = _stops.get(rec['id'])
+        if t is None or not t.is_alive():
+            t = _stops[rec['id']] = threading.Thread(target=stop_job, args=(copy.deepcopy(rec),), daemon=True)
+            t.start()
+    return t
+
+
+def job_active(rec, res):
+    """macOS: (active, live processes) of a workload's launchd job, as systemd's ActiveState of its unit: active while
+    the job is loaded (lockrun.py runs; launchd removes the job when it exits) or while the broker stops what is left
+    in its coalition. Records the coalition. As systemd does, the broker stops the processes that are left when
+    lockrun.py is gone, and stops the job just after its deadline if lockrun.py did not (it enforces the deadline)."""
+    job = darwin.job(rec['unit'])
+    cid = rec.get('coalition') or (job or {}).get('coalition') or res.get('coalition')
+    if cid:
+        rec['coalition'] = cid
+        _coalitions[cid] = rec['id']
+    live = hostlib.coalition_members(cid) or []
+    t = _stops.get(rec['id'])
+    if t is None and ((job is None and live) or (job is not None and now() >= rec['deadline'] + 1)):
+        t = start_stop(rec)
+    return job is not None or bool(t and t.is_alive()), live
+
+
 def reconcile_workload(rec):
     """Bring a record up to date from systemd, the cgroup and lockrun's result. Final states: exited, conflict, blocked,
-    stopped, deadline, launch_failed; containment_unknown when a recorded process still lives after the unit ended."""
+    stopped, deadline, launch_failed; containment_unknown when a recorded process still lives after the unit ended.
+    macOS: from launchd, the job's coalition and lockrun's result."""
     if rec['state'] in ('exited', 'conflict', 'blocked', 'stopped', 'deadline', 'launch_failed', 'terminated'):
         return rec
     d = os.path.join(WL, rec['id'])
-    info = show(rec['unit'], ['LoadState', 'ActiveState', 'ControlGroup', 'MainPID'])
     res = hostlib.read_json(os.path.join(d, 'result.json'), {})
-    if info.get('ControlGroup'):
-        rec['cgroup'] = info['ControlGroup']
-    if info.get('ActiveState') in ('active', 'activating', 'deactivating', 'reloading'):
-        members = hostlib.cgroup_members(f'/sys/fs/cgroup{rec.get("cgroup", "")}') if rec.get('cgroup') else None
+    if DARWIN:
+        active, live = job_active(rec, res)
+    else:
+        info = show(rec['unit'], ['LoadState', 'ActiveState', 'ControlGroup', 'MainPID'])
+        if info.get('ControlGroup'):
+            rec['cgroup'] = info['ControlGroup']
+        active = info.get('ActiveState') in ('active', 'activating', 'deactivating', 'reloading')
+    if active:
+        if DARWIN:
+            members = live
+        else:
+            members = hostlib.cgroup_members(f'/sys/fs/cgroup{rec.get("cgroup", "")}') if rec.get('cgroup') else None
         seen = {(m['pid'], m['start']) for m in rec['members_seen']}
         rec['members_seen'] += [m for m in (members or []) if (m['pid'], m['start']) not in seen][:200]
         rec['state'] = res.get('state') if res.get('state') in ('running', 'queued') else 'starting'
@@ -1178,7 +1419,10 @@ def reconcile_workload(rec):
                 rec.pop(k, None)
     else:
         # The unit has ended (collected units vanish). Every process ever seen in it, and any left in its cgroup, must be gone.
-        left = hostlib.cgroup_members(f'/sys/fs/cgroup{rec["cgroup"]}') if rec.get('cgroup') else None
+        if DARWIN:   # the coalition outlives the job while a process is in it
+            left = live if rec.get('coalition') else None
+        else:
+            left = hostlib.cgroup_members(f'/sys/fs/cgroup{rec["cgroup"]}') if rec.get('cgroup') else None
         known = rec['members_seen'] + res.get('survivors', []) + ([res['leader']] if res.get('leader') else [])
         living = [m for m in known if hostlib.alive(m)] + (left or [])
         if not res and rec['state'] == 'launching' and now() - rec['launched'] < 30:
@@ -1198,8 +1442,12 @@ def reconcile_workload(rec):
             rec['state'] = 'launch_failed'
         for k in ('waiting_for', 'queued_by'):
             rec.pop(k, None)
-        rec['verification'] = {'unit_ended': True, 'cgroup_remaining': left, 'recorded_processes': len(known),
-                               'still_alive': living, 'verified_exit': not living, 'checked_at': iso()}
+        rec['verification'] = {'unit_ended': True, 'coalition_remaining' if DARWIN else 'cgroup_remaining': left,
+                               'recorded_processes': len(known), 'still_alive': living, 'verified_exit': not living, 'checked_at': iso()}
+        if DARWIN and not living:
+            _stops.pop(rec['id'], None)
+            if rec.get('tmpdir'):   # the private TMPDIR ends with its last process, as a tmpfs does
+                shutil.rmtree(rec['tmpdir'], ignore_errors=True)
         rec['result'] = {k: v for k, v in res.items() if k in ('rc', 'state', 'evidence', 'problems', 'signal', 'survivors')}
         if rec['state'] == 'conflict' and rec.get('runner_queue_expired'):
             rec['result']['evidence'] = rec['runner_queue_expired']
@@ -1223,6 +1471,8 @@ def describe_workload(rec):
         out.update(queued_by=rec.get('queued_by'), waiting_for=rec.get('waiting_for'),
                    queued_since=iso(rec['queued_since']) if rec.get('queued_since') else None,
                    queue_deadline_at=iso(rec['queue_deadline']) if rec.get('queue_deadline') else None)
+    if rec.get('delegate'):   # macOS: podman containers are not contained (PODMAN_NOTE)
+        out['delegate'] = rec['delegate']
     out['launched_at'] = iso(rec['launched'])
     out['output_tail'] = tail(os.path.join(WL, rec['id'], 'output.log'), 20)
     return out
@@ -1295,14 +1545,19 @@ def op_workload_stop(project, sess, req):
         rec['stop_requested'] = now()
         hostlib.write_json(os.path.join(WL, rec['id'], 'record.json'), rec)
     # Only this unit's cgroup: systemd sends SIGTERM to every process in it, then SIGKILL after TimeoutStopSec.
-    r = systemctl('stop', rec['unit'], timeout=60)
+    if DARWIN:   # only this job's coalition, the same way
+        start_stop(rec).join(60)
+        r = subprocess.CompletedProcess([], 0)
+    else:
+        r = systemctl('stop', rec['unit'], timeout=60)
     for _ in range(50):
         with state_lock:
             rec = reconcile_workload(load_workload(project, rec['id']))
         if rec['state'] not in LIVE:
             break
         time.sleep(0.1)
-    audit({'op': 'workload_stop', 'id': rec['id'], 'project': project, 'session': sess, 'systemctl_rc': r.returncode, 'state': rec['state']})
+    audit({'op': 'workload_stop', 'id': rec['id'], 'project': project, 'session': sess,
+           'launchctl_rc' if DARWIN else 'systemctl_rc': r.returncode, 'state': rec['state']})
     return describe_workload(rec)
 
 
@@ -1644,7 +1899,8 @@ def capabilities(project, refresh=False):
         loaded = info.get('LoadState') == 'loaded'
         cap(f'service:{name}:inspect', 'AVAILABLE' if loaded else 'BLOCKED',
             f'{s["unit"]} {info.get("LoadState")}/{info.get("ActiveState")}', None if loaded else 'the unit is not loaded',
-            None if loaded else f'Start or install {s["unit"]} (systemctl --user).')
+            None if loaded else f'Load {s["unit"]} (launchctl bootstrap gui/{UID} PLIST).' if DARWIN
+            else f'Start or install {s["unit"]} (systemctl --user).')
         lvl = min(approval('restart'), s.get('restart', 'deny'), key=lambda x: LEVEL.get(x, 0))
         status = {'allow': 'AVAILABLE', 'ask': 'REQUIRES_AUTHORIZATION'}.get(lvl, 'REQUIRES_AUTHORIZATION')
         cap(f'service:{name}:restart', status if loaded else 'BLOCKED',
@@ -1701,16 +1957,29 @@ def capabilities(project, refresh=False):
              'Start the supervisor unit.' if problems else None if lvl == 'allow' else snippet(project, 'classes.reserve', 'allow')),
             source=origins.get(name, 'project'), **brief(r))
     # Containment.
-    app = show('app.slice', ['ControlGroup']).get('ControlGroup', '')
-    delegated = app.startswith(f'/user.slice/user-{UID}.slice/user@{UID}.service/')
-    has_kill = os.path.exists(f'/sys/fs/cgroup{app}/cgroup.kill') if app else False
-    ok = delegated and has_kill
     lvl = approval('workload')
-    cap('process_containment', 'BLOCKED' if not ok else 'AVAILABLE' if lvl == 'allow' else 'REQUIRES_AUTHORIZATION',
-        'each registered workload runs in its own transient systemd user service (own cgroup, RuntimeMaxSec deadline, '
-        'KillMode=control-group); stop affects only that cgroup and exit is verified per process identity',
-        None if ok else 'a delegated cgroup v2 user manager with cgroup.kill',
-        None if ok else 'Run on systemd with cgroup v2 (unified hierarchy).' if not delegated else None)
+    if DARWIN:
+        # A job of launchd has a coalition of its own (no process can leave it); the broker can start a Seatbelt sandbox
+        # only from outside every sandbox. The kernel has no cgroup.kill: the stop is SIGSTOP and SIGKILL rounds.
+        ok = (os.path.exists(darwin.LAUNCHCTL) and bool(darwin.coalition_of(os.getpid())) and os.path.exists(darwin.SANDBOX_EXEC)
+              and not darwin.sandboxed(os.getpid()))
+        cap('process_containment', 'BLOCKED' if not ok else 'AVAILABLE' if lvl == 'allow' else 'REQUIRES_AUTHORIZATION',
+            'each registered workload runs in its own launchd job (own resource coalition, which no process can leave; the '
+            'max_s deadline and a stop end every process of the coalition: SIGTERM, then SIGKILL after '
+            f'{STOP_GRACE_S} s); stop affects only that coalition and exit is verified per process identity. Not contained: '
+            'podman containers (they run in a virtual machine) and setuid programs (the broker cannot signal them)',
+            None if ok else 'launchd jobs with resource coalitions, and sandbox-exec, with the broker outside every sandbox',
+            None if ok else f'Run the broker as its LaunchAgent ({LABEL}: hostd.py install), not inside a sandbox.')
+    else:
+        app = show('app.slice', ['ControlGroup']).get('ControlGroup', '')
+        delegated = app.startswith(f'/user.slice/user-{UID}.slice/user@{UID}.service/')
+        has_kill = os.path.exists(f'/sys/fs/cgroup{app}/cgroup.kill') if app else False
+        ok = delegated and has_kill
+        cap('process_containment', 'BLOCKED' if not ok else 'AVAILABLE' if lvl == 'allow' else 'REQUIRES_AUTHORIZATION',
+            'each registered workload runs in its own transient systemd user service (own cgroup, RuntimeMaxSec deadline, '
+            'KillMode=control-group); stop affects only that cgroup and exit is verified per process identity',
+            None if ok else 'a delegated cgroup v2 user manager with cgroup.kill',
+            None if ok else 'Run on systemd with cgroup v2 (unified hierarchy).' if not delegated else None)
     for name, w in sorted((p.get('workloads') or {}).items()):
         changed = [path.replace('{project}', project) for path, want in (w.get('pin') or {}).items()
                    if sha256_file(path.replace('{project}', project)) != want]
@@ -1725,7 +1994,8 @@ def capabilities(project, refresh=False):
                 f'network {w.get("sandbox", {}).get("network", "offline")})'
                 if w.get('command_sandbox', True) else ', takes command: an argv the launcher runs in its own sandbox')
                if '{command}' in w['argv'] else '')
-            + (f', requires fresh {w["requires_fresh"]}' if w.get('requires_fresh') else ''),
+            + (f', requires fresh {w["requires_fresh"]}' if w.get('requires_fresh') else '')
+            + (f'; podman: {PODMAN_NOTE}' if DARWIN and w.get('delegate') else ''),
             (f'pinned files changed since approval: {changed}' if changed else None) or (None if lvl == 'allow' else 'workload approval'),
             (f'Propose the new pin with mina_host policy_propose: {{"kind": "workload_update", "name": "{name}", "repin": true}} '
              '(also "set" for other keys that must change with it). The user reviews the files and approves the diff. '
@@ -1738,7 +2008,8 @@ def capabilities(project, refresh=False):
     cap('monitoring', 'BLOCKED' if not fresh else 'AVAILABLE' if lvl == 'allow' else 'REQUIRES_AUTHORIZATION',
         'host-side monitors evaluated by the broker every few seconds, independent of the Mina session; alarms are kept '
         'until a Mina session of this project acknowledges them', None if fresh else 'the broker\'s monitor loop is not running',
-        None if fresh else 'systemctl --user restart mina-hostd' if lvl == 'allow' else snippet(project, 'classes.monitor', 'allow'))
+        None if fresh else (f'launchctl kickstart -k gui/{UID}/{LABEL}' if DARWIN else 'systemctl --user restart mina-hostd')
+        if lvl == 'allow' else snippet(project, 'classes.monitor', 'allow'))
     # Policy changes: never pre-approved. "allow" counts as "ask".
     if approval('policy') == 'deny':
         cap('policy_propose', 'REQUIRES_AUTHORIZATION', 'policy proposals are turned off for this project',
@@ -2037,9 +2308,14 @@ class Handler(socketserver.StreamRequestHandler):
 
 class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
+    if DARWIN:   # macOS refuses a connection while the listen queue is full (Linux makes the client wait): room for bursts
+        request_queue_size = 128
 
 
 def serve():
+    if DARWIN and len(os.fsencode(SOCKET)) > 103:
+        sys.exit(f'mina-hostd: the socket path {SOCKET} has {len(os.fsencode(SOCKET))} bytes; macOS allows at most 103 '
+                 '(sun_path). Set MINA_HOST_RUNTIME to a shorter folder.')
     os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
     os.chmod(RUNTIME, 0o700)
     ensure_state_dir()
@@ -2072,7 +2348,30 @@ WantedBy=default.target
 """
 
 
+def install_launchd():
+    """macOS: the broker as the LaunchAgent com.mina.hostd: started at login, started again when it fails (KeepAlive
+    unless it exited successfully, as Restart=on-failure; ThrottleInterval as RestartSec), its output in the state
+    folder. A loaded earlier version is removed first."""
+    d = os.path.expanduser('~/Library/LaunchAgents')
+    os.makedirs(d, exist_ok=True)
+    ensure_state_dir()
+    path = os.path.join(d, f'{LABEL}.plist')
+    log_file = os.path.join(STATE, 'hostd.log')
+    darwin.write_plist(path, {'Label': LABEL, 'ProgramArguments': darwin.via_helper(['/usr/bin/python3', '-I', os.path.abspath(__file__), 'serve']),
+                              'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 2,
+                              'ProcessType': 'Interactive', 'StandardInPath': '/dev/null', 'StandardOutPath': log_file,
+                              'StandardErrorPath': log_file})
+    darwin.launchctl('bootout', f'{darwin.domain()}/{LABEL}')
+    r = darwin.launchctl('bootstrap', darwin.domain(), path)
+    if r.returncode:
+        sys.exit(f'launchctl bootstrap {darwin.domain()} {path}: {r.stderr.strip()}')
+    job = darwin.job(LABEL) or {}
+    print(f'installed {path}; {LABEL} is {job.get("state") or "not loaded"}')
+
+
 def install():
+    if DARWIN:
+        return install_launchd()
     d = os.path.expanduser('~/.config/systemd/user')
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, 'mina-hostd.service')

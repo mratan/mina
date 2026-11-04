@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { renderSandboxCall, renderSandboxResult } from './renderers.mjs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { runFileOperation, workerBashOperations } from '../../sandbox/worker-client.mjs';
+import { MACOS } from '../../sandbox/sandbox.mjs';
 
 export function createSandboxTools({ cwd = process.cwd(), env = process.env, getEgressSocket = () => null } = {}) {
   const calls = new AsyncLocalStorage();
@@ -53,7 +54,7 @@ export function createSandboxTools({ cwd = process.cwd(), env = process.env, get
           const name = `command-${randomUUID()}.log`;
           const target = join(env.MINA_WORKER_OUTPUTS, name);
           await copyFile(source, target, constants.COPYFILE_EXCL);
-          return { visible: `/run/mina-outputs/${name}`, target };
+          return { visible: MACOS ? target : `/run/mina-outputs/${name}`, target }; // macOS: workers read the real path
         };
         let out;
         try { out = await execute(id, args, signal, (partial) => { spill = partial.details?.fullOutputPath ?? spill; update?.(partial); }, ctx); }

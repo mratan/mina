@@ -273,7 +273,7 @@ The agent's commands do not see the key folder.
 SearXNG is optional. Mina uses it for the `literature` and `verify` modes of `research_search`, and for the `comprehensive` and `novelty` modes of `literature_search`.
 Run SearXNG at `http://127.0.0.1:18080`, or set `SEARXNG_URL`. Enable the `json` output format in its configuration.
 
-The literature servers run in bubblewrap, also with `--nosandbox`. They connect only through a proxy for public hosts.
+The literature servers run in bubblewrap (on macOS: in a Seatbelt sandbox), also with `--nosandbox`. They connect only through a proxy for public hosts.
 Each connection goes to a log in `~/.cache/mina/mcp/<server>.egress.jsonl`. The broker keeps its cache in `~/.cache/mina/literature`.
 
 ## The sandbox
@@ -365,7 +365,7 @@ Put permanent sandbox settings in `~/.config/mina/sandbox.json`:
 
 ### Limits and instances
 
-Each launch of Mina is an instance with its own systemd scope. These limits apply to the full instance:
+Each launch of Mina is an instance with its own systemd scope (on macOS: its own launchd jobs, see [macOS](macos.md#differences-from-linux)). These limits apply to the full instance:
 
 | Limit | Default | Key in `limits` |
 |---|---|---|
@@ -533,6 +533,7 @@ The footer also shows the plan limits of the sign-in ([the models guide](models.
 |---|---|
 | `the project folder ... is or contains your home folder` | Go to a specific project folder. |
 | `bubblewrap (bwrap) is required` | Install bubblewrap. |
+| `the macOS helper is not built` or `out of date` (macOS) | Run `npm run macos:helpers`. |
 | Mina starts on an unexpected model, or reports that a model is not found | Select a model with `--model` or `MINA_MODEL`, or set Pi's default model ([models](models.md#select-a-model)). |
 | The agent cannot write a file outside the project | Restart with `--sandbox-write PATH` for that specific folder. |
 | The agent cannot see a host folder | Allow its `mina_sandbox_request`, or decide it with `/mina-sandbox`. |

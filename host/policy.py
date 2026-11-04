@@ -232,7 +232,7 @@ ENTRY_KEYS = {'classes', 'resources', 'workloads', 'services', 'monitor_paths', 
               'max_monitor_ttl_s', 'instance_budget', 'description'}
 RESOURCE_KEYS = {'locks', 'lockouts', 'requires_active', 'device', 'protocol_source', 'description'}
 LOCK_KEYS = {'path', 'turnstile', 'mode'}
-DEVICE_KEYS = {'nvidia', 'kfd'}
+DEVICE_KEYS = {'nvidia', 'kfd', 'apple_gpu'}   # apple_gpu: every Apple GPU user client (macOS)
 WORKLOAD_KEYS = {'argv', 'params', 'max_s', 'queue_s', 'resources', 'sandbox', 'command_sandbox', 'pin', 'env', 'cwd',
                  'delegate', 'cleanup', 'requires_fresh', 'instance_budget', 'description', 'runner_queue'}
 SANDBOX_KEYS = {'write', 'readonly', 'hide', 'network'}
@@ -319,15 +319,17 @@ def _resource(rep, path, r):
     if 'device' in r:
         d = r['device']
         if not isinstance(d, dict):
-            rep.err(path + ['device'], 'must be {"nvidia": [bus IDs]} or {"kfd": true}')
+            rep.err(path + ['device'], 'must be {"nvidia": [bus IDs]}, {"kfd": true} or {"apple_gpu": true}')
             return
         # An unknown device key would be ignored: the broker would then not examine the GPU users (false exclusivity).
         for k in sorted(set(d) - DEVICE_KEYS):
-            rep.err(path + ['device', k], 'unknown device kind: the broker would not examine its users (use "nvidia" or "kfd")')
+            rep.err(path + ['device', k], 'unknown device kind: the broker would not examine its users (use "nvidia", "kfd" or "apple_gpu")')
         if 'nvidia' in d and not (_strings(d['nvidia']) and d['nvidia']):
             rep.err(path + ['device', 'nvidia'], 'must be a nonempty list of PCI bus IDs')
         if 'kfd' in d and d['kfd'] is not True:
             rep.err(path + ['device', 'kfd'], 'must be true')
+        if 'apple_gpu' in d and d['apple_gpu'] is not True:
+            rep.err(path + ['device', 'apple_gpu'], 'must be true')
         if not d:
             rep.warn(path + ['device'], 'empty: no GPU users are examined')
 
@@ -1262,6 +1264,36 @@ def amd_gpus(env=None):
     return gpus, None
 
 
+IOREG = '/usr/sbin/ioreg'
+
+
+def apple_gpus(env=None):
+    """macOS: [{index, bus_id, name}] of the Apple GPUs, from the IOAccelerator entries of ioreg (MINA_HOST_IOREG
+    replaces the program, for tests). Apple silicon has no PCI bus ID: bus_id is the class of the IORegistry entry.
+    Not macOS: none, and no note."""
+    env = os.environ if env is None else env
+    if sys.platform != 'darwin' and 'MINA_HOST_IOREG' not in env:
+        return [], None
+    cmd = env.get('MINA_HOST_IOREG', IOREG)
+    try:
+        r = subprocess.run([cmd, '-r', '-c', 'IOAccelerator', '-d', '1', '-w0'], capture_output=True, text=True, timeout=20)
+    except FileNotFoundError:
+        return [], 'ioreg not found'
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return [], f'ioreg: {type(e).__name__}'
+    if r.returncode != 0:
+        return [], f'ioreg exited {r.returncode}'
+    gpus = []
+    for block in re.split(r'^\+-o ', r.stdout, flags=re.M)[1:]:
+        cls = re.search(r'<class (\w+)', block)
+        model = re.search(r'"model" = "([^"]*)"', block)
+        cores = re.search(r'"gpu-core-count" = (\d+)', block)
+        if cls:
+            name = (model.group(1) if model else cls.group(1)) + (f' ({cores.group(1)} GPU cores)' if cores else '')
+            gpus.append({'vendor': 'apple', 'index': len(gpus), 'bus_id': cls.group(1), 'name': name})
+    return gpus, None
+
+
 def _bus(b):
     return str(b).lower()[-12:]
 
@@ -1271,6 +1303,7 @@ def inventory(cfg, project=None, env=None):
     project's effective resources (an agent's view: no other project's paths)."""
     gpus_n, note_n = nvidia_gpus(env)
     gpus_a, note_a = amd_gpus(env)
+    gpus_m, note_m = apple_gpus(env)
     sets = [('machine', machine_resources(cfg))]
     if project is None:
         for p, entry in sorted((cfg.get('projects') or {}).items()):
@@ -1283,7 +1316,7 @@ def inventory(cfg, project=None, env=None):
         if isinstance(entry, dict) and isinstance(entry.get('resources'), dict):
             sets.append((source, entry['resources']))
     devices = []
-    for g in gpus_n + gpus_a:
+    for g in gpus_n + gpus_a + gpus_m:
         cover = []
         for label, rs in sets:
             for name, r in sorted(rs.items()):
@@ -1293,6 +1326,8 @@ def inventory(cfg, project=None, env=None):
                 if g['vendor'] == 'nvidia' and _bus(g['bus_id']) in {_bus(b) for b in dev.get('nvidia') or []}:
                     cover.append(f'{label}:{name}')
                 if g['vendor'] == 'amd' and dev.get('kfd') is True:
+                    cover.append(f'{label}:{name}')
+                if g['vendor'] == 'apple' and dev.get('apple_gpu') is True:
                     cover.append(f'{label}:{name}')
         devices.append({**g, 'covered_by': cover})
     locks, lockouts = {}, {}
@@ -1314,7 +1349,7 @@ def inventory(cfg, project=None, env=None):
             for lo in r.get('lockouts') or []:
                 if isinstance(lo, str):
                     lockouts.setdefault(lo, {'path': lo, 'exists': os.path.exists(lo), 'used_by': []})['used_by'].append(f'{label}:{name}')
-    notes = [n for n in (note_n, note_a) if n]
+    notes = [n for n in (note_n, note_a, note_m) if n]
     return {'devices': devices, 'locks': list(locks.values()), 'lockouts': list(lockouts.values()), 'notes': notes,
             'kfd_resources': [f'{label}:{n}' for label, rs in sets for n, r in sorted(rs.items())
                               if isinstance(r, dict) and isinstance(r.get('device'), dict) and r['device'].get('kfd') is True]}
@@ -1322,7 +1357,9 @@ def inventory(cfg, project=None, env=None):
 
 def suggestions(cfg, inv):
     """resource_set changes (scope machine) for the GPUs that no resource covers. The lock path is a placeholder in the
-    folder of the existing lock files: replace it with the lock file that your host runners use."""
+    folder of the existing lock files: replace it with the lock file that your host runners use. An Apple GPU gets no
+    suggestion: the window server and each app that draws are its users too, so an apple_gpu resource is busy while
+    they run (docs/host-profile.md, "macOS")."""
     names = set(machine_resources(cfg))
     dirs = {os.path.dirname(rec['path']) for rec in inv['locks']}
     folder = dirs.pop() if len(dirs) == 1 else '/tmp/gpu-locks'

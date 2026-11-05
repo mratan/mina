@@ -66,7 +66,7 @@ You do not need an administrator account, a Developer ID, or a separate macOS us
 |---|---|---|
 | The instance | `systemd-run --scope`: one scope for each instance | One launchd job for each instance (`com.mina.instance.ID`), with its own resource coalition. No process can leave its coalition. |
 | The terminal | The scope keeps the terminal | `mina` passes its terminal (the file descriptors 0 to 2) to the instance job. Pi uses your real terminal. `mina` passes on window size changes, Ctrl+C, Ctrl+Z, `fg`, and a closed terminal, and it returns the exit status of Pi. |
-| The outer layer (Pi) | bwrap: read-only root, private `/tmp` and runtime folder, writes only to the roots of the launch | A Seatbelt profile with the same rules: Pi reads the host; it writes only to the roots of the launch and its own temporary folder; `/private/tmp` and your temporary folder are hidden; only the sockets of Mina, the broker, and the name service are reachable; no clipboard. |
+| The outer layer (Pi) | bwrap: read-only root, private `/tmp` and runtime folder, writes only to the roots of the launch | A Seatbelt profile with the same rules: Pi reads the host; it writes only to the roots of the launch and its own temporary folder; `/private/tmp` and your temporary folder are hidden; only the sockets of Mina, the broker, and the name service are reachable. Pi can write to the clipboard and cannot read it (see below). |
 | A worker (each command and file operation) | A new bwrap with its own PID, network, and mount namespaces | A new launchd job (`com.mina.call.ID.N`) with its own coalition and a deny-by-default Seatbelt profile. When the main process of the call exits, every other process of the call stops, also a detached one. |
 | Who starts the workers | Pi, with bwrap | A process in a Seatbelt sandbox cannot start a second sandbox. Thus, Pi sends each request to the supervisor of the instance (`sandbox/macos/supervisor.mjs`). The supervisor builds the profile, refuses a write root that is not a root of the launch, and starts the call. |
 | Network of a worker | Its own loopback; a bridge to the egress proxy | Only one TCP port on localhost: the egress proxy of the instance. The proxy needs the token of the instance. |
@@ -85,6 +85,7 @@ The native helper `mina-instance` (`sandbox/macos/mina-instance.c`) is the progr
 - When a call ends, all its processes stop: background processes, `setsid`, and double forks too. A timeout or an abort stops them too.
 - A worker cannot use `open`, AppleEvents, `launchctl`, the pasteboard, the Keychain, `crontab`, or the GPU.
 - Read grants during a session apply from the next call.
+- Pi can copy to the clipboard, for example a sign-in URL with its copy key, and it cannot read the clipboard. On Linux Pi copies through the terminal (OSC 52); Terminal.app ignores OSC 52, so on macOS Pi's `pbcopy` (`sandbox/macos/pi-bin/pbcopy`) gives the text to the supervisor, which runs `/usr/bin/pbcopy` outside the sandbox. Pasting goes through the terminal, as on Linux.
 - `mina status` and `mina stop` work as on Linux. `mina stop` verifies that no process of the instance remains.
 - The literature servers and the PDF converter have their own sandboxes, with the same roots as on Linux. The PDF converter has no network and a kernel memory bound.
 
@@ -126,6 +127,7 @@ macOS protects some folders (`~/Documents`, `~/Desktop`, `~/Downloads`, iCloud D
 - **"Operation not permitted" in the agent's commands:** the path is outside the sandbox. Add it with `--sandbox-read` or `--sandbox-write`, or let the agent ask with `mina_sandbox_request`.
 - **A project in `~/Documents` fails without a prompt:** a permission was denied before. Allow `mina-instance` in System Settings → Privacy & Security → Files & Folders.
 - **The Command Line Tools are missing:** `xcode-select --install`.
+- **Selecting text with the mouse does not work:** the terminal UI uses the mouse (scrolling). In Terminal.app, turn off View → Allow Mouse Reporting (⌘R) while you select, or use Pi's copy key where it shows one.
 - **Diagnostics:** `MINA_SUPERVISOR_DEBUG=/tmp/mina-supervisor.log mina ...` writes a log of the calls and the limits.
 
 ## Tests

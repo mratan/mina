@@ -1,0 +1,6 @@
+#!/bin/sh
+# pbcopy for Pi on macOS (docs/macos.md). Pi's profile denies the pasteboard, as the outer layer of Linux hides X11 and
+# Wayland from Pi. On Linux Pi copies through the terminal (OSC 52); Terminal.app ignores OSC 52. So this pbcopy sends
+# its input to the supervisor of the instance, which runs /usr/bin/pbcopy outside the sandbox: Pi can write the
+# clipboard, and it still cannot read it (there is no pbpaste).
+exec /usr/bin/env MINA_CALL='{"kind":"clipboard"}' "$MINA_HELPER" relay "$MINA_SUPERVISOR_SOCKET"

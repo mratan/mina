@@ -97,3 +97,16 @@ test('the CPU quota throttles a busy instance', { skip }, async () => {
     assert.ok(Math.max(...walls) >= 1.4, `wall times ${walls.join(', ')} s: not throttled`);
   } finally { f.child.kill('SIGKILL'); f.close(); }
 });
+
+test('Pi copies to the clipboard through the supervisor, and cannot read it (as OSC 52 on Linux)', { skip }, async () => {
+  const saved = spawnSync('/usr/bin/pbpaste', { encoding: 'utf8' }).stdout;
+  const marker = `mina-clipboard-${process.pid}`;
+  spawnSync('/usr/bin/pbcopy', { input: 'before' });
+  const f = startInstance(`printf ${marker} | pbcopy; echo "copy=$?"; /usr/bin/pbpaste >/dev/null 2>&1; echo "paste=$?"`, base);
+  try {
+    assert.equal(await f.exited, 0, f.err());
+    assert.match(f.out(), /copy=0/);
+    assert.doesNotMatch(f.out(), /paste=0/, 'Pi cannot read the clipboard');
+    assert.equal(spawnSync('/usr/bin/pbpaste', { encoding: 'utf8' }).stdout, marker);
+  } finally { spawnSync('/usr/bin/pbcopy', { input: saved }); f.close(); }
+});

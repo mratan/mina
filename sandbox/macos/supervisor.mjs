@@ -28,6 +28,40 @@ const FILE_WORKER = join(REPO, 'sandbox', 'worker.mjs');
 // ps, pgrep and pkill for workers (sandbox/macos/mina-ps.c): first in a worker's PATH.
 export const WORKER_TOOLS = join(REPO, 'build', 'macos', 'bin');
 const SPARES = 2;
+// pbcopy for Pi (sandbox/macos/pi-bin/pbcopy): first in Pi's PATH. The copy itself is clipboardCopy below.
+const PI_BIN = join(REPO, 'sandbox', 'macos', 'pi-bin');
+const CLIPBOARD_MAX = 16 * 1024 * 1024;
+
+// The clipboard for Pi: write-only (as OSC 52 through the terminal on Linux). The relay sends the text as stdin; the
+// supervisor, outside the sandbox, gives it to /usr/bin/pbcopy and returns its exit status.
+function clipboardCopy(relay, rest) {
+  const chunks = []; let size = 0, pending = Buffer.from(rest), ended = false;
+  const reply = (code, message) => {
+    if (ended) return; ended = true;
+    if (message) relay.write(encodeFrame('E', `${message}\n`));
+    relay.end(encodeFrame('X', `${code} 0`));
+  };
+  const take = (chunk) => {
+    pending = Buffer.concat([pending, chunk]);
+    const { frames, rest: left } = decodeFrames(pending);
+    pending = Buffer.from(left);
+    for (const f of frames) {
+      if (f.type === 'I') { size += f.data.length; if (size > CLIPBOARD_MAX) return reply(1, 'mina: the text is too large for the clipboard'); chunks.push(f.data); }
+      if (f.type === 'i') {
+        relay.off('data', take);
+        const pb = spawn('/usr/bin/pbcopy', [], { stdio: ['pipe', 'ignore', 'ignore'], env: { PATH: '/usr/bin:/bin', LANG: 'en_US.UTF-8' } });
+        pb.on('error', () => reply(1, 'mina: /usr/bin/pbcopy failed'));
+        pb.on('close', (code) => reply(code ?? 1));
+        pb.stdin.end(Buffer.concat(chunks));
+        return;
+      }
+    }
+  };
+  relay.on('data', take);
+  relay.on('error', () => {});
+  relay.resume();
+  take(Buffer.alloc(0));
+}
 const HELLO_MS = 20_000;
 const contains = (root, p) => root === p || p.startsWith(root === '/' ? '/' : `${root}/`);
 const canonical = (p) => { try { return realpathSync(p); } catch { return resolve(p); } };
@@ -330,6 +364,7 @@ export async function main(specFile) {
         let req;
         try { req = JSON.parse(data.toString()); } catch { socket.destroy(); return; }
         if (closing) { socket.end(Buffer.concat([encodeFrame('F', 'mina: the instance is stopping\n'), encodeFrame('X', '125 0')])); return; }
+        if (req.kind === 'clipboard') { clipboardCopy(socket, rest); return; }
         runCall(socket, req, rest).finally(() => socket.resume());
       } else socket.destroy();
     };
@@ -348,7 +383,8 @@ export async function main(specFile) {
   writeFileSync(outerFile, outer.text, { mode: 0o600 });
   // Pi's private temporary folder is the counterpart of its private /tmp on Linux. Claude Code writes to /tmp/claude-UID
   // unless CLAUDE_CODE_TMPDIR names another folder (/private/tmp is hidden from Pi).
-  const env = { ...spec.pi.env, TMPDIR: `${piTmp}/`, CLAUDE_CODE_TMPDIR: piTmp, MINA_SUPERVISOR_SOCKET: spec.socket, MINA_HELPER: HELPER };
+  const env = { ...spec.pi.env, TMPDIR: `${piTmp}/`, CLAUDE_CODE_TMPDIR: piTmp, MINA_SUPERVISOR_SOCKET: spec.socket, MINA_HELPER: HELPER,
+    PATH: [PI_BIN, spec.pi.env.PATH].filter(Boolean).join(':') };
   // Pi leads its own process group, as the terminal's job on Linux: its suspend (kill(0, SIGTSTP)) stops Pi and its
   // children, not the supervisor; the terminal's signals go to the whole group. mina-instance pgrp sets the group and
   // execs sandbox-exec (the pid stays Pi's).

@@ -17,7 +17,7 @@ Mina (Pi with Mina's layers)
   │
   ├── web search                       research_search, web_fetch (adapters/pi-research-search)
   │      ├── Exa        semantic discovery
-  │      ├── SearXNG    local literature meta-search (optional, http://127.0.0.1:18080)
+  │      ├── SearXNG    local literature meta-search (optional, http://127.0.0.1:18080, `npm run searxng:install`)
   │      └── Brave      exact and documentation search
   │
   └── literature servers (MCP, .pi/mcp.json), each in its own sandbox
@@ -48,7 +48,7 @@ Mina itself does not load Pi's `mcp` and `codemode` extensions in the sandbox. I
 
 | Server | Package and version | Upstream | Keys | Role |
 |---|---|---|---|---|
-| `openalex` | Remote, `https://mcp.openalex.org/mcp` (Streamable HTTP). OurResearch sets the version. | [ourresearch/openalex-mcp-server](https://github.com/ourresearch/openalex-mcp-server) | OAuth: sign in once (`pi mcp login openalex`). Queries use the daily budget of your OpenAlex account. | Work search (keyword or semantic), work lookup by ID, citations and references, entities, and analysis. The tools that change your OpenAlex account are hidden (`toolExposure`). |
+| `openalex` | Remote, `https://mcp.openalex.org/mcp` (Streamable HTTP). OurResearch sets the version. | [ourresearch/openalex-mcp-server](https://github.com/ourresearch/openalex-mcp-server) | OAuth, only for plain Pi: sign in once (`pi mcp login openalex`). Queries use the daily budget of your OpenAlex account. Mina does not use this server: its tools use the OpenAlex REST API. | Work search (keyword or semantic), work lookup by ID, citations and references, entities, and analysis. The tools that change your OpenAlex account are hidden (`toolExposure`). |
 | `pubmed` | `@cyanheads/pubmed-mcp-server` 2.10.19 (npm) | [cyanheads/pubmed-mcp-server](https://github.com/cyanheads/pubmed-mcp-server) | `NCBI_API_KEY` (optional: 10 requests per second instead of 3). Contact addresses from `RESEARCH_EMAIL`, only when it is set. | PubMed search, metadata, MeSH, related and citing articles, ID conversion, Europe PMC, and full text: PMC, then Europe PMC, then Unpaywall. |
 | `biorxiv` | `@cyanheads/biorxiv-mcp-server` 0.3.0 (npm) | [cyanheads/biorxiv-mcp-server](https://github.com/cyanheads/biorxiv-mcp-server) | None. `RESEARCH_EMAIL`, if set, goes into a polite User-Agent. | Search (through Europe PMC), recent preprints, metadata with revision history, the journal link, and the full text of a version. |
 | `semantic_scholar` | `semantic-scholar-mcp` 0.4.0 (PyPI), with `mcp` 1.30.0 pinned below 2 | [hy20191108/semantic-scholar-mcp](https://github.com/hy20191108/semantic-scholar-mcp) | `SEMANTIC_SCHOLAR_API_KEY` (optional). Without it, requests share a global rate limit. | Search, lookup by DOI, PMID, or arXiv ID, references, citations, recommendations, snippets, and open-access PDF locations. |
@@ -112,7 +112,7 @@ The key files hold static keys and a contact address, with no session state. You
 Do not copy them through git, a relay, a synced folder, or a chat.
 
 Never copy state that you got from a browser sign-in: the OpenAlex sign-in (`~/.pi/agent/mcp-auth.json`), Pi's `auth.json`, or other OAuth state.
-Two machines that share a refresh token can make each other's token invalid. Run `pi mcp login openalex` on each machine.
+Two machines that share a refresh token can make each other's token invalid. Run `pi mcp login openalex` on each machine where you use it.
 Machines that share a key also share its rate limit and its billing.
 
 ## Setup
@@ -129,10 +129,11 @@ Machines that share a key also share its rate limit and its billing.
    npm run literature:install
    ```
 
-3. Optional: sign in to the OpenAlex server. This command opens or prints the authorization URL.
+3. Optional, only for plain Pi in the Mina folder: sign in to the OpenAlex server. Mina does not need this sign-in: its tools use the OpenAlex REST API with `OPENALEX_API_KEY`.
+   Pi reads the servers of `.pi/mcp.json` only when the folder is trusted: start Pi in the folder once and trust it. Then this command opens or prints the authorization URL:
 
    ```bash
-   pi mcp login openalex
+   node_modules/.bin/pi mcp login openalex
    ```
 
 4. Show each server, its state, and its tools:

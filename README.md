@@ -31,6 +31,7 @@ It sends no telemetry: traffic goes only to your model provider and to the resea
 - Node.js 22 or newer (on macOS: 24 or newer, for example `brew install node`)
 - An account for a model provider, for example a Claude subscription with Claude Code, or a ChatGPT plan for Codex
 - For the literature tools: [uv](https://docs.astral.sh/uv/) and Node.js 24 or newer (on Linux the installer can supply Node.js 24, see step 2)
+- For the literature meta-search (SearXNG): [Podman](https://podman.io) (on macOS: `brew install podman`)
 
 ## Install
 
@@ -67,7 +68,16 @@ It sends no telemetry: traffic goes only to your model provider and to the resea
 
    If `~/.local/bin` is not on your PATH yet (the default on macOS), add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile (`~/.zshrc` on macOS).
 
-4. Optional: add keys for the search services to `~/.config/mina/keys/`, or to the `keys/` folder of the checkout. All keys are optional.
+4. Install SearXNG, the literature meta-search of the research tools. It runs in Podman, on `127.0.0.1:18080` only:
+
+   ```bash
+   npm run searxng:install
+   ```
+
+   It starts at login. On macOS, Podman runs containers in a Linux VM: if you have no Podman machine, the command creates one (a download of about 1 GB).
+   Mina works without SearXNG, but its literature searches then use fewer sources. See [SearXNG](docs/usage.md#searxng).
+
+5. Optional: add keys for the search services to `~/.config/mina/keys/`, or to the `keys/` folder of the checkout. All keys are optional.
    See [keys and services](docs/usage.md#keys-and-services).
 
 Mina includes its own pinned copy of Pi. Its sign-ins and settings are the same as those of Pi, in `~/.pi/agent`.

@@ -22,6 +22,7 @@ For the guarantees themselves, read [the sandbox boundary](sandbox.md). This doc
 - The Command Line Tools: `xcode-select --install`. Mina builds two small native helpers with them.
 - Node.js 24 or newer, for example from Homebrew: `brew install node`.
 - [uv](https://docs.astral.sh/uv/), for the literature tools: `brew install uv`.
+- [Podman](https://podman.io), for SearXNG: `brew install podman`.
 - An account for a model provider, for example a Claude subscription with Claude Code.
 
 You do not need an administrator account, a Developer ID, or a separate macOS user.
@@ -52,13 +53,21 @@ You do not need an administrator account, a Developer ID, or a separate macOS us
 
    On macOS, the installer puts a Python 3.14 in the install folder, because `/usr/bin/python3` is too old. It uses the Node.js on your `PATH`.
 
-4. Put `mina` on your `PATH`:
+4. Install SearXNG:
+
+   ```bash
+   npm run searxng:install
+   ```
+
+   Podman runs containers in a Linux VM. If you have no Podman machine, the command creates one (a download of about 1 GB). The LaunchAgent `com.mina.searxng` starts the machine and SearXNG at login. See [SearXNG](usage.md#searxng).
+
+5. Put `mina` on your `PATH`:
 
    ```bash
    mkdir -p ~/.local/bin && ln -s "$PWD/bin/mina.mjs" ~/.local/bin/mina
    ```
 
-5. Sign in to Claude Code (`claude auth login --claudeai`), or to another provider. See [a first session](../README.md#a-first-session).
+6. Sign in to Claude Code (`claude auth login --claudeai`), or to another provider. See [a first session](../README.md#a-first-session).
 
 ## How it works
 
@@ -128,6 +137,7 @@ macOS protects some folders (`~/Documents`, `~/Desktop`, `~/Downloads`, iCloud D
 - **A project in `~/Documents` fails without a prompt:** a permission was denied before. Allow `mina-instance` in System Settings → Privacy & Security → Files & Folders.
 - **The Command Line Tools are missing:** `xcode-select --install`.
 - **Selecting text with the mouse does not work:** the terminal UI uses the mouse (scrolling). In Terminal.app, turn off View → Allow Mouse Reporting (⌘R) while you select, or use Pi's copy key where it shows one.
+- **SearXNG does not answer:** run `npm run searxng:status`. The login start writes to `~/Library/Logs/mina-searxng.log`. `npm run searxng:install` starts the machine and creates the container again.
 - **Diagnostics:** `MINA_SUPERVISOR_DEBUG=/tmp/mina-supervisor.log mina ...` writes a log of the calls and the limits.
 
 ## Tests

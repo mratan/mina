@@ -270,8 +270,21 @@ Put each key in a file in that folder, one `NAME=value` line for each key:
 
 The agent's commands do not see the key folder.
 
+### SearXNG
+
 SearXNG is optional. Mina uses it for the `literature` and `verify` modes of `research_search`, and for the `comprehensive` and `novelty` modes of `literature_search`.
-Run SearXNG at `http://127.0.0.1:18080`, or set `SEARXNG_URL`. Enable the `json` output format in its configuration.
+Without it, these modes use the other sources.
+
+`npm run searxng:install` runs Mina's private SearXNG in a Podman container (`mina-searxng`):
+
+- It listens on `127.0.0.1:18080` only. Set `MINA_SEARXNG_PORT` for a different port, and then `SEARXNG_URL=http://127.0.0.1:PORT` for Mina.
+- It uses the settings in `services/searxng/settings.yml` and a pinned image. The command copies the settings to `~/.config/mina/searxng/`, and the container reads them read-only. Run the command again after an update that changes them.
+- It starts at login: on Linux, through the systemd user unit `mina-searxng.service` (at boot only with lingering, `loginctl enable-linger`); on macOS, through the LaunchAgent `com.mina.searxng`, which also starts the Podman machine.
+- `npm run searxng:status` makes one search. `npm run searxng:remove` removes the container, its cache, its settings, and the login start. Podman and its machine stay.
+
+On macOS, Podman runs containers in a Linux VM, the Podman machine. If there is no machine, the command creates Podman's default machine: 4 CPUs, 2 GiB of memory, and a disk that grows up to 100 GiB. Podman shares `/Users` with this VM. The SearXNG container gets only its settings folder.
+
+You can also use your own SearXNG: run it at `http://127.0.0.1:18080`, or set `SEARXNG_URL`. Enable the `json` output format in its configuration.
 
 The literature servers run in bubblewrap (on macOS: in a Seatbelt sandbox), also with `--nosandbox`. They connect only through a proxy for public hosts.
 Each connection goes to a log in `~/.cache/mina/mcp/<server>.egress.jsonl`. The broker keeps its cache in `~/.cache/mina/literature`.

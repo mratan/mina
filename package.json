@@ -29,6 +29,9 @@
     "literature:install": "bash scripts/literature-install.sh",
     "literature:runtime": "bash scripts/literature-runtime.sh",
     "literature:smoke": "node literature/smoke.mjs",
+    "searxng:install": "bash scripts/searxng.sh install",
+    "searxng:status": "bash scripts/searxng.sh status",
+    "searxng:remove": "bash scripts/searxng.sh remove",
     "test:e2e": "node --test --test-concurrency=1 --test-timeout=1200000 test/e2e/privacy.e2e.mjs"
   },
   "engines": {

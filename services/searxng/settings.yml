@@ -1,0 +1,56 @@
+# SearXNG settings for Mina's private instance (scripts/searxng.sh). Holds no secret.
+# server.secret_key comes from SEARXNG_SECRET in ~/.config/mina/searxng/env.
+# Engine names and shortcuts verified against searx/settings.yml of image 2026.10.2-19ffbcd30.
+use_default_settings: true
+
+general:
+  instance_name: "pi-research-searxng"
+  enable_metrics: true
+
+server:
+  # The container listens on all its interfaces; the host port is published on 127.0.0.1 only.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  method: "GET"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  # JSON is required by the research_search tool (format=json).
+  formats:
+    - html
+    - json
+  # Upstream suspends an engine for 180 s after HTTP 429. PubMed (NCBI E-utilities, 3 requests/s without an API key)
+  # hits this in bursts; a shorter suspension keeps it out of fewer searches. The adapter also spaces its SearXNG calls
+  # (searxngMinIntervalMs). Evidence: docs/search/eval-2026-10-02.md.
+  suspended_times:
+    SearxEngineTooManyRequests: 60
+
+outgoing:
+  # Scholarly APIs are slower than web engines; the default 3 s drops many of them.
+  request_timeout: 6.0
+  max_request_timeout: 15.0
+
+engines:
+  # Biomedical literature.
+  - name: pubmed            # !pub
+    disabled: false
+  - name: europepmc         # !epmc
+    disabled: false
+    timeout: 10.0           # the 6 s default timed out once in eval-2026-10-02 (observed latency up to about 1.9 s otherwise)
+  # Computational / cross-domain literature.
+  - name: openalex          # !oa  (ships disabled upstream)
+    disabled: false
+    timeout: 8.0
+    # No `mailto` (polite pool): it would send a personal e-mail address to OpenAlex.
+  - name: semantic scholar  # !se
+    disabled: false
+  - name: arxiv             # !arx
+    disabled: false
+  - name: crossref          # !cr  (ships disabled upstream, timeout 30 s upstream)
+    disabled: false
+    timeout: 10.0
+  # Opportunistic: may be rate-limited or CAPTCHA-blocked; results must not depend on it.
+  - name: google scholar    # !gos
+    disabled: false

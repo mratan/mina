@@ -14,8 +14,8 @@ software that Mina installs or runs.
 
 ## Software that Mina installs or runs
 
-These packages are not in this repository. `npm install` and `scripts/literature-install.sh` download them, and their
-own licenses apply.
+These packages are not in this repository. `npm install`, `scripts/literature-install.sh` and `scripts/searxng.sh`
+download them, and their own licenses apply.
 
 - **npm dependencies** in `package-lock.json` and `services/literature-mcp/package-lock.json`, for example the Pi
   coding agent, `@cyanheads/pubmed-mcp-server`, `@cyanheads/arxiv-mcp-server` and `@cyanheads/biorxiv-mcp-server`.
@@ -26,3 +26,6 @@ own licenses apply.
   text. Artifex licenses them under the **GNU AGPL-3.0**, or under a commercial license. Mina runs them as a separate
   process in its PDF sandbox and does not include their code. If you distribute an installation that contains them, or
   offer it as a network service, read the AGPL terms first.
+- **SearXNG** (the image `docker.io/searxng/searxng`, pinned in `scripts/searxng.sh`) is licensed under the
+  **GNU AGPL-3.0**. Mina runs the unchanged image in a Podman container on `127.0.0.1` only, with its own settings
+  (`services/searxng/settings.yml`), and does not include its code.

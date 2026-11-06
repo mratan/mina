@@ -10,7 +10,8 @@ Without help, the agent must give this work to you. Or it makes a private lock t
 The host profile adds one narrow, audited route out of the sandbox. The sandbox stays on and does not change for the agent's own commands.
 
 - [The parts](#the-parts)
-- [Install and register a project](#install-and-register-a-project)
+- [Set up](#set-up)
+- [Write the policy yourself](#write-the-policy-yourself)
 - [Defaults for unregistered projects](#defaults-for-unregistered-projects)
 - [Share the GPUs of a machine](#share-the-gpus-of-a-machine)
 - [Change the host policy](#change-the-host-policy)
@@ -34,12 +35,109 @@ The host profile adds one narrow, audited route out of the sandbox. The sandbox 
 | Part | Where | What it does |
 |---|---|---|
 | Host broker | `host/hostd.py`, user service `mina-hostd` | Runs outside every sandbox. It does a fixed list of operations on what you registered, and it logs each one. No model takes part. |
-| Registry | `~/.config/mina/host.json` | The resources of the machine, and for each project its services, resources, workloads, monitor paths, and the approval level of each operation class. Optional defaults apply to unregistered projects in folders that you name. The agent cannot write it. |
+| Registry | `~/.config/mina/host.json` | The resources and services of the machine, and for each project its access level or its own entry: services, resources, workloads, monitor paths, and the approval level of each operation class. Optional defaults apply to unregistered projects in folders that you name. The agent cannot write it. |
 | Workload holder | `host/lockrun.py` | The main process of each workload unit. It takes the locks (it can wait for them), examines the resources again, runs the command, and records the result. |
-| Launcher session | `bin/mina.mjs` | Opens a host session when the broker runs and the project is registered. It binds the broker socket folder and a grant file for this launch into the outer sandbox layer. |
+| Launcher session | `bin/mina.mjs` | Opens a host session when the broker runs. On the first interactive start in a project, it asks you for the access level of the project. It binds the broker socket folder and a grant file for this launch into the outer sandbox layer. |
 | Mina client | `extensions/host/` | The `mina_host` tool, the capability list in the system prompt and in `.mina/host-capabilities.json`, and alarm delivery. |
 
-## Install and register a project
+## Set up
+
+When there is no `host.json`, the first interactive start of `mina` offers the setup once: on Linux on a machine with an NVIDIA or AMD GPU, and on macOS.
+You can also start it at any time:
+
+```bash
+mina host setup
+```
+
+The setup does these steps:
+
+1. It finds the GPUs. For each NVIDIA GPU that no resource covers, it makes a machine resource `GPU_<index>`. All AMD GPUs share one resource, `GPU_AMD`.
+   If the policy has no machine resources yet, it uses the layout of [share the GPUs of a machine](#share-the-gpus-of-a-machine):
+   each GPU resource also holds the host-quiet lock shared, `QUIET` holds it exclusive for a timed measurement, and `BUILD` holds it shared.
+   If the policy has machine resources, their scheme stays: a new GPU gets only its own lock file.
+   On macOS, the setup makes no resource for the Apple GPU, because apps and the window server use it too. Jobs can still use Metal.
+   To make GPU jobs wait for each other, add a resource with `"device": {"apple_gpu": true}` (see [differences from Linux](#differences-from-linux)).
+2. It shows the lock files that programs hold now, and asks for the folder of the GPU lock files.
+   The default is the folder of the lock files that the policy has already, or `/tmp/mina-locks`.
+   If your own scripts lock the GPUs, give their folder and use the same file names (`NAME.lock`). Then your scripts and Mina's jobs wait for each other.
+3. It asks for the longest job (default: 1 hour).
+   For trusted projects, it also asks if their jobs can use the network, and if the agent can restart services without a question (both default: no).
+4. It shows the diff and the risk flags, and writes `host.json` after you confirm.
+5. It installs and starts the broker as a user service, if it does not run: `mina-hostd` (systemd) on Linux, the LaunchAgent `com.mina.hostd` on macOS.
+   On macOS, it first builds Mina's helpers (`npm run macos:helpers`) if they are missing or out of date, after it asks you.
+   The helpers need the Command Line Tools.
+
+The setup keeps the resources and settings that the policy has already. If you run it again, it writes nothing that did not change.
+Without a terminal, give the answers as options and add `--yes`:
+
+```bash
+mina host setup --yes --lock-dir /tmp/mina-locks --max-hours 2 --network offline --restart ask
+```
+
+`--no-install` does not start the broker. The setup also does not install the user service when `MINA_HOST_CONFIG`, `MINA_HOST_STATE`, or `MINA_HOST_RUNTIME` is set, because the service uses the default paths.
+
+### The access level of a project
+
+On the first interactive start in a project that has no host policy, `mina` asks you one question before the sandbox starts:
+
+```text
+mina: this project has no host access yet: /home/you/work/myproject
+    [l] look only: it sees the GPUs and services, and changes nothing
+    [a] ask me: it runs jobs and restarts services after you approve each one
+    [t] trusted: the same, without asking
+    [n] no host access (Mina does not ask again)
+  Choice [l/a/t/n, Enter: not now]:
+```
+
+| Level | What the agent can do |
+|---|---|
+| `look` | `inventory`, `capabilities`, service status and logs (class `observe`). Nothing that changes the host. |
+| `ask` | Also jobs (`run` without a resource, and `run-NAME` for each machine resource), reservations, monitors, and service restarts. You approve each one. |
+| `trusted` | The same as `ask`, without approval. Restarts and the network follow the answers of `mina host setup` (`presets.trusted`). |
+| `none` | No host session. Mina does not ask again. |
+
+Mina saves your answer in `host.json` as `"projects": {"<path>": {"preset": "<level>"}}`. Enter saves nothing: Mina asks again at the next start.
+These rules apply:
+
+- Mina asks only when standard input and standard output are a terminal. It does not ask in print, JSON, or RPC mode (`-p`, `--mode`), or when `MINA_HOST=0` or `MINA_HOST_ASK=0` is set.
+  Without the question, the project gets the limited session (see [projects that are not registered](#projects-that-are-not-registered)).
+- Mina does not ask for a project that has its own entry, or that gets the defaults.
+- The answer is for the real path of the project. A clone in another folder, or a moved project, is a new project: Mina asks again.
+  Mina does not use the git remote to find a project, because the agent can write `.git/config`.
+- The agent cannot set a level. The broker refuses `access_set`, and a `project_register` with `preset`, from `policy_propose`.
+
+To show or change the level, use `mina host access` in the project folder. A change applies at once, also to a session that is open:
+
+```bash
+mina host access            # shows the level
+mina host access trusted    # sets it (diff, risk flags, confirmation)
+mina host access reset      # removes it: Mina asks again at the next start
+```
+
+The jobs of a preset project run in the broker's command sandbox. They can write only in the project, and they are offline unless the project is trusted and `presets.trusted.network` is `open`.
+Each job runs at most `presets.max_s` seconds (default 3600). A job that waits for a resource waits at most 900 seconds.
+
+A preset project can also have its own keys, for example a pinned workload or a service.
+The broker merges `classes`, `workloads`, `resources`, and `services` with the preset by name: an own item replaces the preset's item of the same name. Other own keys replace the preset's value.
+The agent can propose own keys with `policy_propose`, as for a registered project. `preset` stays.
+
+### Services of the machine
+
+A service that all projects use, for example a safety watchdog, goes into the top-level `services`, with an absolute `source_root`:
+
+```json
+"services": {
+ "my-safety-watchdog": {"unit": "my-safety-watchdog.service", "restart": "ask",
+                        "source_root": "/home/you/work/tools", "sources": ["watchdog.py"]}
+}
+```
+
+Every project with a host policy (own entry, preset, or defaults) gets the machine services. A service of the project with the same name replaces the machine service for that project.
+The level of the `restart` class of the project still applies.
+
+## Write the policy yourself
+
+Use this procedure for a policy that the setup does not make, for example resources that share lock files with your own runners, or a project with pinned workloads.
 
 1. Install and start the broker:
 
@@ -149,7 +247,7 @@ The host profile adds one narrow, audited route out of the sandbox. The sandbox 
 The broker reads `host.json` for each request. After a change, you do not restart it.
 
 A project that is not registered gets a full host session if `defaults` applies to it (see the next section).
-Otherwise, it gets a limited session: the agent can see the machine with `inventory` and propose a registration with `policy_propose` (see [proposals from the agent](#proposals-from-the-agent)).
+Otherwise, it gets a limited session until you give it an access level: the agent can see the machine with `inventory` and propose a registration with `policy_propose` (see [proposals from the agent](#proposals-from-the-agent)).
 An older broker that does not support proposals gives such a project no host session.
 `MINA_HOST=0` turns off the profile for one launch.
 
@@ -182,8 +280,8 @@ These rules apply:
   They also never apply in folders for credentials or in the folders of Mina's configuration and state, for example `~/.ssh` or `~/.config/mina`.
 - A project under `projects` never gets the defaults. Its entry is complete: the broker does not merge it with the defaults.
 - `{project}` in a workload of the defaults is the path of the project that uses it. This also applies to `argv`, `env`, `sandbox`, and the keys of `pin`.
-- The broker ignores `services` in the defaults, because a service belongs to one project. `capabilities` then shows a BLOCKED `services` line.
-  Thus, `requires_fresh` and `unit_active` monitors cannot work in the defaults. To give a project services, register it.
+- The broker ignores `services` in the defaults, because a service belongs to one project. The [machine services](#services-of-the-machine) apply.
+  Thus, `requires_fresh` and `unit_active` monitors in the defaults can name only machine services. To give a project its own services, register it.
 
 `session_open` gives `registered: true` and `policy_source: "defaults"` for such a project. `capabilities` also shows `policy_source`.
 Audit records for operations on such a project contain `"policy_source": "defaults"`.
@@ -251,7 +349,8 @@ A job holds all the locks of its resources while it runs.
    ```
 
 4. Give the projects access. Use one of these procedures:
-   - Register each project with workloads that use the resources (see [install and register a project](#install-and-register-a-project)).
+   - Give each project an [access level](#the-access-level-of-a-project). Its jobs get one workload for each machine resource.
+   - Register each project with workloads that use the resources (see [write the policy yourself](#write-the-policy-yourself)).
    - Give all projects in a folder the same workloads with [`defaults`](#defaults-for-unregistered-projects).
    - Start Mina in the project and let the agent propose its registration. You approve the diff in a dialog (see [proposals from the agent](#proposals-from-the-agent)).
 
@@ -330,6 +429,8 @@ The broker reads the policy for each request. After a change, you do not restart
 
 | Command | What it does |
 |---|---|
+| `mina host setup [--yes] [--lock-dir DIR] [--max-hours H] [--network offline\|open] [--restart ask\|allow] [--no-install]` | Finds the GPUs, asks a few questions, writes the policy, and starts the broker. See [set up](#set-up). |
+| `mina host access [look\|ask\|trusted\|none\|reset] [--project DIR] [--yes]` | Shows or sets the access level of the project of the current folder. See [the access level of a project](#the-access-level-of-a-project). |
 | `mina host discover [--json]` | Shows the GPUs (bus IDs), the resources that cover them, the lock files with their holders, the lockouts, and suggested resources. It changes nothing. |
 | `mina host show [PROJECT] [--json]` | Shows the effective policy of a project: its source (`project` or `defaults`), the classes, the resources, and the workloads. The default is the project of the current folder. |
 | `mina host validate` | Shows the errors and the warnings of `host.json`. |
@@ -360,6 +461,7 @@ A change list is a JSON list. Each change has a `kind`:
 | `workload_update` | `project`, `name`, and one or more of `set`, `unset`, `repin` | Only its own project |
 | `classes_set` | `project`, `classes` (merged into the current classes) | Only its own project, and not the `policy` class |
 | `monitor_paths_set` | `project`, `paths` | Only its own project |
+| `access_set` | `project`, `level` (`none`, `look`, `ask`, `trusted`, or `null` to remove it) | No |
 | `defaults_set`, `defaults_remove` | `defaults` | No |
 | `raw_set`, `raw_remove` | `path` (a list of keys), `value` | No |
 
@@ -456,7 +558,9 @@ It does not show the resources of other projects.
 
 When the broker supports proposals (`policy_protocol: "mina-policy-v1"`), the launcher opens a host session also for a project that is not registered.
 In such a session, `capabilities` shows only `inventory` and `policy_propose` (REQUIRES AUTHORIZATION). The broker refuses all other operations.
-The manifest in the system prompt tells the agent that it can see the machine and propose a registration.
+The manifest in the system prompt tells the agent that it can see the machine, and that you give access with `mina host access` in a terminal.
+After `mina host access`, the open session gets the new level at its next `capabilities` call. You do not restart Mina.
+For a project with the level `none`, `session_open` returns `declined: true` and no grant: the launcher opens no session.
 It also lists the machine-wide resources and the boundaries (see [what the agent sees](#what-the-agent-sees)).
 As before, only the launcher can open a session (`session_open`) for a project that is not registered. `MINA_HOST=0` turns off the profile.
 
@@ -838,7 +942,7 @@ The code is in `host/darwin.py`. The differences are at the end of this section.
 
 ### Install on macOS
 
-- Build the helpers first (`npm run macos:helpers`), then run `/usr/bin/python3 -I host/hostd.py install`. It writes `~/Library/LaunchAgents/com.mina.hostd.plist` and loads it with `launchctl bootstrap gui/UID`. It removes a loaded earlier version first.
+- `mina host setup` does this. By hand: build the helpers first (`npm run macos:helpers`), then run `/usr/bin/python3 -I host/hostd.py install`. It writes `~/Library/LaunchAgents/com.mina.hostd.plist` and loads it with `launchctl bootstrap gui/UID`. It removes a loaded earlier version first.
 - launchd starts the broker at login. It starts the broker again when it fails (`KeepAlive` with `SuccessfulExit` false, as `Restart=on-failure`).
 - The output of the broker goes to `~/.local/state/mina/hostd/hostd.log`.
 - The socket is `~/.local/state/mina/run/hostd/sock`, because macOS has no runtime folder such as `/run/user/UID`. `MINA_HOST_RUNTIME` sets another folder.

@@ -898,6 +898,119 @@ class ProposeTest(unittest.TestCase):
         self.assertIn('another project', e.message)
 
 
+class PresetTest(Tmp):
+    """The owner's answer for a project ({"preset": LEVEL}), the machine services, and the presets settings."""
+
+    def test_each_level_makes_its_entry_from_the_machine_resources(self):
+        self.assertIsNone(P.preset_entry('none', self.cfg))
+        self.assertIsNone(P.preset_entry('weird', self.cfg))
+        look = P.preset_entry('look', self.cfg)
+        self.assertEqual([P.level_of(look, c) for c in ('observe', 'reserve', 'workload', 'restart', 'monitor')],
+                         ['allow', 'deny', 'deny', 'deny', 'deny'])
+        self.assertNotIn('workloads', look)
+        ask = P.preset_entry('ask', self.cfg)
+        self.assertEqual([P.level_of(ask, c) for c in ('reserve', 'workload', 'restart', 'monitor')], ['ask'] * 4)
+        self.assertEqual(sorted(ask['workloads']), ['run', 'run-BUILD', 'run-GPU_A', 'run-QUIET'])
+        w = ask['workloads']['run-GPU_A']
+        self.assertEqual((w['argv'], w['resources'], w['max_s'], w['queue_s'], w['sandbox']),
+                         (['{command}'], ['GPU_A'], P.PRESET_MAX_S, P.PRESET_QUEUE_S, {'write': ['{project}'], 'network': 'offline'}))
+        trusted = P.preset_entry('trusted', self.cfg)
+        self.assertEqual([P.level_of(trusted, c) for c in ('reserve', 'workload', 'restart')], ['allow', 'allow', 'ask'])
+        self.assertEqual(trusted['workloads']['run']['sandbox']['network'], 'offline', 'trusted is offline unless the owner chose open')
+        self.cfg['presets'] = {'max_s': 7200, 'trusted': {'network': 'open', 'restart': 'allow'}}
+        trusted = P.preset_entry('trusted', self.cfg)
+        self.assertEqual((trusted['workloads']['run']['max_s'], trusted['workloads']['run']['sandbox']['network'], P.level_of(trusted, 'restart')),
+                         (7200, 'open', 'allow'))
+        ask = P.preset_entry('ask', self.cfg)
+        self.assertEqual((ask['workloads']['run']['max_s'], ask['workloads']['run']['sandbox']['network'], P.level_of(ask, 'restart')),
+                         (7200, 'offline', 'ask'), 'the trusted settings never reach "ask"')
+        self.cfg['presets'] = {'max_s': 0, 'trusted': {'network': 'packages', 'restart': 'yes'}}
+        trusted = P.preset_entry('trusted', self.cfg)
+        self.assertEqual((trusted['workloads']['run']['max_s'], trusted['workloads']['run']['sandbox']['network'], P.level_of(trusted, 'restart')),
+                         (P.PRESET_MAX_S, 'offline', 'ask'), 'a bad setting gives the safe default')
+
+    def test_own_keys_add_to_the_preset_and_none_blocks_the_defaults(self):
+        q = f'{self.tmp}/work/q'
+        self.cfg['projects'][q] = {'preset': 'ask', 'classes': {'workload': 'allow'},
+                                   'workloads': {'cell': {'argv': ['/bin/true'], 'max_s': 5}}, 'max_monitors': 2}
+        entry, source = P.entry_for(self.cfg, q)
+        self.assertEqual(source, 'project')
+        self.assertEqual((P.level_of(entry, 'workload'), P.level_of(entry, 'reserve'), entry['max_monitors']), ('allow', 'ask', 2))
+        self.assertIn('cell', entry['workloads'])
+        self.assertIn('run-GPU_A', entry['workloads'])
+        self.assertEqual(P.access_of(self.cfg, q), 'ask')
+        self.assertEqual(P.entry_for(self.cfg, f'{self.tmp}/work/r')[1], 'defaults')
+        self.cfg['projects'][f'{self.tmp}/work/r'] = {'preset': 'none'}
+        self.assertEqual(P.entry_for(self.cfg, f'{self.tmp}/work/r'), (None, None), '"none" also under a defaults root')
+        self.cfg['projects'][f'{self.tmp}/work/r'] = {'preset': 'bogus'}
+        self.assertEqual(P.entry_for(self.cfg, f'{self.tmp}/work/r'), (None, None), 'an unknown preset gives no access')
+
+    def test_validation_of_presets_machine_services_and_preset_entries(self):
+        def errors(mutate):
+            cfg = json.loads(json.dumps(self.cfg))
+            mutate(cfg)
+            return P.check(cfg)
+        q = f'{self.tmp}/work/q'
+        wd = {'unit': 'wd.service', 'sources': ['wd.py'], 'source_root': f'{self.tmp}/p1', 'restart': 'ask', 'restart_requires_idle': ['GPU_A']}
+        ok = errors(lambda c: c.update(services={'wd': wd}, presets={'max_s': 60, 'trusted': {'network': 'open', 'restart': 'allow'}},
+                                       projects={**c['projects'], q: {'preset': 'trusted', 'workloads': {
+                                           'x': {'argv': ['/bin/true'], 'requires_fresh': ['wd']}}}}))
+        self.assertEqual(ok, ([], []))
+        cases = {
+            'preset': (lambda c: c['projects'].update({q: {'preset': 'all'}}), r'projects\[.*\]\.preset: must be one of'),
+            'max_s': (lambda c: c.update(presets={'max_s': -1}), r'presets\.max_s: max_s must be a positive integer'),
+            'network': (lambda c: c.update(presets={'trusted': {'network': 'packages'}}), r'presets\.trusted\.network'),
+            'restart': (lambda c: c.update(presets={'trusted': {'restart': 'deny'}}), r'presets\.trusted\.restart: must be "allow" or "ask"'),
+            'source_root': (lambda c: c.update(services={'wd': {**wd, 'source_root': None}}), r'services\.wd\.source_root: a machine service'),
+            'idle': (lambda c: c.update(services={'wd': {**wd, 'restart_requires_idle': ['NOPE']}}), r"services\.wd\.restart_requires_idle: names 'NOPE'"),
+            'defaults': (lambda c: c['defaults'].update(preset='ask'), r'defaults\.preset: a preset is for one project'),
+            'own over preset': (lambda c: c['projects'].update({q: {'preset': 'ask', 'workloads': {'x': {'argv': []}}}}), r'workloads\.x\.argv'),
+        }
+        for name, (mutate, pattern) in cases.items():
+            with self.subTest(name):
+                self.assertTrue(any(re.search(pattern, e) for e in errors(mutate)[0]), (name, errors(mutate)))
+        _errors, warnings = errors(lambda c: c['projects'].update({q: {'preset': 'none', 'classes': {}}}))
+        self.assertTrue(any('"none"' in w for w in warnings), warnings)
+
+    def test_access_set_writes_the_answer_and_the_agent_cannot(self):
+        q = f'{self.tmp}/work/q'
+        new, _notes = P.apply_changes(self.cfg, [{'kind': 'access_set', 'level': 'ask'}], q)
+        self.assertEqual(new['projects'][q], {'preset': 'ask'})
+        self.assertEqual(P.validate(new), [])
+        new, notes = P.apply_changes(self.cfg, [{'kind': 'access_set', 'level': 'trusted', 'project': f'{self.tmp}/p1'}])
+        self.assertEqual(new['projects'][f'{self.tmp}/p1']['preset'], 'trusted')
+        self.assertIn('workloads', new['projects'][f'{self.tmp}/p1'], 'the own entry stays')
+        self.assertTrue(any('own entry' in n for n in notes), notes)
+        gone, _ = P.apply_changes(P.apply_changes(self.cfg, [{'kind': 'access_set', 'level': 'look'}], q)[0],
+                                  [{'kind': 'access_set', 'level': None}], q)
+        self.assertNotIn(q, gone['projects'], 'reset removes an entry that had only the preset')
+        with self.assertRaisesRegex(P.PolicyError, 'has no preset'):
+            P.apply_changes(self.cfg, [{'kind': 'access_set', 'level': None}], q)
+        with self.assertRaisesRegex(P.PolicyError, 'must be one of'):
+            P.apply_changes(self.cfg, [{'kind': 'access_set', 'level': 'all'}], q)
+        for change in ({'kind': 'access_set', 'level': 'trusted'}, {'kind': 'project_register', 'entry': {'preset': 'trusted'}}):
+            self.assertTrue(any('the owner\'s decision' in r for r in P.agent_refusals(self.cfg, [change], q)), change)
+        # The flags of a preset name all its any-command workloads in one line.
+        fl = P.flags(self.cfg, P.apply_changes(self.cfg, [{'kind': 'access_set', 'level': 'trusted'}], q)[0])
+        self.assertIn(f'workloads "run", "run-BUILD", "run-GPU_A", "run-QUIET" in project "{q}" run any command (the agent\'s argv)', fl)
+        self.assertTrue(any('class "workload" becomes "allow"' in f for f in fl), fl)
+
+    def test_held_lock_files_come_from_proc_locks(self):
+        held = os.path.join(self.tmp, 'locks', 'TOOL.lock')
+        open(held, 'w').close()
+        open(os.path.join(self.tmp, 'locks', 'free.lock'), 'w').close()
+        holder = subprocess.Popen([*FLOCK, '-x', held, 'sleep', '60'], start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(holder.pid, signal.SIGKILL), holder.wait()))
+        self.assertTrue(wait_for(lambda: hostlib.lock_holders(held)))
+        if not os.path.exists('/proc/locks'):
+            self.assertEqual(P.held_lock_files((self.tmp,)), [])
+            return
+        found = P.held_lock_files((self.tmp,))
+        self.assertEqual([r['path'] for r in found], [held])
+        self.assertIn(holder.pid, [h['pid'] for h in found[0]['holders']])
+        self.assertEqual(P.held_lock_files((self.tmp,), proc_locks=os.path.join(self.tmp, 'none')), [])
+
+
 class BrokerPolicyTest(unittest.TestCase):
     """The real broker over its socket: an unregistered project's session proposes its registration, the user approves,
     and the new policy applies to the next request."""
@@ -934,6 +1047,35 @@ class BrokerPolicyTest(unittest.TestCase):
         self.assertIn('"op": "policy_change"', text)
         self.assertNotIn(out['error']['approval_request']['challenge'], text)
         self.assertNotIn(grant, text)
+
+    def test_session_open_tells_the_launcher_the_access_and_none_gets_no_session(self):
+        opened = self.b.open_session(self.proj, full=True)
+        self.assertEqual((opened['registered'], opened['access'], opened['presets']), (False, None, True))
+        cfg = json.loads(rb(self.b.env['MINA_HOST_CONFIG']))
+        cfg['resources'] = {'GPU_T': {'locks': [{'path': os.path.join(self.b.locks, 'GPU_T.lock')}]}}
+        cfg['services'] = {'wd': {'unit': 'mina-test-absent.service', 'source_root': self.b.tmp, 'sources': ['wd.py']}}
+        cfg['projects'][self.proj] = {'preset': 'ask'}
+        hostlib.write_json(self.b.env['MINA_HOST_CONFIG'], cfg)
+        # The answer applies to the open session at once: the broker reads the policy on each request.
+        caps = self.b.raw({'op': 'capabilities', 'grant': opened['grant'], 'refresh': True})['result']
+        names = [c['capability'] for c in caps['capabilities']]
+        self.assertTrue(caps['registered'])
+        self.assertIn('workload:run-GPU_T', names)
+        self.assertIn('service:wd:inspect', names, 'a machine service is a service of every project with a policy')
+        again = self.b.open_session(self.proj, full=True)
+        self.assertEqual((again['registered'], again['access']), (True, 'ask'))
+        cfg['projects'][self.proj] = {'preset': 'none'}
+        hostlib.write_json(self.b.env['MINA_HOST_CONFIG'], cfg)
+        s = __import__('socket').socket(__import__('socket').AF_UNIX)
+        s.connect(self.b.sock)
+        s.sendall((json.dumps({'op': 'session_open', 'project': self.proj}) + '\n').encode())
+        data = b''
+        while not data.endswith(b'\n'):
+            data += s.recv(65536)
+        s.close()
+        out = json.loads(data)
+        self.assertTrue(out['ok'], out)
+        self.assertEqual((out['result']['declined'], out['result'].get('grant')), (True, None))
 
 
 if __name__ == '__main__':

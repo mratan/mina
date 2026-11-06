@@ -19,8 +19,10 @@
 // Pi's subcommands (install, list, config, mcp, ...) pass through unchanged, without the sandbox.
 // mina sandbox unlink-git-objects [--dry-run] DIR   gives each hard-linked git object of the clone DIR its own copy
 //   (sandbox/git-objects.mjs), for a clone that the startup check refuses.
-// mina host discover|show [PROJECT]|validate|apply FILE|- [--dry-run] [--yes]|edit [--yes]
-//   shows and changes the host policy (~/.config/mina/host.json, or $MINA_HOST_CONFIG) in your terminal: host/policy.py.
+// mina host setup|access [LEVEL]|discover|show [PROJECT]|validate|apply FILE|- [--dry-run] [--yes]|edit [--yes]
+//   sets up, shows and changes the host policy (~/.config/mina/host.json, or $MINA_HOST_CONFIG) in your terminal:
+//   host/policy.py. On an interactive start, mina offers the setup once (on a machine with GPUs), and asks once per
+//   project what the agent may do there (mina host access changes the answer).
 //   Exit status: 0 done, 1 refused or failed, 2 usage error. The agent's sandbox cannot write the policy file.
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -35,6 +37,7 @@ import { request as hostRequest } from '../extensions/host/index.js';
 import { ownerSkills } from '../lib/skill-resources.mjs';
 import { modelTuning, modelDirs, userModelsDir } from '../lib/model-tuning.mjs';
 import { homedir } from 'node:os';
+import { createInterface } from 'node:readline/promises';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -241,13 +244,76 @@ export async function openHostSession(project, env = process.env, { uid = proces
   // macOS: the broker accepts the session only from the Pi of this instance (its launchd job), so the request names it.
   const out = await hostRequest(socket, { op: 'session_open', project, label: `mina ${process.pid}`, ...(sandbox.MACOS && instance ? { instance } : {}) }, { timeoutMs: 5000 });
   if (!out.ok) return { unavailable: `${out.error.code}: ${out.error.message}` };
+  if (out.result.declined) return null;   // the owner said no for this project (mina host access none)
   if (!out.result.registered && env.MINA_HOST !== '1' && out.result.policy_protocol !== POLICY_PROTOCOL) return null;
   if (sandbox.MACOS) mkdirSync(hp.inside, { recursive: true, mode: 0o700 });
   const dir = mkdtempSync(sandbox.MACOS ? join(hp.inside, 'grant-') : join(env.XDG_RUNTIME_DIR || `/run/user/${uid}`, 'mina-grant-'));
   chmodSync(dir, 0o700);
   const grantFile = join(dir, 'grant');
   writeFileSync(grantFile, `${out.result.grant}\n`, { mode: 0o600 });
-  return { brokerDir: hp.brokerDir, grantFile, dir, session: out.result.session };
+  return { brokerDir: hp.brokerDir, grantFile, dir, session: out.result.session, project: out.result.project,
+    registered: out.result.registered === true, access: out.result.access ?? null, presets: out.result.presets === true };
+}
+
+// The owner's questions at the start: only in a terminal, and never for a run that a program reads (print, JSON or RPC
+// mode) or that only shows something. MINA_HOST_ASK=0 turns them off.
+const NOT_INTERACTIVE = ['-p', '--print', '--mode', '--export', '--list-models', '--help', '-h', '--version', '-v'];
+export function interactiveStart(argv, env = process.env, tty = { stdin: process.stdin.isTTY, stdout: process.stdout.isTTY }) {
+  return !!(tty.stdin && tty.stdout) && env.MINA_HOST !== '0' && env.MINA_HOST_ASK !== '0' && !argv.some((a) => NOT_INTERACTIVE.includes(a));
+}
+
+// Ask what the agent may do in this project: when the broker knows presets (host.presets) and the project has no host
+// policy and no answer yet. A registered project or one under defaults.roots is not asked.
+export function shouldAskAccess(host, interactive) {
+  return !!(interactive && host?.grantFile && host.presets && !host.registered && !host.access);
+}
+
+export const ACCESS_KEYS = { l: 'look', a: 'ask', t: 'trusted', n: 'none' };
+export const ACCESS_QUESTION = (project) => `mina: this project has no host access yet: ${project}\n`
+  + '  What may the agent do on this machine outside its sandbox? (GPU jobs, jobs that outlive the session, service restarts)\n'
+  + '    [l] look only: it sees the GPUs and services, and changes nothing\n'
+  + '    [a] ask me: it runs jobs and restarts services after you approve each one\n'
+  + '    [t] trusted: the same, without asking\n'
+  + '    [n] no host access (Mina does not ask again)\n'
+  + '  Change it later in the project folder with: mina host access LEVEL\n';
+
+// The answer to the access question: a level, or null (Enter: not now; Mina asks again at the next start).
+export function parseAccess(answer) {
+  const a = String(answer ?? '').trim().toLowerCase();
+  return ACCESS_KEYS[a[0]] && (a.length === 1 || Object.values(ACCESS_KEYS).includes(a)) ? ACCESS_KEYS[a[0]] : null;
+}
+
+async function question(text) {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try { return await rl.question(text); } catch { return ''; } finally { rl.close(); }
+}
+
+async function askAccess(host, env) {
+  process.stderr.write(ACCESS_QUESTION(host.project));
+  const level = parseAccess(await question('  Choice [l/a/t/n, Enter: not now]: '));
+  if (!level) { process.stderr.write('mina: not now; Mina asks again at the next start.\n'); return null; }
+  const r = spawnSync('python3', ['-I', POLICY_PY, 'access', level, '--project', host.project, '--yes', '--quiet'], { stdio: 'inherit', env });
+  if (r.status !== 0) { process.stderr.write('mina: the answer was not saved; Mina asks again at the next start.\n'); return null; }
+  process.stderr.write(`mina: host access for this project: ${level}.\n`);
+  return level;
+}
+
+// Offer the setup of the host profile once, when there is no host policy yet: on a machine with an NVIDIA or AMD GPU,
+// and on macOS (jobs that outlive a session, and launchd services). A Linux machine without a GPU is not asked.
+const gpuDevices = () => ['/dev/nvidiactl', '/dev/kfd'].some((d) => existsSync(d));
+export function hostConfigPath(env = process.env) { return env.MINA_HOST_CONFIG || join(homedir(), '.config', 'mina', 'host.json'); }
+export function setupMarker(env = process.env) { return join(dirname(hostConfigPath(env)), 'host-setup-offered'); }
+export function shouldOfferSetup(interactive, env = process.env, { gpu = gpuDevices(), macos = sandbox.MACOS } = {}) {
+  return !!(interactive && (gpu || macos) && !existsSync(hostConfigPath(env)) && !existsSync(setupMarker(env)));
+}
+
+async function offerSetup(env) {
+  process.stderr.write(gpuDevices()
+    ? 'mina: this machine has GPUs. With your approval, the agent can run GPU jobs and long jobs outside its sandbox.\n'
+    : 'mina: with your approval, the agent can run long jobs outside its sandbox and restart your services.\n');
+  const yes = /^y/i.test((await question('  Set this up now? (about a minute; later: mina host setup) [y/N]: ')).trim());
+  try { mkdirSync(dirname(setupMarker(env)), { recursive: true, mode: 0o700 }); writeFileSync(setupMarker(env), `${new Date().toISOString()}\n`, { mode: 0o600 }); } catch { /* asked again next time */ }
+  if (yes) hostCommand(['setup'], env);
 }
 
 // What the Pi process is told about the host session.
@@ -263,8 +329,11 @@ export function hostEnv(host, { sandboxed, uid = process.getuid(), env = process
 // `mina host ...`: the owner's terminal commands for the host policy. One implementation (host/policy.py) with the
 // broker's policy_propose: the same validation, change kinds, diff, risk flags and atomic write with a backup.
 export const POLICY_PY = join(REPO, 'host', 'policy.py');
-export const HOST_USAGE = 'usage: mina host discover [--json] | show [PROJECT] [--json] | validate | apply FILE|- [--project DIR] [--dry-run] [--yes] | edit [--yes]\n'
-  + '  Shows and changes the host policy (MINA_HOST_CONFIG, else ~/.config/mina/host.json). See docs/host-profile.md, "Change the host policy".\n';
+export const HOST_USAGE = 'usage: mina host setup | access [look|ask|trusted|none|reset] | discover [--json] | show [PROJECT] [--json] | validate\n'
+  + '                 | apply FILE|- [--project DIR] [--dry-run] [--yes] | edit [--yes]\n'
+  + '  setup: find the GPUs, ask a few questions, write the host policy, start the broker.\n'
+  + '  access: what the agent may do in the project of this folder.\n'
+  + '  Shows and changes the host policy (MINA_HOST_CONFIG, else ~/.config/mina/host.json). See docs/host-profile.md.\n';
 
 export function hostCommand(args, env = process.env, { cwd = env.MINA_CWD || process.cwd(), python = 'python3' } = {}) {
   if (!args.length || ['-h', '--help', 'help'].includes(args[0]) && args.length === 1) {
@@ -389,7 +458,13 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       GIT_CONFIG_KEY_2: 'credential.helper', GIT_CONFIG_VALUE_2: '' });
     if (p.args.includes('--verbose')) process.stderr.write(`mina: instance ${instance.id}; local limit ${instance.limits.maxWallS ? `${instance.limits.maxWallS}s` : 'no wall-clock deadline'}, ${instance.limits.memoryBytes} bytes, ${instance.limits.maxProcesses} processes.\nmina: explicit local stop: mina stop ${instance.id}; broker jobs remain separate.\n`);
   }
-  const host = p.passthrough || p.dryRun ? null : await openHostSession(p.sandbox?.project ?? sandbox.projectRoot(env.MINA_CWD || process.cwd()), env, { instance: instance?.id ?? null });
+  const interactive = !p.passthrough && !p.dryRun && interactiveStart(argv, env);
+  if (shouldOfferSetup(interactive, env)) await offerSetup(env);
+  let host = p.passthrough || p.dryRun ? null : await openHostSession(p.sandbox?.project ?? sandbox.projectRoot(env.MINA_CWD || process.cwd()), env, { instance: instance?.id ?? null });
+  if (shouldAskAccess(host, interactive) && await askAccess(host, env) === 'none') {
+    rmSync(host.dir, { recursive: true, force: true });
+    host = null;
+  }
   Object.assign(runEnv, hostEnv(host, { sandboxed: !!p.sandbox, env }));
   if (p.sandbox) {
     const problem = sandbox.projectProblem(p.sandbox.project);

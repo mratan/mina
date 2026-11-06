@@ -52,7 +52,9 @@ def identity(pid):
 
 
 def alive(ident):
-    """Whether this exact process (pid and start ticks) still runs. A reused pid is not it."""
+    """Whether this exact process (pid and start ticks) still runs. A reused pid is not it. No identity: not alive."""
+    if not ident:
+        return False
     st = proc_stat(ident['pid'])
     return bool(st) and st['start'] == ident['start'] and st['state'] != 'Z'
 

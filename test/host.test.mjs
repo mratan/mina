@@ -659,7 +659,7 @@ test('the manifest states the resource boundaries: machine-wide or project, excl
 test('an unregistered project with a policy-capable broker gets a one-line manifest; an older broker the full one', async () => {
   assert.equal(manifestText(UNREG_CAPS), UNREGISTERED_MANIFEST);
   assert.equal(UNREGISTERED_MANIFEST.trim().split('\n').length, 1);
-  assert.match(UNREGISTERED_MANIFEST, /^Host broker: this project is not registered\. .*mina_host inventory .*mina_host policy_propose asks the user to approve a registration\.$/m);
+  assert.match(UNREGISTERED_MANIFEST, /^Host broker: this project has no host access\. .*mina_host inventory .*`mina host access ask`.*mina_host policy_propose asks the user to approve one\.$/m);
   const old = { ...UNREG_CAPS, policy_protocol: undefined };
   assert.match(manifestText(old), /^## Host capabilities/);
   assert.match(manifestText(POLICY_CAPS), /^## Host capabilities[^]*REQUIRES AUTHORIZATION:/);

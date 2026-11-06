@@ -28,8 +28,9 @@ const ACTIONS = ['capabilities', 'inventory', 'service_status', 'service_logs', 
   'workload_status', 'workload_budget', 'workload_output', 'workload_stop', 'monitor_add', 'monitor_list', 'monitor_remove', 'alarms',
   'policy_propose'];
 // The whole manifest of a project that is not registered: one line in the system prompt of every turn.
-export const UNREGISTERED_MANIFEST = 'Host broker: this project is not registered. If you need GPUs or host jobs, mina_host inventory '
-  + 'shows the machine, and mina_host policy_propose asks the user to approve a registration.\n';
+export const UNREGISTERED_MANIFEST = 'Host broker: this project has no host access. If you need GPUs or host jobs, mina_host inventory '
+  + 'shows the machine. Ask the user to run `mina host access ask` (or look, or trusted) in a terminal in the project folder; '
+  + 'it applies at once. For a registration of its own, mina_host policy_propose asks the user to approve one.\n';
 
 // The rules for host resources, in the prompt of every session that has the host profile: short, and the same text each turn.
 export const BOUNDARIES = 'Boundaries:\n'

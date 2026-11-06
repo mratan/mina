@@ -222,11 +222,13 @@ def policy_source(project):
 
 def project_config(project):
     """The effective policy of a project, or None. Its resources are the machine resources overlaid by the policy's own
-    "resources": an entry of the policy with the same name replaces the machine entry as a whole."""
+    "resources": an entry of the policy with the same name replaces the machine entry as a whole. Its services are the
+    machine services (top-level "services") overlaid by its own in the same way."""
     entry, _source = policy_entry(project)
     if entry is None:
         return None
-    return {**entry, 'resources': {**machine_resources(), **(entry.get('resources') or {})}}
+    services = hostpolicy.effective_services(config(), entry)
+    return {**entry, 'resources': {**machine_resources(), **(entry.get('resources') or {})}, **({'services': services} if services else {})}
 
 
 def resource_origins(project):
@@ -247,9 +249,9 @@ def snippet(project, path, value):
     return f'In {CONFIG}, set projects["{project}"].{path} = {json.dumps(value)}'
 
 
-UNREGISTERED = ('Add "{project}" under "projects" in {config} (mina host apply), or make it a subfolder of a folder in '
-                '"defaults.roots" (see docs/host-profile.md). The agent can propose a registration with mina_host policy_propose; '
-                'the user approves it.')
+UNREGISTERED = ('The user gives {project} host access in a terminal, in that folder: mina host access ask (or '
+                'look, or trusted). Mina also asks at the next start. For a registration of its own, the agent can propose '
+                'one with mina_host policy_propose; the user approves it (see docs/host-profile.md).')
 
 
 def require_class(project, cls, target=None, level=None):
@@ -395,20 +397,28 @@ def op_session_open(req, pid):
     project = os.path.realpath(req.get('project') or '')
     if not os.path.isdir(project):
         raise Refusal('INVALID', f'project {project} is not a folder')
+    access = hostpolicy.access_of(config(), project)
+    if access == 'none':   # the owner said no (mina host access none): no session, and the launcher does not ask again
+        return {'declined': True, 'project': project, 'registered': False, 'access': 'none', 'presets': True,
+                'policy_protocol': POLICY_PROTOCOL}
+    launcher = hostlib.identity(pid)
+    if not launcher:
+        raise Refusal('UNAUTHENTICATED', 'caller vanished')
     grant = secrets.token_urlsafe(32)
     sid = hashlib.sha256(grant.encode()).hexdigest()[:16]
     with state_lock:
         sessions = hostlib.read_json(SESSIONS, {})
         sessions = {k: v for k, v in sessions.items() if hostlib.alive(v['launcher'])}
-        sessions[sid] = {'project': project, 'launcher': hostlib.identity(pid), 'opened': now(), 'label': str(req.get('label', ''))[:80]}
+        sessions[sid] = {'project': project, 'launcher': launcher, 'opened': now(), 'label': str(req.get('label', ''))[:80]}
         if instance:
             sessions[sid]['instance'] = instance
         hostlib.write_json(SESSIONS, sessions)
     budgets.open((project, sid))
     audit({'op': 'session_open', 'session': sid, 'project': project, 'launcher': pid})
     source = policy_source(project)
+    # presets: this broker knows {"preset": LEVEL} entries, so the launcher may ask the owner for a level (access: None).
     return {'grant': grant, 'session': sid, 'project': project, 'registered': source is not None, 'policy_source': source,
-            'policy_protocol': POLICY_PROTOCOL}
+            'policy_protocol': POLICY_PROTOCOL, 'access': access, 'presets': True}
 
 
 # --- systemd ---------------------------------------------------------------------------------------------------------

@@ -41,7 +41,7 @@ test('mina host runs host/policy.py with python3 -I; no subcommand is a usage er
     assert.equal(POLICY_PY, join(REPO, 'host', 'policy.py'));
     let r = t.mina([]);
     assert.equal(r.code, 2);
-    assert.match(r.out, /^usage: mina host discover/);
+    assert.match(r.out, /^usage: mina host setup/);
     r = t.mina(['nope']);
     assert.equal(r.code, 2);
     assert.match(r.out, /invalid choice: 'nope'/);
@@ -224,5 +224,84 @@ c.alarm_external_after_s = 60; writeFileSync(f, JSON.stringify(c));
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, /changed/);
     assert.equal(t.policy().alarm_external_after_s, 30, 'the other change stays');
+  } finally { t.done(); }
+});
+
+test('setup: fixture GPUs get lock files in the chosen folder, the presets settings are written, and the broker service is not installed for custom paths', () => {
+  const t = setup();
+  try {
+    const smi = join(t.tmp, 'nvidia-smi');
+    writeFileSync(smi, '#!/bin/sh\nprintf "0, 00000000:01:00.0, NVIDIA Fixture A\\n1, 00000000:02:00.0, NVIDIA Fixture B\\n"\n');
+    chmodSync(smi, 0o755);
+    const ioreg = join(t.tmp, 'ioreg');
+    writeFileSync(ioreg, '#!/bin/sh\n');
+    chmodSync(ioreg, 0o755);
+    const extraEnv = { MINA_HOST_NVIDIA_SMI: smi, MINA_HOST_IOREG: ioreg, MINA_HOST_RUNTIME: join(t.tmp, 'run') };
+    const locks = join(t.tmp, 'gpu-locks');
+    let r = t.mina(['setup', '--lock-dir', locks], { extraEnv });
+    assert.equal(r.code, 1, 'no terminal: refused without --yes');
+    assert.match(r.out, /nvidia 1 00000000:02:00\.0 NVIDIA Fixture B/);
+    assert.ok(!existsSync(t.config), 'nothing written');
+    r = t.mina(['setup', '--yes', '--lock-dir', locks, '--max-hours', '2', '--network', 'open'], { extraEnv });
+    assert.equal(r.code, 0, r.out);
+    const cfg = t.policy();
+    assert.deepEqual(Object.keys(cfg.resources).sort(), ['BUILD', 'GPU_0', 'GPU_1', 'QUIET']);
+    const quiet = { path: join(locks, 'HOST_QUIET.lock'), turnstile: join(locks, 'HOST_QUIET.turn') };
+    assert.deepEqual(cfg.resources.GPU_1, { description: 'NVIDIA Fixture B 1 at 00000000:02:00.0. Runs beside jobs on other GPUs, never during a timed measurement.',
+      locks: [{ ...quiet, mode: 'shared' }, { path: join(locks, 'GPU_1.lock') }], device: { nvidia: ['00000000:02:00.0'] } });
+    assert.deepEqual(cfg.resources.QUIET.locks, [quiet]);
+    assert.deepEqual(cfg.resources.BUILD.locks, [{ ...quiet, mode: 'shared' }]);
+    assert.deepEqual(cfg.presets, { max_s: 7200, trusted: { network: 'open', restart: 'ask' } });
+    assert.match(r.out, /Not installing the broker service: MINA_HOST_CONFIG, MINA_HOST_STATE, MINA_HOST_RUNTIME is set/);
+    assert.match(r.out, /Next: start mina in a project/);
+    assert.equal(t.mina(['validate']).code, 0);
+    r = t.mina(['setup', '--yes', '--lock-dir', locks, '--max-hours', '2', '--network', 'open'], { extraEnv });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /nothing to write/, 'a second setup keeps what is there');
+    assert.equal(t.backups().length, 0);
+    // A policy with machine resources keeps its own scheme: a new GPU gets only its suggested resource.
+    writeFileSync(smi, '#!/bin/sh\nprintf "0, 00000000:01:00.0, NVIDIA Fixture A\\n1, 00000000:02:00.0, NVIDIA Fixture B\\n2, 00000000:03:00.0, NVIDIA Fixture C\\n"\n');
+    r = t.mina(['setup', '--yes', '--lock-dir', locks, '--max-hours', '2', '--network', 'open'], { extraEnv });
+    assert.equal(r.code, 0, r.out);
+    assert.deepEqual(t.policy().resources.GPU_2, { locks: [{ path: join(locks, 'GPU_2.lock') }], device: { nvidia: ['00000000:03:00.0'] } });
+    assert.deepEqual(Object.keys(t.policy().resources).sort(), ['BUILD', 'GPU_0', 'GPU_1', 'GPU_2', 'QUIET']);
+  } finally { t.done(); }
+});
+
+test('access: not set, then each level, --quiet, and reset; a project with its own entry keeps it', () => {
+  const t = setup();
+  try {
+    let r = t.mina(['access']);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Access: not set \(Mina asks at the next start\)/);
+    assert.match(r.out, /trusted {2}the same, without asking/);
+    assert.equal(t.mina(['access', 'ask']).code, 1, 'no terminal: refused without --yes');
+    r = t.mina(['access', 'ask', '--yes']);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /does not exist yet: this change creates it/);
+    assert.ok(r.out.includes(`"${t.project}": {`), r.out);   // the diff wraps a long line (macOS temporary folders)
+    assert.match(r.out, /"preset": "ask"/);
+    assert.match(r.out, /workload "run" in project .* runs any command/);
+    assert.deepEqual(t.policy().projects[t.project], { preset: 'ask' });
+    r = t.mina(['show']);
+    assert.match(r.out, /Access: ask \(mina host access\)/);
+    assert.match(r.out, /Classes: observe=allow, reserve=ask, workload=ask/);
+    r = t.mina(['access', 'trusted', '--yes', '--quiet']);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(r.out, '', '--quiet prints nothing on success');
+    assert.equal(t.policy().projects[t.project].preset, 'trusted');
+    r = t.mina(['access', 'trusted', '--yes']);
+    assert.match(r.out, /access is trusted already/);
+    assert.equal(t.mina(['access', 'reset', '--yes']).code, 0);
+    assert.deepEqual(t.policy().projects, {});
+    const other = join(t.tmp, 'work', 'other');
+    mkdirSync(other);
+    assert.equal(t.mina(['apply', t.change('o.json', register(other)), '--yes']).code, 0);
+    r = t.mina(['access', 'look', '--yes'], { cwd: other });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /has its own entry: it stays/);
+    assert.deepEqual(t.policy().projects[other], { classes: { workload: 'ask' }, preset: 'look' });
+    const audit = readFileSync(join(t.tmp, 'state', 'audit.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.ok(audit.some((a) => a.via === 'mina host access' && a.level === 'trusted'), 'the quiet write is audited too');
   } finally { t.done(); }
 });

@@ -1072,6 +1072,16 @@ class HostBrokerTest(unittest.TestCase):
         self.assertEqual(out['error']['code'], 'UNAUTHENTICATED', out)
         self.assertIn('outside the sandbox', out['error']['message'])
 
+    def test_session_record_without_a_launcher_does_not_block_new_sessions(self):
+        # 2026-11-04: a launcher exited during session_open, and the broker stored launcher=None. Every later
+        # session_open then failed with TypeError when it pruned the sessions.
+        path = os.path.join(self.b.env['MINA_HOST_STATE'], 'sessions.json')
+        sessions = hostlib.read_json(path, {})
+        sessions['0000000000000000'] = {'project': self.b.project, 'launcher': None, 'opened': time.time(), 'label': 'mina 1'}
+        hostlib.write_json(path, sessions)
+        self.assertTrue(self.b.open_session())
+        self.assertNotIn('0000000000000000', hostlib.read_json(path, {}))
+
     def test_auth_session_pins_to_one_live_process(self):
         # A long-lived first caller pins the session; a second live caller with the same grant is refused.
         a = subprocess.Popen([sys.executable, self.b.client, self.b.sock], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -2274,11 +2284,13 @@ class DefaultsBrokerTest(unittest.TestCase):
         os.makedirs(runtime); os.makedirs(cwd)
         env = {'MINA_HOSTD_RUNTIME': os.path.dirname(self.b.sock), 'XDG_RUNTIME_DIR': runtime,
                'MINA_HOST_CONFIG': self.b.env['MINA_HOST_CONFIG']}
-        script = ("const m = await import(process.argv[1]); const out = {};"
-                  "for (const p of process.argv.slice(2)) out[p] = await m.openHostSession(p, JSON.parse(process.env.FIXTURE_ENV));"
+        # The module path is not argv[1]: mina.mjs runs its launcher when argv[1] is mina.mjs, and that launcher opened
+        # a session for node-cwd on the owner's live broker (2026-11-04).
+        script = ("const m = await import(process.env.FIXTURE_MODULE); const out = {};"
+                  "for (const p of process.argv.slice(1)) out[p] = await m.openHostSession(p, JSON.parse(process.env.FIXTURE_ENV));"
                   "process.stdout.write(`\\nFIXTURE ${JSON.stringify(out)}\\n`); process.exit(0);")
-        r = subprocess.run([node, '--input-type=module', '-e', script, os.path.join(hostd.REPO, 'bin', 'mina.mjs'), self.proj, self.outside],
-                           env={**os.environ, 'FIXTURE_ENV': json.dumps(env)}, cwd=cwd, capture_output=True, text=True, timeout=60)
+        r = subprocess.run([node, '--input-type=module', '-e', script, self.proj, self.outside],
+                           env={**os.environ, 'FIXTURE_ENV': json.dumps(env), 'FIXTURE_MODULE': os.path.join(hostd.REPO, 'bin', 'mina.mjs')}, cwd=cwd, capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(next(line for line in r.stdout.splitlines() if line.startswith('FIXTURE '))[8:])
         self.assertTrue(out[self.proj] and out[self.proj]['grantFile'], out)

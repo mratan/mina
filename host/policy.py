@@ -11,7 +11,9 @@ Two callers use it, so they follow the same rules:
 The broker reads the policy on each request, so a written change applies to the next request without a restart.
 Standard library only. Run it with python3 -I.
 
-usage: policy.py discover [--json]
+usage: policy.py setup [--yes] [--lock-dir DIR] [--max-hours H] [--network offline|open] [--restart ask|allow] [--no-install]
+       policy.py access [none|look|ask|trusted|reset] [--project PATH] [--yes] [--quiet]
+       policy.py discover [--json]
        policy.py show [PROJECT] [--json]
        policy.py validate
        policy.py apply FILE|- [--project PATH] [--dry-run] [--yes]
@@ -28,9 +30,11 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -44,6 +48,16 @@ NETWORKS = ('offline', 'open')
 BACKUPS_KEPT = 10
 # Folders that never get the defaults: credentials and mina's own configuration and state (relative to the home folder).
 NO_DEFAULTS = ['.ssh', '.gnupg', '.aws', '.docker', '.config/gh', '.config/mina', '.local/state/mina']
+# The owner's answer to "what may the agent do in this project?" (the launcher asks once; mina host access changes it):
+# a project entry {"preset": LEVEL}. Mina makes the entry of a preset from the machine resources, so a new machine resource
+# reaches every preset project. "none": the owner said no; the project gets no host session.
+PRESETS = ('none', 'look', 'ask', 'trusted')
+PRESET_MAX_S = 3600
+PRESET_QUEUE_S = 900
+PRESETS_KEYS = {'max_s', 'trusted'}
+TRUSTED_KEYS = {'network', 'restart'}
+# The keys of a preset project's own entry that add to the preset's (by name); its other keys replace the preset's.
+MERGED_KEYS = ('classes', 'workloads', 'resources', 'services')
 
 
 def config_path(env=None):
@@ -114,13 +128,74 @@ def template(cfg):
     return {k: copy.deepcopy(v) for k, v in d.items() if k not in ('roots', 'services')} if isinstance(d, dict) else None
 
 
+def preset_options(cfg):
+    """The owner's settings of the presets (top-level "presets", written by mina host setup), with their defaults. A bad
+    value gives the safe default (validation reports it)."""
+    p = _obj(cfg.get('presets'))
+    t = _obj(p.get('trusted'))
+    return {'max_s': p['max_s'] if 'max_s' in p and max_s_problem(p['max_s']) is None else PRESET_MAX_S,
+            'network': t['network'] if t.get('network') in NETWORKS else 'offline',
+            'restart': t['restart'] if t.get('restart') in ('allow', 'ask') else 'ask'}
+
+
+def preset_entry(level, cfg):
+    """The project entry of a preset, or None ("none", or an unknown level: no access).
+    look: the agent sees the machine and the services; it changes nothing.
+    ask: each reservation, workload, and service restart needs the owner's approval in a dialog. Workloads: "run" (a
+    command in the broker's sandbox, without a GPU, that can outlive the session) and "run-NAME" for each machine resource
+    (the same, holding the resource's locks). They write only in the project and have no network.
+    trusted: the same without a dialog; network and service restarts as the owner set them in "presets.trusted"."""
+    if level == 'look':
+        return {'classes': {'observe': 'allow'}}
+    if level not in ('ask', 'trusted'):
+        return None
+    o = preset_options(cfg)
+    trusted = level == 'trusted'
+    lvl = 'allow' if trusted else 'ask'
+    sandbox = {'write': ['{project}'], 'network': o['network'] if trusted else 'offline'}
+    workloads = {'run': {'argv': ['{command}'], 'resources': [], 'max_s': o['max_s'], 'sandbox': dict(sandbox),
+                         'description': 'a command in the broker\'s sandbox, without a GPU, that can outlive this session'}}
+    for name in sorted(machine_resources(cfg)):
+        workloads[f'run-{name}'] = {'argv': ['{command}'], 'resources': [name], 'max_s': o['max_s'], 'queue_s': PRESET_QUEUE_S,
+                                    'sandbox': dict(sandbox), 'description': f'a command that holds the machine resource {name}'}
+    return {'classes': {'observe': 'allow', 'reserve': lvl, 'workload': lvl, 'monitor': lvl,
+                        'restart': o['restart'] if trusted else 'ask'}, 'workloads': workloads}
+
+
+def expand(entry, cfg):
+    """The effective entry of a project's own entry. With "preset": the preset's entry, with the project's own keys over it
+    (an own class, workload, resource or service replaces the preset's of the same name; another key replaces the
+    preset's value). None for "none" or an unknown preset: no access. Without "preset": the entry as it is."""
+    if not isinstance(entry, dict) or 'preset' not in entry:
+        return entry
+    base = preset_entry(entry['preset'], cfg)
+    if base is None:
+        return None
+    for k, v in entry.items():
+        if k == 'preset':
+            continue
+        if k in MERGED_KEYS and isinstance(v, dict) and isinstance(base.get(k), dict):
+            base[k] = {**base[k], **copy.deepcopy(v)}
+        else:
+            base[k] = copy.deepcopy(v)
+    return base
+
+
+def access_of(cfg, project):
+    """The preset of the project's own entry ("none", "look", "ask", "trusted"), or None."""
+    e = _obj(cfg.get('projects')).get(project)
+    return e.get('preset') if isinstance(e, dict) else None
+
+
 def entry_for(cfg, project):
-    """(entry, source): the project's own entry in "projects" (source 'project'); else the "defaults" template when the
-    project is strictly inside one of its roots (source 'defaults'); else (None, None). No merging."""
+    """(entry, source): the project's own entry in "projects" (source 'project'; with "preset", the preset's entry with
+    the project's own keys over it); else the "defaults" template when the project is strictly inside one of its roots
+    (source 'defaults'); else (None, None). A project whose preset is "none" gets (None, None), also under a root."""
     projects = cfg.get('projects')
     entry = projects.get(project) if isinstance(projects, dict) else None
     if entry is not None:
-        return entry, 'project'
+        entry = expand(entry, cfg)
+        return (entry, 'project') if entry is not None else (None, None)
     d = cfg.get('defaults')
     if isinstance(d, dict) and defaults_root(project, d.get('roots')):
         return template(cfg), 'defaults'
@@ -130,6 +205,19 @@ def entry_for(cfg, project):
 def machine_resources(cfg):
     r = cfg.get('resources')
     return r if isinstance(r, dict) else {}
+
+
+def machine_services(cfg):
+    """The top-level "services": services of the machine (for example a watchdog that every project depends on), in the
+    effective services of every project that has a host policy."""
+    s = cfg.get('services')
+    return s if isinstance(s, dict) else {}
+
+
+def effective_services(cfg, entry):
+    """The machine services overlaid by the entry's own: an own service with the same name replaces the machine one."""
+    own = (entry or {}).get('services')
+    return {**machine_services(cfg), **(own if isinstance(own, dict) else {})}
 
 
 def effective_resources(cfg, entry):
@@ -227,7 +315,7 @@ def safe_text(s):
 
 # --- the schema check -----------------------------------------------------------------------------------------------
 
-TOP_KEYS = {'version', 'resources', 'projects', 'defaults', 'alarm_command', 'alarm_external_after_s'}
+TOP_KEYS = {'version', 'resources', 'services', 'presets', 'projects', 'defaults', 'alarm_command', 'alarm_external_after_s'}
 ENTRY_KEYS = {'classes', 'resources', 'workloads', 'services', 'monitor_paths', 'max_reserve_s', 'max_monitors',
               'max_monitor_ttl_s', 'instance_budget', 'description'}
 RESOURCE_KEYS = {'locks', 'lockouts', 'requires_active', 'device', 'protocol_source', 'description'}
@@ -424,12 +512,14 @@ def _workload(rep, path, w, names, services, is_defaults):
     if 'requires_fresh' in w:
         if not _strings(w['requires_fresh']):
             rep.err(path + ['requires_fresh'], 'must be a list of service names')
-        elif is_defaults and w['requires_fresh']:
-            rep.warn(path + ['requires_fresh'], 'cannot work in the defaults: the defaults have no services')
         else:
             for s in w['requires_fresh']:
-                if s not in services:
-                    rep.err(path + ['requires_fresh'], f'names {s!r}, which is not a service of this project')
+                if s in services:
+                    continue
+                if is_defaults:
+                    rep.warn(path + ['requires_fresh'], f'names {s!r}, which is not a machine service: the defaults have only the machine services')
+                else:
+                    rep.err(path + ['requires_fresh'], f'names {s!r}, which is not a service of this project or of the machine')
     if 'instance_budget' in w:
         try:
             budget_limits(w)
@@ -516,8 +606,7 @@ def _entry(rep, path, entry, cfg, is_defaults=False):
         else:
             for name, s in services.items():
                 _service(rep, path + ['services', name], s, names)
-    if is_defaults or not isinstance(services, dict):
-        services = {}
+    services = {**machine_services(cfg), **({} if is_defaults or not isinstance(services, dict) else services)}
     workloads = entry.get('workloads', {})
     if not isinstance(workloads, dict):
         rep.err(path + ['workloads'], 'must be an object of named workloads')
@@ -552,6 +641,33 @@ def check(cfg):
         rep.err(['version'], f'must be 1, not {cfg["version"]!r}')
     if 'resources' in cfg:
         _resources(rep, ['resources'], cfg['resources'])
+    if 'services' in cfg:
+        if not isinstance(cfg['services'], dict):
+            rep.err(['services'], 'must be an object of named services')
+        else:
+            for name, s in cfg['services'].items():
+                _service(rep, ['services', name], s, set(machine_resources(cfg)))
+                # A machine service belongs to no project: relative sources need a source_root of their own.
+                if isinstance(s, dict) and _strings(s.get('sources')) and any(not os.path.isabs(f) for f in s['sources']) \
+                        and not (isinstance(s.get('source_root'), str) and os.path.isabs(s['source_root'])):
+                    rep.err(['services', name, 'source_root'], 'a machine service with relative sources needs an absolute source_root')
+    if 'presets' in cfg:
+        pr = cfg['presets']
+        if not isinstance(pr, dict):
+            rep.err(['presets'], 'must be an object {max_s, trusted}')
+        else:
+            rep.unknown(['presets'], pr, PRESETS_KEYS)
+            if 'max_s' in pr and max_s_problem(pr['max_s']):
+                rep.err(['presets', 'max_s'], max_s_problem(pr['max_s']))
+            t = pr.get('trusted', {})
+            if not isinstance(t, dict):
+                rep.err(['presets', 'trusted'], 'must be an object {network, restart}')
+            else:
+                rep.unknown(['presets', 'trusted'], t, TRUSTED_KEYS)
+                if 'network' in t and network_problem(t['network']):
+                    rep.err(['presets', 'trusted', 'network'], network_problem(t['network']))
+                if 'restart' in t and t['restart'] not in ('allow', 'ask'):
+                    rep.err(['presets', 'trusted', 'restart'], f'must be "allow" or "ask", not {t["restart"]!r}')
     projects = cfg.get('projects', {})
     if not isinstance(projects, dict):
         rep.err(['projects'], 'must be an object {absolute project path: entry}')
@@ -561,9 +677,20 @@ def check(cfg):
                 rep.err(['projects', p], 'the key must be an absolute path')
             elif os.path.realpath(p) != p:
                 rep.warn(['projects', p], f'not a real path: the broker looks the project up as {os.path.realpath(p)}')
+            if isinstance(entry, dict) and 'preset' in entry:
+                if entry['preset'] not in PRESETS:
+                    rep.err(['projects', p, 'preset'], f'must be one of {list(PRESETS)}, not {entry["preset"]!r}')
+                    continue
+                if entry['preset'] == 'none':
+                    if set(entry) - {'preset'}:
+                        rep.warn(['projects', p], 'the preset is "none": the project has no host access, and its other keys are ignored')
+                    continue
+                entry = expand(entry, cfg)
             _entry(rep, ['projects', p], entry, cfg)
     if 'defaults' in cfg:
         d = cfg['defaults']
+        if isinstance(d, dict) and 'preset' in d:
+            rep.err(['defaults', 'preset'], 'a preset is for one project (mina host access), not for the defaults')
         _entry(rep, ['defaults'], d, cfg, is_defaults=True)
         if isinstance(d, dict):
             roots = d.get('roots')
@@ -589,10 +716,10 @@ def validate(cfg):
 
 # --- changes --------------------------------------------------------------------------------------------------------
 
-KINDS = ('resource_set', 'resource_remove', 'project_register', 'project_remove', 'workload_set', 'workload_update',
+KINDS = ('resource_set', 'resource_remove', 'project_register', 'project_remove', 'access_set', 'workload_set', 'workload_update',
          'workload_remove', 'classes_set', 'defaults_set', 'defaults_remove', 'monitor_paths_set', 'raw_set', 'raw_remove')
 CHANGE_KEYS = {'resource_set': {'scope', 'project', 'name', 'resource'}, 'resource_remove': {'scope', 'project', 'name'},
-               'project_register': {'project', 'entry'}, 'project_remove': {'project'},
+               'project_register': {'project', 'entry'}, 'project_remove': {'project'}, 'access_set': {'project', 'level'},
                'workload_set': {'project', 'name', 'workload'}, 'workload_remove': {'project', 'name'},
                'workload_update': {'project', 'name', 'set', 'unset', 'repin'},
                'classes_set': {'project', 'classes'}, 'defaults_set': {'defaults'}, 'defaults_remove': set(),
@@ -691,6 +818,29 @@ def apply_changes(cfg, changes, project=None):
                 if p not in (new.get('projects') or {}):
                     raise PolicyError(f'{q(p)} is not registered')
                 del new['projects'][p]
+            elif kind == 'access_set':
+                # level: a preset; None removes the preset (and the entry, if nothing else is in it).
+                level = c.get('level')
+                if level is not None and level not in PRESETS:
+                    raise PolicyError(f'"level" must be one of {list(PRESETS)}, or null to remove the preset')
+                p = _target(c, project)
+                projects = _named(new, 'projects', '"projects"')
+                entry = projects.get(p)
+                if level is None:
+                    if not isinstance(entry, dict) or 'preset' not in entry:
+                        raise PolicyError(f'{q(p)} has no preset')
+                    del entry['preset']
+                    if not entry:
+                        del projects[p]
+                elif entry is None:
+                    projects[p] = {'preset': level}
+                elif not isinstance(entry, dict):
+                    raise PolicyError(f'the entry of {q(p)} is not an object')
+                else:
+                    if 'preset' not in entry and level != 'none':
+                        notes.append(f'{q(p)} has its own entry: it stays, over the preset (its own classes, workloads, '
+                                     'resources and services replace the preset\'s of the same name).')
+                    entry['preset'] = level
             elif kind in ('workload_set', 'workload_remove'):
                 if not isinstance(c.get('name'), str) or not c['name']:
                     raise PolicyError('needs "name"')
@@ -805,6 +955,10 @@ def agent_refusals(cfg, changes, project):
             continue
         if kind == 'project_remove':
             out.append(head + 'only the owner removes a project registration. ' + owner)
+            continue
+        if kind == 'access_set' or (kind == 'project_register' and 'preset' in _obj(c.get('entry'))):
+            out.append(head + 'the access level of a project is the owner\'s decision. The owner runs `mina host access LEVEL` '
+                       'in the project folder.')
             continue
         if kind in ('resource_set', 'resource_remove') and c.get('scope') == 'machine':
             name = c.get('name')
@@ -1027,8 +1181,9 @@ def flags(old, new):
         if not isinstance(ne, dict):
             continue
         project = _scope_project(label)
-        # Workloads.
+        # Workloads. The two common flags name all their workloads in one line (a preset makes one workload per resource).
         ow = _obj(_obj(oe).get('workloads'))
+        any_command, open_net = [], []
         for name, w in sorted(_obj(ne.get('workloads')).items()):
             if not isinstance(w, dict) or same(ow.get(name), w):
                 continue
@@ -1037,10 +1192,10 @@ def flags(old, new):
             wl = f'workload {q(name)} in {label}'
             takes = '{command}' in argv
             if takes:
-                out.append(f'{wl} runs any command (the agent\'s argv)')
+                any_command.append(name)
             if takes and w.get('command_sandbox', True) is not False:
                 if sb.get('network') == 'open':
-                    out.append(f'{wl} has network "open"')
+                    open_net.append(name)
                 write_ = sb.get('write') if isinstance(sb.get('write'), list) else ['{project}']
                 outside = [p for p in write_ if not (p == '{project}' or str(p).startswith('{project}/'))]
                 if outside:
@@ -1055,6 +1210,12 @@ def flags(old, new):
                 elif now != pin[f]:
                     review = pin_review(f.replace('{project}', project), pin[f], now) if project and f.startswith(('{project}', '/')) else ''
                     out.append(f'{wl} pins a new version of {q(f)}: review the file' + (f' ({review})' if review else ''))
+        for names, one, many in ((any_command, 'runs any command (the agent\'s argv)', 'run any command (the agent\'s argv)'),
+                                 (open_net, 'has network "open"', 'have network "open"')):
+            if len(names) == 1:
+                out.append(f'workload {q(names[0])} in {label} {one}')
+            elif names:
+                out.append(f'workloads {", ".join(q(n) for n in names)} in {label} {many}')
         # Classes.
         for cls in CLASSES:
             if cls == 'policy':
@@ -1355,14 +1516,14 @@ def inventory(cfg, project=None, env=None):
                               if isinstance(r, dict) and isinstance(r.get('device'), dict) and r['device'].get('kfd') is True]}
 
 
-def suggestions(cfg, inv):
+def suggestions(cfg, inv, folder=None):
     """resource_set changes (scope machine) for the GPUs that no resource covers. The lock path is a placeholder in the
     folder of the existing lock files: replace it with the lock file that your host runners use. An Apple GPU gets no
     suggestion: the window server and each app that draws are its users too, so an apple_gpu resource is busy while
     they run (docs/host-profile.md, "macOS")."""
     names = set(machine_resources(cfg))
     dirs = {os.path.dirname(rec['path']) for rec in inv['locks']}
-    folder = dirs.pop() if len(dirs) == 1 else '/tmp/gpu-locks'
+    folder = folder or (dirs.pop() if len(dirs) == 1 else '/tmp/gpu-locks')
     out = []
 
     def fresh(base):
@@ -1385,6 +1546,85 @@ def suggestions(cfg, inv):
         out.append({'kind': 'resource_set', 'scope': 'machine', 'name': name,
                     'resource': {'locks': [{'path': os.path.join(folder, f'{name}.lock')}], 'device': {'kfd': True}}})
     return out
+
+
+def setup_resources(cfg, inv, folder):
+    """The resources of `mina host setup`. With machine resources in the policy already: the suggestions for the GPUs that
+    they do not cover (the policy's own scheme stays). Without: the layout of docs/host-profile.md, "Share the GPUs of a
+    machine": each GPU resource holds the host-quiet lock shared and its own lock; QUIET holds the host-quiet lock
+    exclusive (a timed measurement); BUILD holds it shared (a build, never during a timed measurement)."""
+    changes = suggestions(cfg, inv, folder)
+    if machine_resources(cfg) or not changes:
+        return changes
+    quiet = {'path': os.path.join(folder, 'HOST_QUIET.lock'), 'turnstile': os.path.join(folder, 'HOST_QUIET.turn')}
+    devices = {g['bus_id']: g for g in inv['devices']}
+    for c in changes:
+        r = c['resource']
+        g = devices.get((r['device'].get('nvidia') or [None])[0])
+        what = f'{g["name"]} {g["index"]} at {g["bus_id"]}' if g else 'The AMD GPUs together (the KFD process list does not separate them)'
+        r['description'] = f'{what}. Runs beside jobs on other GPUs, never during a timed measurement.'
+        r['locks'] = [{**quiet, 'mode': 'shared'}, *r['locks']]
+    names = {c['name'] for c in changes} | set(machine_resources(cfg))
+    for name, mode, text in (('QUIET', None, 'The host to itself for a timed measurement: no GPU job or build runs at the same time.'),
+                             ('BUILD', 'shared', 'A build or another CPU job: runs beside GPU jobs, never during a timed measurement.')):
+        if name not in names:
+            changes.append({'kind': 'resource_set', 'scope': 'machine', 'name': name,
+                            'resource': {'description': text, 'locks': [{**quiet, **({'mode': mode} if mode else {})}]}})
+    return changes
+
+
+LOCK_FOLDERS = ('/tmp', '/var/tmp', '/run/lock', '/var/lock', '/dev/shm')
+
+
+def held_lock_files(folders=LOCK_FOLDERS, proc_locks='/proc/locks'):
+    """[{path, holders}] of the files in these folders (and one level below) that a process holds a lock on now (Linux:
+    /proc/locks). These show the lock files of tools outside Mina that coordinate the machine. macOS: none."""
+    try:
+        with open(proc_locks) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    held = set()
+    for line in lines:
+        for field in line.split():
+            parts = field.split(':')
+            if len(parts) == 3 and all(parts) and parts[2].isdigit():
+                try:
+                    held.add((int(parts[0], 16), int(parts[1], 16), int(parts[2])))
+                except ValueError:
+                    pass
+                break
+    out = []
+    for top in folders:
+        try:
+            names = [os.path.join(top, n) for n in os.listdir(top)]
+        except OSError:
+            continue
+        for p in list(names):
+            if os.path.isdir(p) and not os.path.islink(p):
+                try:
+                    names += [os.path.join(p, n) for n in os.listdir(p)]
+                except OSError:
+                    pass
+        for p in names:
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode) and (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino) in held:
+                out.append({'path': p, 'holders': [{'pid': h['pid'], 'argv': h['argv'][:2]} for h in hostlib.lock_holders(p)
+                                                   if not h['waiting']]})
+    return sorted(out, key=lambda r: r['path'])
+
+
+def broker_socket(env=None):
+    """The socket of the broker (host/hostd.py RUNTIME)."""
+    env = os.environ if env is None else env
+    if 'MINA_HOST_RUNTIME' in env:
+        return os.path.join(env['MINA_HOST_RUNTIME'], 'sock')
+    if sys.platform == 'darwin':
+        return os.path.join(os.path.expanduser('~/.local/state/mina/run/hostd'), 'sock')
+    return f'/run/user/{os.getuid()}/mina-hostd/sock'
 
 
 # --- the owner's commands -------------------------------------------------------------------------------------------
@@ -1490,8 +1730,10 @@ def cmd_show(args):
     _say(f'Project: {project}')
     root = defaults_root(project, (cfg.get('defaults') or {}).get('roots')) if source == 'defaults' else None
     _say(f'Policy source: {source or "none"}' + (f' (defaults root {root})' if root else ''))
+    if access_of(cfg, project):
+        _say(f'Access: {access_of(cfg, project)} (mina host access)')
     if entry is None:
-        _say('This project has no host policy. Register it with `mina host apply` (kind project_register).')
+        _say('This project has no host access. Set it with `mina host access LEVEL` (look, ask or trusted).')
     else:
         _say('Classes: ' + ', '.join(f'{c}={level_of(entry, c)}' for c in CLASSES))
         sources = resource_sources(cfg, entry, source)
@@ -1587,6 +1829,211 @@ def cmd_apply(args):
     return _write_and_report(path, new, sha, 'mina host apply', fl, [c['kind'] for c in changes])
 
 
+LEVELS_HELP = ('  look     the agent sees the GPUs, the lock files and the services; it changes nothing\n'
+               '  ask      the agent can run jobs (with or without a GPU) and restart services; you approve each one\n'
+               '  trusted  the same, without asking (network and restarts as `mina host setup` set them)\n'
+               '  none     no host access, and Mina does not ask again\n'
+               '  reset    remove the answer: Mina asks again at the next start')
+
+
+def cmd_access(args):
+    """The access level of a project: what the agent may do on this machine outside its sandbox."""
+    path = config_path()
+    try:
+        cfg, sha = read(path)
+        if sha is None:
+            cfg = dict(NEW_POLICY)
+        project = canonical_project(os.path.abspath(args.project)) if args.project else project_root(os.getcwd())
+    except PolicyError as e:
+        _say(f'Refused: {e}')
+        return 1
+    if args.level is None:
+        _entry, source = entry_for(cfg, project)
+        level = access_of(cfg, project)
+        _say(f'Project: {project}')
+        _say(f'Access: {level}' if level else 'Access: own entry in host.json (mina host show)' if source == 'project'
+             else 'Access: the defaults (mina host show)' if source == 'defaults' else 'Access: not set (Mina asks at the next start)')
+        _say('Levels (mina host access LEVEL):')
+        _say(LEVELS_HELP)
+        return 0
+    level = None if args.level == 'reset' else args.level
+    try:
+        new, notes = apply_changes(cfg, [{'kind': 'access_set', 'level': level}], project)
+    except PolicyError as e:
+        _say(f'Refused: {e}')
+        return 1
+    if sha is None:
+        notes = [f'{path} does not exist yet: this change creates it.', *notes]
+    if same(cfg, new):
+        _say(f'{project}: access is {args.level} already.')
+        return 0
+    if args.quiet:
+        errors, fl = validate(new), flags(cfg if sha is not None else {}, new)
+        for e in errors:
+            _say(f'error: {e}')
+    else:
+        _text, fl, errors = _show_change(cfg if sha is not None else {}, new, notes)
+    if errors:
+        _say('Refused: the new policy has errors. Nothing was written.')
+        return 1
+    if not _confirm(args):
+        _say('Not applied.')
+        return 1
+    if args.quiet:
+        try:
+            result = write(path, new, sha)
+        except PolicyError as e:
+            _say(f'Refused: {e}')
+            return 1
+        audit({'op': 'policy_change', 'via': 'mina host access', 'kinds': ['access_set'], 'project': project, 'level': args.level,
+               'sha_before': result['sha_before'], 'sha_after': result['sha_after'], 'flags': fl, 'backup': result['backup']})
+        return 0
+    return _write_and_report(path, new, sha, 'mina host access', fl, ['access_set'])
+
+
+def _ask(question, default, given, choices=None):
+    """An answer: the command-line value if given; else the default without a terminal; else the user's (empty: default)."""
+    if given is not None:
+        return given
+    if not sys.stdin.isatty():
+        return default
+    while True:
+        try:
+            a = input(f'{question} [{default}] ').strip()
+        except EOFError:
+            return default
+        if not a:
+            return default
+        if choices is None or a.lower() in choices:
+            return a if choices is None else a.lower()
+        _say(f'  Answer one of: {", ".join(choices)}')
+
+
+def cmd_setup(args):
+    """First setup of the host profile: find the machine, ask the few things that only the owner knows, write
+    host.json, and start the broker. It keeps what the policy has already."""
+    path = config_path()
+    try:
+        cfg, sha = read(path)
+    except PolicyError as e:
+        _say(f'Refused: {e} Correct the file (mina host edit), then run setup again.')
+        return 1
+    if sha is None:
+        cfg = dict(NEW_POLICY)
+    _say('Mina host setup. The agent works in a sandbox. Here you decide what it may do on this machine outside it:')
+    _say('run jobs that outlive a session (on a GPU too, one job at a time on each GPU that Mina shares), and restart services.')
+    _say('')
+    inv = inventory(cfg)
+    _say('GPUs:' if inv['devices'] else 'GPUs: none found (jobs without a GPU still work)')
+    for g in inv['devices']:
+        _say(f'  {g["vendor"]} {g["index"]} {g["bus_id"]} {g["name"]}' + (f' (resource {", ".join(g["covered_by"])})' if g['covered_by'] else ''))
+    for n in inv['notes'] if not sys.platform == 'darwin' else ():   # macOS: no nvidia-smi or KFD is normal
+        _say(f'  ({n})')
+    if any(g['vendor'] == 'apple' and not g['covered_by'] for g in inv['devices']):
+        _say('  Setup makes no resource for the Apple GPU: apps and the window server use it too, so a job never has it to')
+        _say('  itself. Jobs can still use Metal. To make GPU jobs wait for each other, add an apple_gpu resource')
+        _say('  (docs/host-profile.md, "macOS").')
+    changes = []
+    uncovered = [g for g in inv['devices'] if not g['covered_by'] and g['vendor'] != 'apple']
+    if machine_resources(cfg):
+        _say(f'The policy has {len(machine_resources(cfg))} machine resource(s) already. Setup keeps them.')
+    if uncovered:
+        held = held_lock_files()
+        if held:
+            _say('Lock files that programs hold now (tools outside Mina that coordinate this machine):')
+            for rec in held[:10]:
+                who = ', '.join(f'pid {h["pid"]} {" ".join(h["argv"])}' for h in rec['holders'][:2])
+                _say(f'  {rec["path"]}' + (f' ({who})' if who else ''))
+        dirs = {os.path.dirname(rec['path']) for rec in inv['locks']}
+        default = dirs.pop() if len(dirs) == 1 else '/tmp/mina-locks'
+        _say('Each GPU gets a lock file. A job takes it before it uses the GPU, so two jobs never share a GPU.')
+        _say('If your own scripts lock the GPUs, give their folder: then they and Mina\'s jobs wait for each other')
+        _say('(Mina names the files NAME.lock; see docs/host-profile.md, "Resource coordination").')
+        folder = _ask('Folder for the GPU lock files?', default, args.lock_dir)
+        if not os.path.isabs(os.path.expanduser(folder)):
+            _say(f'Refused: {folder!r} is not an absolute folder. Nothing was written.')
+            return 1
+        changes += setup_resources(cfg, inv, os.path.expanduser(folder))
+    opts = preset_options(cfg)
+    hours = _ask('Longest job, in hours?', str(round(opts['max_s'] / 3600, 2)).removesuffix('.0'), args.max_hours)
+    try:
+        max_s = int(float(hours) * 3600)
+        if max_s < 1:
+            raise ValueError
+    except ValueError:
+        _say(f'Refused: {hours!r} is not a positive number of hours. Nothing was written.')
+        return 1
+    _say('Projects that you mark "trusted" run jobs without a question. Two choices for them:')
+    network = _ask('  May their jobs use the network? (no: offline)', 'no' if opts['network'] == 'offline' else 'yes',
+                   None if args.network is None else ('yes' if args.network == 'open' else 'no'), ('yes', 'no', 'y', 'n'))
+    restart = opts['restart']
+    if machine_services(cfg) or any(_obj(e).get('services') for e in _obj(cfg.get('projects')).values()):
+        restart = _ask('  May the agent restart services without a question?', 'no' if opts['restart'] == 'ask' else 'yes',
+                       None if args.restart is None else ('yes' if args.restart == 'allow' else 'no'), ('yes', 'no', 'y', 'n'))
+        restart = 'allow' if restart.startswith('y') else 'ask'
+    elif args.restart is not None:
+        restart = args.restart
+    presets = copy.deepcopy(_obj(cfg.get('presets')))
+    presets['max_s'] = max_s
+    presets['trusted'] = {**_obj(presets.get('trusted')), 'network': 'open' if network.startswith('y') else 'offline', 'restart': restart}
+    if not same(presets, cfg.get('presets')):
+        changes.append({'kind': 'raw_set', 'path': ['presets'], 'value': presets})
+    new = cfg
+    if changes:
+        try:
+            new, notes = apply_changes(cfg, changes)
+        except PolicyError as e:
+            _say(f'Refused: {e}')
+            return 1
+        _say('')
+        _say(f'The change to {path}:')
+        _text, fl, errors = _show_change(cfg if sha is not None else {}, new, notes)
+        if errors:
+            _say('Refused: the new policy has errors. Nothing was written.')
+            return 1
+        if not _confirm(args):
+            _say('Not applied.')
+            return 1
+        if _write_and_report(path, new, sha, 'mina host setup', fl, [c['kind'] for c in changes]):
+            return 1
+    else:
+        _say('The policy has these settings already: nothing to write.')
+    sock = broker_socket()
+    custom = [v for v in ('MINA_HOST_CONFIG', 'MINA_HOST_STATE', 'MINA_HOST_RUNTIME') if v in os.environ]
+    darwin = sys.platform == 'darwin'
+    helpers = os.path.join(os.path.dirname(HERE), 'scripts', 'macos-helpers.sh')
+    start = (f'npm run macos:helpers (in {os.path.dirname(HERE)}), then ' if darwin else '') + \
+        f'{"/usr/bin/python3" if darwin else "python3"} -I {os.path.join(HERE, "hostd.py")} install'
+    if os.path.exists(sock):
+        _say('The broker (mina-hostd) runs.')
+    elif args.no_install or custom:   # the user service uses the default paths: never install it for other ones (tests)
+        if custom and not args.no_install:
+            _say(f'Not installing the broker service: {", ".join(custom)} is set, and the service uses the default paths.')
+        _say(f'The broker does not run (no {sock}). Start it: {start}')
+    else:
+        # macOS: the LaunchAgent starts the broker through mina-instance (the program that holds the privacy permissions,
+        # for example for ~/Documents); without it, macOS asks for python3 (docs/host-profile.md, "macOS").
+        if darwin and subprocess.run(['/bin/bash', helpers, '--check'], capture_output=True).returncode != 0:
+            _say('The broker starts through Mina\'s macOS helper, which is not built or is out of date.')
+            build = _ask('Build it now? (needs the Command Line Tools; about 10 s)', 'yes', 'yes' if args.yes else None, ('yes', 'no', 'y', 'n'))
+            if not build.startswith('y') or subprocess.run(['/bin/bash', helpers]).returncode != 0:
+                _say(f'The broker was not started. Start it: {start}')
+                return 1
+        _say('Starting the broker (mina-hostd) as a service of your user ...')
+        r = subprocess.run(['/usr/bin/python3' if darwin else sys.executable, '-I', os.path.join(HERE, 'hostd.py'), 'install'])
+        deadline = time.time() + 10
+        while r.returncode == 0 and not os.path.exists(sock) and time.time() < deadline:
+            time.sleep(0.2)
+        if r.returncode != 0 or not os.path.exists(sock):
+            _say(f'The broker did not start. Start it: {start}')
+            return 1
+    _say('')
+    _say('Next: start mina in a project. The first time, it asks what the agent may do there:')
+    _say(LEVELS_HELP)
+    _say('Change it later in the project folder: mina host access LEVEL')
+    return 0
+
+
 def cmd_edit(args):
     path = config_path()
     try:
@@ -1640,6 +2087,18 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog='mina host', description='Show, examine and change the host policy '
                                  f'({config_path()}). The agent cannot run these commands: they need your terminal.')
     sub = ap.add_subparsers(dest='cmd', required=True)
+    p = sub.add_parser('setup', help='set up the host profile: find the GPUs, ask a few questions, write the policy, start the broker')
+    p.add_argument('--yes', action='store_true', help='apply without a question (necessary without a terminal)')
+    p.add_argument('--lock-dir', help='the folder of the GPU lock files (default: the folder of the existing ones, or /tmp/mina-locks)')
+    p.add_argument('--max-hours', help='the longest job of a preset project, in hours (default 1)')
+    p.add_argument('--network', choices=NETWORKS, help='the network of the jobs of trusted projects (default offline)')
+    p.add_argument('--restart', choices=('ask', 'allow'), help='service restarts in trusted projects (default ask)')
+    p.add_argument('--no-install', action='store_true', help='do not start the broker')
+    p = sub.add_parser('access', help='what the agent may do in a project (default: the project of this folder)')
+    p.add_argument('level', nargs='?', choices=(*PRESETS, 'reset'))
+    p.add_argument('--project', help='the project (default: the project of this folder)')
+    p.add_argument('--yes', action='store_true', help='apply without a question (necessary without a terminal)')
+    p.add_argument('--quiet', action='store_true', help='no diff (the launcher\'s question has shown the choice)')
     p = sub.add_parser('discover', help='the GPUs and lock files of this machine, and what the policy covers (read-only)')
     p.add_argument('--json', action='store_true')
     p = sub.add_parser('show', help='the effective policy of a project (default: the project of this folder)')
@@ -1654,8 +2113,8 @@ def main(argv=None):
     p = sub.add_parser('edit', help='edit the policy in $VISUAL or $EDITOR, then validate, show and confirm the change')
     p.add_argument('--yes', action='store_true', help='apply without a question (necessary without a terminal)')
     args = ap.parse_args(argv)
-    return {'discover': cmd_discover, 'show': cmd_show, 'validate': cmd_validate, 'apply': cmd_apply,
-            'edit': cmd_edit}[args.cmd](args)
+    return {'setup': cmd_setup, 'access': cmd_access, 'discover': cmd_discover, 'show': cmd_show, 'validate': cmd_validate,
+            'apply': cmd_apply, 'edit': cmd_edit}[args.cmd](args)
 
 
 if __name__ == '__main__':

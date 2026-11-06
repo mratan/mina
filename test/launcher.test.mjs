@@ -377,3 +377,37 @@ test('privacy: the environment Pi gets cannot be switched back on from the calle
     }
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
+
+test('host access question: only on an interactive start, for a session without a policy and without an answer', async () => {
+  const { interactiveStart, shouldAskAccess, parseAccess, shouldOfferSetup, setupMarker } = await import('../bin/mina.mjs');
+  const tty = { stdin: true, stdout: true };
+  assert.equal(interactiveStart(['--full'], {}, tty), true);
+  assert.equal(interactiveStart(['--full'], {}, { stdin: true, stdout: false }), false, 'output to a pipe');
+  assert.equal(interactiveStart(['--full'], {}, { stdin: false, stdout: true }), false, 'input from a pipe');
+  for (const flag of ['-p', '--print', '--mode', '--help', '--version']) assert.equal(interactiveStart([flag], {}, tty), false, flag);
+  assert.equal(interactiveStart([], { MINA_HOST_ASK: '0' }, tty), false);
+  assert.equal(interactiveStart([], { MINA_HOST: '0' }, tty), false);
+  const session = { grantFile: '/run/g', presets: true, registered: false, access: null, project: '/p' };
+  assert.equal(shouldAskAccess(session, true), true);
+  assert.equal(shouldAskAccess(session, false), false);
+  assert.equal(shouldAskAccess({ ...session, registered: true }, true), false, 'a registered or defaults project');
+  assert.equal(shouldAskAccess({ ...session, access: 'ask' }, true), false);
+  assert.equal(shouldAskAccess({ ...session, presets: false }, true), false, 'an older broker');
+  assert.equal(shouldAskAccess({ unavailable: 'down' }, true), false);
+  assert.equal(shouldAskAccess(null, true), false);
+  assert.deepEqual(['l', 'a', 't', 'n', 'ASK', ' trusted ', 'look', 'none'].map(parseAccess), ['look', 'ask', 'trusted', 'none', 'ask', 'trusted', 'look', 'none']);
+  assert.deepEqual(['', 'x', 'no', 'yes', 'al', undefined].map(parseAccess), [null, null, null, null, null, null], 'Enter or anything else: not now');
+  const dir = mkdtempSync(join(tmpdir(), 'mina-setup-offer-'));
+  try {
+    const env = { MINA_HOST_CONFIG: join(dir, 'host.json') };
+    assert.equal(shouldOfferSetup(true, env, { gpu: true, macos: false }), true);
+    assert.equal(shouldOfferSetup(true, env, { gpu: false, macos: true }), true, 'macOS: long jobs and services, without a GPU');
+    assert.equal(shouldOfferSetup(false, env, { gpu: true, macos: false }), false);
+    assert.equal(shouldOfferSetup(true, env, { gpu: false, macos: false }), false, 'Linux without a GPU: no offer');
+    writeFileSync(setupMarker(env), 'x');
+    assert.equal(shouldOfferSetup(true, env, { gpu: true, macos: true }), false, 'offered once');
+    rmSync(setupMarker(env));
+    writeFileSync(env.MINA_HOST_CONFIG, '{}');
+    assert.equal(shouldOfferSetup(true, env, { gpu: true, macos: true }), false, 'a policy exists');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

@@ -1,4 +1,4 @@
-# Mina
+# MI->NA | Mapping Information to Next Actions
 
 Mina adds research tools, checked goals, long sessions, and a sandbox to the [Pi](https://pi.dev) coding agent.
 It works with Pi's model providers, including Claude, OpenAI Codex, and local models.
@@ -7,6 +7,10 @@ You can use it for software development, literature research, and controlled job
 **Enterprise Claude:** Many enterprise deployments require the **Claude Agent SDK** route (`claude-sdk/*`), rather than Pi's direct Anthropic OAuth.
 The [Claude setup](#claude-including-enterprise-accounts) explains installation, sign-in, and the difference between these routes.
 Your organization must permit Claude Code and SDK use.
+
+> [!NOTE]
+> The name honors astronomer Williamina Fleming and her work on stellar classification.
+> Mina connects literature research to checked, sandboxed engineering work.
 
 ## Install
 

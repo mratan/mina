@@ -9,7 +9,12 @@ The [Claude setup](#claude-including-enterprise-accounts) explains installation,
 Your organization must permit Claude Code and SDK use.
 
 > [!NOTE]
-> The name honors astronomer Williamina Fleming and her work on stellar classification.
+> The name honors astronomer Williamina Fleming.
+> She [classified over 10,000 stars](https://articles.adsabs.harvard.edu/pdf/1911ApJ....34..314C) and discovered the [Horsehead Nebula](https://science.nasa.gov/asset/hubble/horsehead-nebula-infrared/) and hundreds of variable stars.
+> She [led the Harvard Computers](https://www.aip.org/history/williamina-fleming) and helped develop the observatory's system for classifying stellar spectra.
+> In 1899, she became [Curator of Astronomical Photographs](https://www.harvardmagazine.com/2016/12/williamina-fleming), the first woman to receive a Harvard Corporation appointment.
+> In 1906, she became the [first American woman elected an Honorary Member of the Royal Astronomical Society](https://www.aip.org/history/williamina-fleming/williamina-fleming-curator).
+>
 > Mina connects literature research to checked, sandboxed engineering work.
 
 ## Install

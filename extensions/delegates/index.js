@@ -114,7 +114,8 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
   // Lifecycle status is process state. Task and evidence completion are never inferred from the narrative or the receipts.
   const outcome = (r) => ({ lifecycle: r.status, task: 'unknown', evidence: 'unknown' });
   const published = (r) => ({ id: r.id, description: r.description, type: r.type, status: r.status,
-    result: r.result, error: r.error, maxTurns: r.maxTurns, turns: r.turns, tools: r.tools, transcript: r.transcript,
+    result: r.result, error: r.error, maxTurns: r.maxTurns, requestedMaxTurns: r.requestedMaxTurns, maxTurnsNote: r.maxTurnsNote,
+    turns: r.turns, tools: r.tools, transcript: r.transcript,
     requiredTools: r.requiredTools, taskId: r.taskId, supersedes: r.supersedes, revision: r.revision, resultRevision: r.resultRevision,
     receipts: receiptSummary(r), outcome: outcome(r) });
   const display = (r) => ({ startedAt: r.startedAt, completedAt: r.completedAt, toolUses: r.toolUses, lifetimeUsage: r.lifetimeUsage,
@@ -157,10 +158,11 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
     if (body === undefined && !['delegate', 'independent', 'general-purpose', 'researcher'].includes(type)) throw new Error(`Unknown agent type: ${type}`);
     const front = body?.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
     const tools = front.match(/^tools:\s*(.+)$/m)?.[1].split(',').map((s) => s.trim());
+    const turns = front.match(/^max_turns:\s*(\d+)\s*$/m)?.[1];
     return { prompt: body?.replace(/^---\n[\s\S]*?\n---\s*/, '') ?? 'Complete the assigned task. Report actual results and uncertainties.',
       tools: tools ?? (type === 'independent' ? ['read', 'grep', 'find', 'ls'] : type === 'researcher'
         ? ['read', 'grep', 'find', 'ls', ...RESEARCH] : ['read', 'write', 'edit', 'bash', ...RESEARCH]),
-      maxTurns: Number(front.match(/^max_turns:\s*(\d+)\s*$/m)?.[1] ?? 100), color: front.match(/^color:\s*(.+)$/m)?.[1].trim() };
+      maxTurns: Number(turns ?? 100), turnsFromFile: turns !== undefined, color: front.match(/^color:\s*(.+)$/m)?.[1].trim() };
   }
 
   // ---- Tasks on the current branch ----
@@ -275,6 +277,10 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
       taskBusy(r.taskId, r.id);
       checkRequired(required, r.tools, r.type, r.declaredTools);
       if (required) r.requiredTools = required;
+      const asked = args.max_turns !== undefined && args.max_turns !== r.maxTurns;
+      r.requestedMaxTurns = asked ? args.max_turns : undefined;
+      r.maxTurnsNote = asked ? `max_turns ${args.max_turns} was ignored: a resumed child keeps the turn limit of its first launch `
+        + `(${r.maxTurns}, ${r.turns} used). For a different limit, start a new child with the same task_id, within the role's ceiling.` : undefined;
     } else {
       let supersedes = validateTask(args, ctx);
       const taskId = args.task_id;
@@ -293,8 +299,13 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
       // Another task's launch may have committed while the definition loaded (B supersedes A beside A supersedes B). Check the
       // graph again now; nothing below awaits before the record is committed, so the next launch to resume sees this one.
       supersedes = validateTask(args, ctx);
-      const maxTurns = Math.min(200, d.maxTurns, args.max_turns ?? d.maxTurns);
+      // The role sets the ceiling; a call can only lower it. A request above it is reduced, and the receipt says so.
+      const ceiling = Math.min(200, d.maxTurns);
+      const maxTurns = Math.min(ceiling, args.max_turns ?? ceiling);
       if (!Number.isSafeInteger(maxTurns) || maxTurns < 1) throw new Error('max_turns must be a positive integer.');
+      const reduced = args.max_turns > maxTurns;
+      const why = d.maxTurns > 200 ? "Mina's 200-turn maximum" : d.turnsFromFile ? 'max_turns in its role file'
+        : "Mina's default for a role whose file sets no max_turns";
       const model = args.model ? (() => {
         const slash = args.model.indexOf('/');
         return ctx.modelRegistry.find(slash < 0 ? ctx.model.provider : args.model.slice(0, slash), slash < 0 ? args.model : args.model.slice(slash + 1));
@@ -310,6 +321,9 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
       const store = SessionManager.create(ctx.cwd, join(env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent'), 'mina-subagents'));
       const id = randomUUID();
       r = { id, owner, type, description: args.description ?? type, status: 'starting', maxTurns,
+        requestedMaxTurns: reduced ? args.max_turns : undefined,
+        maxTurnsNote: reduced ? `max_turns ${args.max_turns} was reduced to ${maxTurns}: the ${type} role allows at most ${ceiling} turns `
+          + `(${why}). A call can lower a role's turn limit, never raise it.` : undefined,
         turns: 0, toolUses: 0, compactionCount: 0, tools: tools.map((t) => t.name), transcript: store.getSessionFile(), color: d.color,
         lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 }, declaredTools: d.tools, requiredTools: required,
         taskId: taskId ?? id, supersedes, revision: 0, resultRevision: 0, receipts: emptyReceipts(), anchor: ctx.sessionManager?.getLeafId?.() ?? null };
@@ -445,7 +459,9 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
       + 'The receipt lists the actual tools, tool receipts (counts by outcome) and a lifecycle status; completed means the child stopped, not that its task or evidence is complete. '
       + 'task_id names a task (reuse it for a retry); supersedes records that this child replaces earlier tasks without changing their history.',
     parameters: schema({ prompt: text, description: text, subagent_type: text, model: text, thinking: text,
-      max_turns: { type: 'integer', minimum: 1, maximum: 200 }, run_in_background: { type: 'boolean' },
+      max_turns: { type: 'integer', minimum: 1, maximum: 200, description: "Turn limit for the child. The role's max_turns (default 100, at most 200) is a ceiling: "
+        + 'a call can lower it, never raise it. A larger request runs at the ceiling and the receipt shows requestedMaxTurns and maxTurnsNote. '
+        + 'A resumed child keeps the limit of its first launch.' }, run_in_background: { type: 'boolean' },
       inherit_context: { type: 'boolean' }, resume: text, isolation: text,
       required_tools: { type: 'array', items: text, maxItems: 32, description: 'Tools the child must have. Checked against its actual tools before launch; never grants a tool.' },
       task_id: { ...text, description: 'Stable task id (1-64 of A-Z a-z 0-9 . _ : -). Defaults to the child id. Reuse for a retry of the same task.' },

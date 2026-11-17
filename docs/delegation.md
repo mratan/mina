@@ -23,6 +23,14 @@ Launch and finished receipts carry `tools` (actual) and `requiredTools`.
 `supplement_get` joins the research tools a child may inherit. Only the parent's registered tool of that name is passed on, and
 only when the role declares it.
 
+## Turn limits
+
+A role's `max_turns` (in its `.md` file) is a ceiling. The default is 100 when the file sets none, and no role goes above 200.
+The `max_turns` of an `Agent` call can lower the ceiling but never raise it. A larger request runs at the ceiling. The receipt then
+carries `requestedMaxTurns` and a `maxTurnsNote` that names the ceiling and where it comes from. A resumed child keeps the
+limit of its first launch. A `max_turns` on a resume is reported in the same two fields. To give a child more turns, raise
+`max_turns` in the role file. The model cannot do this, because role files are controller resources.
+
 ## Receipts and outcome
 
 Each child record carries `receipts`, which are counted from the structured result of every finished tool call:

@@ -182,11 +182,17 @@ You do not have to manage the context. Mina does two things, and it deletes noth
 Pi's session file keeps every message and every tool output, and the agent can search them (see the table below).
 
 - **Compaction.** When the context grows, Mina prepares a summary in the background and replaces old turns with it.
-  Mina repeats the goal and the checks next to the summary.
+  Mina repeats the goal, the checks, and your standing instructions next to the summary.
+  Then it repeats your latest message word for word, so that the agent continues the work in progress.
 - **Handoff.** When the context is nearly full, the agent writes a short handoff note.
   The work then continues in a new session with the note, the goal, and the checks.
   Running broker jobs and monitors continue. The note records their IDs.
   If subagents run, the context of the current session is reset to the note instead, and the subagents continue.
+
+Mina saves each message that you type in the operator ledger of the goal. It also saves your answers to the questions of the agent.
+The agent sorts your standing instructions into entries that quote your words. Messages that are not sorted yet travel word for word.
+Thus an instruction such as "do not start Claude subagents" stays in your words after each compaction and handoff.
+When two instructions conflict, Mina asks you which one stands. See [the operator ledger](architecture.md#the-operator-ledger).
 
 A handoff also occurs at the compaction threshold after two compactions (tuning key `max_compactions`).
 The thresholds of each model are in [the models guide](models.md#context-thresholds).
@@ -196,6 +202,10 @@ The thresholds of each model are in [the models guide](models.md#context-thresho
 | `/mina-handoff` | Starts a handoff to a new session. The agent writes a note first. The handoff waits for running subagents. |
 | `/mina-handoff now` | Starts a handoff to a new session without a note. |
 | `/mina-handoff force` | Starts a handoff to a new session and stops running subagents. |
+| `/mina-ledger` | Shows the operator ledger of the goal: your standing instructions and the messages not sorted yet. |
+| `/mina-ledger add <instruction>` | Adds an instruction in your words. |
+| `/mina-ledger retire <id> [reason]`, `restore <id>` | Ends an entry, or makes it active again. |
+| `mina_ledger` (agent tool) | Records entries that quote your messages and answers, ends them, settles disputed entries from your answers, and marks messages as sorted. |
 | `/hot-compact status`, `now`, `on`, `off` | Shows or controls the compaction. |
 | `/recall <query>` | Searches the uncompacted history of this session. |
 | `context_recall` (agent tool) | Searches the uncompacted history of this session. The checkpoint refers to its entries as `event://N`. |
@@ -205,6 +215,8 @@ The thresholds of each model are in [the models guide](models.md#context-thresho
 During a handoff, Mina holds the messages that you type and delivers them in the new session.
 An automatic handoff does not wait for running subagents. It resets the context in place, and the subagents continue.
 If a handoff does not start within 120 seconds, Mina cancels it and delivers the held messages in the current session.
+If Mina stops after the agent wrote a handoff note but before the handoff, the next start asks you to finish the handoff or to discard the note.
+A note that the work has moved past is not used again.
 This limit does not apply while `/mina-handoff` waits for subagents.
 
 ## Subagents

@@ -44,7 +44,7 @@ Mina then loads only its own explicit layers, and in `--full` mode also your glo
 | Launcher | `bin/mina.mjs` | Selects the mode and the tuning file, opens the instance scope and the outer sandbox layer, opens a host session, and starts Pi with the layers. |
 | Goal layer | `extensions/goal/` | Wraps the unmodified `pi-goal` package. It adds checks, check runs at completion, questions to the user, operator procedures, provider-error recovery, reset-aware usage recovery, and the no-effect guard. |
 | Compaction | `extensions/compact/` | Wraps the unmodified `pi-hot-compact` package. It applies the thresholds of the live model, also after `/model`. |
-| Handoff | `extensions/handoff/` | Writes the handoff packet, starts the successor session, holds typed messages, and gives `mina_recall`. |
+| Handoff | `extensions/handoff/` | Writes the handoff packet, starts the successor session, holds typed messages, keeps the operator ledger, and gives `mina_recall`. |
 | Research | `adapters/pi-research-search/`, `extensions/literature/`, `literature/` | `research_search`, `web_fetch`, the literature broker tools, `literature_db`, and `supplement_get`. See [research literature](research-literature.md). |
 | Sandbox | `sandbox/`, `extensions/sandbox/`, `lib/instance-runtime.mjs` | The worker for each command and file operation, the protected check runner, and the systemd scope of the instance. See [the sandbox boundary](sandbox.md). |
 | Subagents | `extensions/delegates/` | The `Agent` tool: bounded children with a fixed tool set and recorded receipts. See [delegation](delegation.md). |
@@ -143,6 +143,37 @@ Subagents run in the Pi process of the session, and a new session stops them. Th
 - The next handoff that finds no running subagent starts a new session. Nothing waits for that time.
 
 Only `/mina-handoff` asks for a new session. It waits for running subagents, or stops them with `force`.
+
+### Continuity of the work in progress
+
+After each compaction, Mina adds one message after the summary. It contains the goal and its checks, the operator ledger, and, at the end, the work in progress.
+The work in progress is the latest message of the user, word for word, and the latest words of the agent.
+The message tells the agent to continue that work. The goal restatement is a reminder, not a new start.
+The reason: the model follows the last instruction in its context. An order to read the goal file again pushed an open request of the user aside.
+
+A recorded handoff note describes the session only at the time when the agent wrote it.
+Thus `/mina-handoff` uses a recorded note only if no compaction and no model reply came after it, and no handoff used it.
+Otherwise, the packet uses the automatic summary.
+If the run that writes the note is interrupted, Mina asks for the note one more time.
+If Mina stops between the note and the handoff, the next start asks you to finish the handoff with that note or to discard the note.
+
+### The operator ledger
+
+In a long run you steer through the conversation, not through the goal file. A summary paraphrases, and a paraphrase can weaken or drop an instruction.
+The operator ledger keeps your instructions in your own words:
+
+- Mina saves each message that you type, word for word, in the session file. Mina also saves each answer that you give to a question of the agent (`mina_ask_user`), with the question.
+  An answer shows if you typed it or if you chose an option that the agent wrote. Messages from extensions and goal continuations are not saved there.
+- The agent sorts the messages with `mina_ledger` into entries: directive, constraint, priority, task, or fact. Each entry quotes its message. Mina refuses a quote that is not in the message. The reading of the agent is a separate field.
+- After each compaction and in each handoff packet, Mina restates the active entries and the unsorted messages word for word. The packet size limit does not apply to them.
+- An entry ends only when a later message of yours replaces it. The agent must quote that message. A task also ends when the agent records the evidence that it is done.
+- If an entry seems to conflict with another entry or with the goal text, the agent records the conflict. Mina then asks you. Your answer is saved as a message, and it decides which entry stands.
+  If no terminal is available, the entry stays disputed. When you answer later, for example to `mina_ask_user`, the agent settles the entry. It must quote your answer.
+- The ledger belongs to the goal. A new goal starts an empty ledger.
+
+The goal text and its checks stay the acceptance bar. No ledger entry relaxes a protected check.
+The session file is the store. Mina writes a copy to `.mina/operator-ledger.md` for you to read.
+Mina never reads that file back. If it changed outside Mina, Mina moves the changed copy aside and tells you. To change the ledger, use `/mina-ledger`.
 
 ## Model tuning files
 

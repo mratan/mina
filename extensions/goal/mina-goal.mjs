@@ -21,7 +21,7 @@ export { hashCheckFiles, changedFiles } from './check-files.mjs';
 import { record } from '../handoff/metrics.mjs';
 import { tuningForModel } from '../handoff/policy.mjs';
 import { loadTuning, readModelTuning } from '../../lib/model-tuning.mjs';
-import { ASK_TOOL, WIDGET, OTHER, DETAILS, questionLines, validateOperatorAction, operatorProcedure } from './ask.mjs';
+import { ASK_TOOL, WIDGET, OTHER, DETAILS, ANSWER_EVENT, optionLabel, answerTyped, questionLines, validateOperatorAction, operatorProcedure } from './ask.mjs';
 import { instanceDecisions } from '../../lib/instance-decisions.mjs';
 import { oneDialog, serialUi } from '../../lib/dialog-lock.mjs';
 import { parseGoalArgs, goalCommandSuggestion, upstreamArgs, numberChecks, formatChecks, parseCheckLines, goalInstructions, rejectionFeedback, isMinaPath, isCheckPath, checkScriptsIn, unusedCheckScripts, dryRunVerdict, proposalSummary, statusLine, formatStatus, stripGoalPrompts, goalInstructionsMinimal, minimizeGoalRules } from './checks.mjs';
@@ -656,7 +656,7 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
         // overflowed the screen. The dialog stays short; the whole request opens in Pi's
         // scrollable editor view and the choice is shown again afterwards.
         notify(ctx, `mina: the agent asks you: ${params.question}`, 'warning');
-        const labels = params.options.map((o, i) => `${i + 1}. ${o.label}${i === params.recommended ? ' (recommended)' : ''}`);
+        const labels = params.options.map((o, i) => optionLabel(o, i, params.recommended));
         const viewer = typeof ctx.ui.editor === 'function';
         const recommended = Number.isInteger(params.recommended) && params.options[params.recommended]
           ? `\nRecommended: ${params.recommended + 1}. ${params.options[params.recommended].label}${params.why ? ` - ${String(params.why).slice(0, 240)}` : ''}` : '';
@@ -681,6 +681,7 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
         pi.appendEntry?.('mina-question', { question: params.question, options: params.options, recommended: params.recommended,
           answer: record.answer, request_id: id, instance_id: decisions.instanceId, at: record.answeredAt ?? record.at });
         saveDecisions();
+        if (record.answer) pi.events?.emit?.(ANSWER_EVENT, { ctx, question: params.question, answer: record.answer, typed: answerTyped(params, record.answer), request_id: id });
       });
       const { record: receipt, reused } = result;
       measure({ kind: 'ask_user', options: params.options.length, answered: Boolean(receipt.answer), reused });

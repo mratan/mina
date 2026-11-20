@@ -584,13 +584,224 @@ test('context continuity carries open questions without reinstating retired doub
   assert.match(packet, /Open questions[^]*Why is the latency -11\.29 ms/);
 });
 
-test('a goal whose objective is a file: the packet and the restatement name the file and say to read it again', async () => {
+test('a goal whose objective is a file: the packet and the restatement name the file; neither orders a re-read before continuing', async () => {
   const { goalRestatement } = await import('../extensions/handoff/policy.mjs');
   const goal = { status: 'active', objective: '~/g/pass3.md', objective_file: '/home/u/g/pass3.md', checks: [], settled: false };
   const r = goalRestatement(goal);
-  assert.match(r, /Objective: the text of the file \/home\/u\/g\/pass3\.md[^]*read it again/);
+  assert.match(r, /Objective: the text of the file \/home\/u\/g\/pass3\.md \(read it when a step depends on its wording\)/);
   const p = renderPacket({ note: null, goal, fallback: 'x', parentFile: '/s/a.jsonl' });
-  assert.match(p, /## Goal\nThe text of the file \/home\/u\/g\/pass3\.md[^]*read it again/);
+  assert.match(p, /## Goal\nThe text of the file \/home\/u\/g\/pass3\.md is the objective\. Read it if its text is not in your context; reading it does not restart the work in progress\./);
+  for (const t of [r, p]) assert.doesNotMatch(t, /before you continue|read it again now/);
+});
+
+const typed = (text) => ({ source: 'interactive', text });
+const said = (text, extra = {}) => ({ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text }], ...extra } });
+const asBranch = (custom) => custom.map(({ t, d }) => ({ type: 'custom', customType: t, data: d }));
+// The user's words of 2026-11-19 02:26 and 2026-11-20 06:28.
+const NO_GPT = 'Your task is to orchestrate your team of GLM subagents - you may do some work, but I would like you to prefer using them for implementation '
+  + 'and even design with your guidance. Analysis and direction are your responsibility under the goal contract - do not spin up GPT or Claude subagents. ';
+const LEDGER_ASK = 'Great - just make sure that this doesn\'t happen again; and perhaps it is worth checking up on earlier efforts to make sure we didn\'t consider '
+  + 'or build something important and then not roll it out / measure / optimize it. Having a durable ledger (like we should have already) is important '
+  + 'as Mina keeps our progress moving through compaction and handoffs.';
+
+test('after a compaction the restatement ends with the work in progress: the user\'s open request verbatim, after the goal (2026-11-20 06:28)', async () => {
+  const goal = { id: 'g1', status: 'active', objective: 'b.md', objective_file: '/w/01-GOAL.md', checks: [{ id: 'R1', command: 'bash r1.sh' }] };
+  const branch = [{ type: 'custom', customType: 'mina-goal', data: goal }];
+  const f = fake({ tokens: 30_000, branch, file: '/s/a.jsonl' });
+  await f.emit('input', typed(LEDGER_ASK));
+  branch.push(said('I will add docs/ledger.md and audit earlier efforts. First the inventory:'));
+  const r = await f.emit('turn_end', { entries: [{ type: 'compaction', summary: 'hot checkpoint' }], message: { role: 'assistant', stopReason: 'toolUse', content: [] } });
+  const text = r.entries[1].content;
+  assert.match(text, /Objective: the text of the file \/w\/01-GOAL\.md/); assert.match(text, /R1: bash r1\.sh/);
+  assert.doesNotMatch(text, /before you continue|read it again now/);
+  const work = text.indexOf('## Where the work stood at the compaction');
+  assert.ok(work > text.indexOf('Objective:'), 'the work in progress is the last word, after the goal');
+  assert.ok(text.slice(work).includes(LEDGER_ASK.replace(/^/gm, '> ')), 'the request is quoted word for word');
+  assert.match(text.slice(work), /Your latest words before the compaction:\n> I will add docs\/ledger\.md/);
+  assert.match(text.slice(work), /If the user's latest message is not fully handled yet, it comes first\.[^]*not a new start/);
+  assert.equal(text.split(LEDGER_ASK.slice(0, 40)).length - 1, 1, 'shown once: not also in the unsorted list');
+});
+
+test('a goal-less session also gets the work in progress after a compaction; a session with nothing typed and no goal gets nothing', async () => {
+  const f = fake({ tokens: 30_000, file: '/s/a.jsonl' });
+  assert.equal(await f.emit('turn_end', { entries: [{ type: 'compaction', summary: 's' }] }), undefined);
+  await f.emit('input', typed('rename the column'));
+  const r = await f.emit('turn_end', { entries: [{ type: 'compaction', summary: 's' }] });
+  assert.match(r.entries[1].content, /^mina: the context was just compacted\.[^]*## Where the work stood at the compaction\nThe user's latest message[^]*\n> rename the column/);
+});
+
+test('a note that the work moved past is not reused: after a later compaction or model reply, /mina-handoff uses the summary (2026-11-19 02:24)', async () => {
+  const old = { type: 'custom', customType: 'mina-handoff-note', data: { state: 'NOTE OF 11-18 05:36', next_actions: ['n'] }, timestamp: '2026-11-18T05:36:00Z' };
+  for (const after of [[{ type: 'compaction', summary: 'EMERGENCY SUMMARY' }], [said('more work after the note')]]) {
+    const f = fake({ tokens: 95_000, file: '/s/a.jsonl', branch: [old, ...after] });
+    await f.commands['mina-handoff'].handler('now', f.ctx);
+    const p = f.newSessions[0].messages[0].content;
+    assert.doesNotMatch(p, /NOTE OF 11-18/); assert.match(p, /automatic summary/);
+    assert.equal(f.newSessions[0].custom[0].d.note, false);
+  }
+  // spent: a handoff to a new session used it, or the user discarded it
+  const f = fake({ tokens: 95_000, file: '/s/a.jsonl', branch: [old, { type: 'custom', customType: 'mina-handoff-note-spent', data: {} }] });
+  await f.commands['mina-handoff'].handler('now', f.ctx);
+  assert.equal(f.newSessions[0].custom[0].d.note, false);
+});
+
+test('a handoff to a new session marks its note spent in the earlier session', async () => {
+  const f = fake({ tokens: 95_000, file: '/s/a.jsonl' });
+  await f.tools.mina_handoff_note.execute('id', { state: 's', next_actions: ['n'] }, null, null, f.ctx);
+  await f.commands['mina-handoff'].handler('now', f.ctx);
+  assert.deepEqual(f.entries.map((e) => e.type), ['mina-handoff-note', 'mina-handoff-note-spent']);
+});
+
+test('an interrupted note call is asked for once more; a second interruption hands off with the summary', async () => {
+  const f = fake({ tokens: 95_000, file: '/s/a.jsonl', branch: [{ type: 'compaction', summary: 'SUMMARY-9' }] });
+  await f.commands['mina-handoff'].handler('', f.ctx);
+  assert.deepEqual(f.sent.map((x) => x.text), [NOTE_REQUEST]);
+  await f.emit('agent_settled', { aborted: true });
+  assert.deepEqual(f.sent.map((x) => [x.text, x.opts?.deliverAs]), [[NOTE_REQUEST, undefined], [NOTE_REQUEST, 'followUp']]);
+  await f.emit('agent_settled', { aborted: true });
+  assert.equal(f.sent.at(-1).text, '/mina-handoff now');
+});
+
+test('after a restart, a fresh note means a pending handoff: the user finishes it or discards it; a stale note asks nothing', async () => {
+  const note = { type: 'custom', customType: 'mina-handoff-note', data: { state: 's', next_actions: ['n'] }, timestamp: '2026-11-18T05:36:00Z' };
+  const ui = (answer, asked) => ({ notify: () => {}, confirm: async (title, body) => { asked.push([title, body]); return answer; } });
+  for (const [answer, expectSent, expectEntries] of [[true, ['/mina-handoff now'], []], [false, [], ['mina-handoff-note-spent']]]) {
+    const asked = [];
+    const f = fake({ file: '/s/a.jsonl', branch: [note] });
+    Object.assign(f.ctx, { hasUI: true, ui: ui(answer, asked) });
+    await f.emit('session_start', { reason: 'startup' });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(asked.length, 1); assert.match(asked[0][1], /handoff note \(2026-11-18 05:36\)/);
+    assert.deepEqual(f.sent.map((x) => x.text), expectSent);
+    assert.deepEqual(f.entries.filter((e) => e.type.startsWith('mina-handoff')).map((e) => e.type), expectEntries);
+  }
+  const asked = [];
+  const g = fake({ file: '/s/a.jsonl', branch: [note, { type: 'compaction', summary: 'later' }] });
+  Object.assign(g.ctx, { hasUI: true, ui: ui(true, asked) });
+  await g.emit('session_start', { reason: 'startup' });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(asked.length, 0);
+});
+
+test('the user\'s instruction survives an in-place handoff and a new session word for word, sorted or not (2026-11-19 02:26 -> 11:10)', async () => {
+  const goal = { id: 'g1', status: 'active', objective: 'orchestrate', checks: [] };
+  const recs = {};
+  const reg = Symbol.for('pi-subagents:manager');
+  globalThis[reg] = { getRecord: (id) => recs[id] };
+  try {
+    for (const sort of [false, true]) {
+      recs.c1 = { id: 'c1', description: 'GLM-WORKER', type: 'delegate', status: 'running', maxTurns: 80, toolUses: 0,
+        session: { messages: [{ role: 'assistant' }], getContextUsage: () => ({ tokens: 5000 }) } };
+      const branch = [{ type: 'custom', customType: 'mina-goal', data: goal }];
+      const f = fake({ tokens: 95_000, file: '/s/a.jsonl', branch });
+      await f.emit('input', typed(NO_GPT));
+      await f.emit('input', { source: 'extension', text: 'Continue the active /goal <!-- pi-goal-continuation:abc -->' });
+      await f.emit('input', { source: 'extension', text: 'mina: subagent "x" finished' });
+      const [m] = f.entries.filter((e) => e.type === 'mina-operator-message').map((e) => e.data);
+      assert.equal(f.entries.filter((e) => e.type === 'mina-operator-message').length, 1, 'only typed input is the user\'s');
+      assert.equal(m.text, NO_GPT); assert.equal(m.goal, 'g1');
+      if (sort) {
+        const add = await f.tools.mina_ledger.execute('id', { action: 'add', kind: 'constraint', message_id: m.id, quote: 'do not spin up GPT or Claude subagents', meaning: 'GLM children only' }, null, null, f.ctx);
+        assert.match(add.content[0].text, /Recorded L1/);
+        const bad = await f.tools.mina_ledger.execute('id', { action: 'add', kind: 'constraint', message_id: m.id, quote: 'GLM-only implementation children', meaning: 'x' }, null, null, f.ctx);
+        assert.equal(bad.isError, true);
+        await f.tools.mina_ledger.execute('id', { action: 'sort', message_ids: [m.id] }, null, null, f.ctx);
+      }
+      // 11:10: the in-place handoff (subagents running)
+      f.pi.events.emit('subagents:started', { id: 'c1' });
+      await f.tools.mina_handoff_note.execute('id', { state: 'GLM-only implementation children running', next_actions: ['n'] }, null, null, f.ctx);
+      const r = await f.emit('turn_end', { message: { role: 'assistant', stopReason: 'toolUse' } });
+      const packet = r.entries.at(-1).content;
+      assert.ok(packet.includes(sort ? '"do not spin up GPT or Claude subagents"' : 'do not spin up GPT or Claude subagents'), packet);
+      if (sort) assert.match(packet, /- L1 \[constraint\] "do not spin up GPT or Claude subagents"/);
+      else assert.match(packet, /## The user's messages not yet sorted[^]*do not spin up GPT or Claude subagents/);
+      // later, a handoff to a new session: the ledger goes with it, and the successor restates it after its compactions
+      branch.push(...r.entries);
+      recs.c1.status = 'completed';
+      f.pi.events.emit('subagents:completed', { id: 'c1', status: 'completed', result: 'ok' });
+      await f.commands['mina-handoff'].handler('now', f.ctx);
+      const s = f.newSessions.at(-1);
+      assert.ok(s.messages[0].content.includes('do not spin up GPT or Claude subagents'));
+      const g = fake({ tokens: 30_000, file: '/s/b.jsonl', branch: asBranch(s.custom) });
+      await g.emit('session_start', { reason: 'new' });
+      const again = await g.emit('turn_end', { entries: [{ type: 'compaction', summary: 's' }] });
+      assert.ok(again.entries[1].content.includes('do not spin up GPT or Claude subagents'), 'restated in the successor');
+    }
+  } finally { delete globalThis[reg]; }
+});
+
+test('an answer to mina_ask_user is logged beside the typed messages and travels word for word; it settles a dispute the agent asked about', async () => {
+  const { ANSWER_EVENT } = await import('../extensions/goal/ask.mjs');
+  const goal = { id: 'g1', status: 'active', objective: 'a' };
+  const f = fake({ tokens: 30_000, file: '/s/a.jsonl', branch: [{ type: 'custom', customType: 'mina-goal', data: goal }] });
+  await f.emit('input', typed(NO_GPT));
+  await f.emit('input', typed('use one Claude subagent for the audit'));
+  const [a, b] = f.entries.filter((e) => e.type === 'mina-operator-message').map((e) => e.data);
+  const call = (p) => f.tools.mina_ledger.execute('id', p, null, null, f.ctx);
+  await call({ action: 'add', kind: 'constraint', message_id: a.id, quote: 'do not spin up GPT or Claude subagents', meaning: 'GLM only' });
+  await call({ action: 'add', kind: 'directive', message_id: b.id, quote: 'use one Claude subagent for the audit', meaning: 'one exception', conflicts_with: ['L1', 'goal'], conflict: 'L1 forbids Claude subagents.' });
+  // the agent asks with mina_ask_user; the user types the final word
+  f.pi.events.emit(ANSWER_EVENT, { ctx: f.ctx, question: 'Does the audit override the GLM-only rule?', answer: 'Yes for the audit only. Everything else stays GLM.', typed: true, request_id: 'audit' });
+  f.pi.events.emit(ANSWER_EVENT, { ctx: f.ctx, question: 'q', answer: '  ', typed: true });
+  const answers = f.entries.filter((e) => e.type === 'mina-operator-message').map((e) => e.data).slice(2);
+  assert.deepEqual(answers.map((m) => [m.text, m.question, m.typed, m.request_id, m.goal]), [['Yes for the audit only. Everything else stays GLM.', 'Does the audit override the GLM-only rule?', true, 'audit', 'g1']]);
+  const r = await f.emit('turn_end', { entries: [{ type: 'compaction', summary: 's' }] });
+  assert.match(r.entries[1].content, /- L2 \[directive; DISPUTED/);
+  assert.match(r.entries[1].content, /## Where the work stood[^]*The user's latest message[^]*\n> Yes for the audit only\. Everything else stays GLM\./);
+  const settled = await call({ action: 'resolve', id: 'L2', outcome: 'new', message_id: answers[0].id, quote: 'Yes for the audit only.' });
+  assert.match(settled.content[0].text, /L2 is active, by the user's words/);
+  const list = (await call({ action: 'list' })).content[0].text;
+  assert.doesNotMatch(list, /- L1 \[/); assert.match(list, /- L2 \[directive\][^]*The user's ruling on a conflict[^]*"Yes for the audit only\."/);
+  await call({ action: 'add', kind: 'constraint', message_id: answers[0].id, quote: 'Everything else stays GLM.', meaning: 'GLM for all but the audit' });
+  const p = renderPacket({ parentFile: '/s/a.jsonl', ledger: (await f.emit('turn_end', { entries: [{ type: 'compaction', summary: 's' }] })).entries[1].content });
+  assert.match(p, /- L3 \[constraint\] "Everything else stays GLM\." \(the user, [^)]*answering "Does the audit override the GLM-only rule\?"\)/);
+});
+
+test('a new goal starts an empty ledger; messages typed for the old goal do not travel with the new one', async () => {
+  const branch = [{ type: 'custom', customType: 'mina-goal', data: { id: 'g1', status: 'active', objective: 'a' } }];
+  const f = fake({ tokens: 30_000, file: '/s/a.jsonl', branch });
+  await f.emit('input', typed('only for the first goal'));
+  branch.push({ type: 'custom', customType: 'mina-goal', data: { id: 'g2', status: 'active', objective: 'b' } });
+  const r = await f.emit('turn_end', { entries: [{ type: 'compaction', summary: 's' }] });
+  assert.doesNotMatch(r.entries[1].content, /only for the first goal/);
+});
+
+test('a conflict goes to the user, whose answer is logged and decides; without a terminal it stays disputed', async () => {
+  const goal = { id: 'g1', status: 'active', objective: 'a' };
+  const f = fake({ tokens: 30_000, file: '/s/a.jsonl', branch: [{ type: 'custom', customType: 'mina-goal', data: goal }] });
+  await f.emit('input', typed(NO_GPT));
+  await f.emit('input', typed('use one Claude subagent for the audit'));
+  const [a, b] = f.entries.filter((e) => e.type === 'mina-operator-message').map((e) => e.data);
+  const call = (p) => f.tools.mina_ledger.execute('id', p, null, null, f.ctx);
+  await call({ action: 'add', kind: 'constraint', message_id: a.id, quote: 'do not spin up GPT or Claude subagents', meaning: 'GLM only' });
+  const headless = await call({ action: 'add', kind: 'directive', message_id: b.id, quote: 'use one Claude subagent for the audit', meaning: 'one exception', conflicts_with: ['L1'], conflict: 'L1 forbids Claude subagents.' });
+  assert.match(headless.content[0].text, /DISPUTED: no one can answer here/);
+  const asked = [];
+  Object.assign(f.ctx, { hasUI: true, ui: { notify: () => {}, select: async (q, o) => { asked.push([q, o]); return o[0]; } } });
+  const r = await call({ action: 'add', kind: 'directive', message_id: b.id, quote: 'use one Claude subagent for the audit', meaning: 'one exception', conflicts_with: ['L1'], conflict: 'L1 forbids Claude subagents.' });
+  assert.match(asked[0][0], /Your instruction "use one Claude subagent for the audit" seems to conflict with L1 "do not spin up GPT or Claude subagents"/);
+  assert.match(r.content[0].text, /The user answered: "Your newer instruction stands[^]*L3 is active; L1 gives way to it/);
+  const answer = f.entries.filter((e) => e.type === 'mina-operator-message').at(-1).data;
+  assert.match(answer.question, /Which stands\?/);
+  const list = await call({ action: 'list' });
+  assert.doesNotMatch(list.content[0].text, /- L1 \[/); assert.match(list.content[0].text, /- L2 \[directive; DISPUTED/); assert.match(list.content[0].text, /- L3 \[directive\]/);
+});
+
+test('the ledger mirror: written to .mina/operator-ledger.md for a goal; an outside edit is set aside and reported, never read back', async () => {
+  const { readFileSync, readdirSync } = await import('node:fs');
+  const cwd = mkdtempSync(join(tmpdir(), 'mina-ledger-'));
+  const f = fake({ tokens: 30_000, file: '/s/a.jsonl', branch: [{ type: 'custom', customType: 'mina-goal', data: { id: 'g1', status: 'active', objective: 'a' } }] });
+  const notes = [];
+  Object.assign(f.ctx, { cwd, hasUI: true, ui: { notify: (t, l) => notes.push([t, l]) } });
+  await f.emit('session_start', { reason: 'startup' });
+  await f.emit('input', typed(NO_GPT));
+  const path = join(cwd, '.mina', 'operator-ledger.md');
+  assert.match(readFileSync(path, 'utf8'), /## Unsorted messages[^]*do not spin up GPT or Claude subagents/);
+  writeFileSync(path, 'the user edited this');
+  await f.emit('input', typed('second message'));
+  assert.match(readFileSync(path, 'utf8'), /second message/);
+  assert.equal(readdirSync(join(cwd, '.mina')).filter((n) => n.startsWith('operator-ledger.md.edited-')).length, 1);
+  assert.match(notes.at(-1)[0], /was changed outside mina/);
 });
 
 test('a finished subagent result stays reachable: mina_subagents lists it and returns it by id; mina_recall finds it', async () => {

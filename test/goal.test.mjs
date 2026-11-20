@@ -277,8 +277,9 @@ const DONE = project();
 
 // A fake Pi with the parts the extension uses, and a fake pi-goal that registers /goal and goal_complete.
 function fakePi({ execCodes = [], execResults = [], syntaxBad = [], dryRuns = [], env, onExec, tuning = null, measure, amendWaitMs, readTuning, snapshot = async () => null } = {}) {
-  const handlers = {}, tools = {}, commands = {}, entries = [], messages = [], upstream = [], sent = [];
+  const handlers = {}, tools = {}, commands = {}, entries = [], messages = [], upstream = [], sent = [], emitted = [];
   const pi = {
+    events: { emit: (channel, data) => emitted.push([channel, data]) },
     on: (ev, fn) => { (handlers[ev] ??= []).push(fn); },
     registerTool: (t) => { tools[t.name] = t; },
     registerCommand: (name, opts) => { commands[name] = opts; },
@@ -293,7 +294,7 @@ function fakePi({ execCodes = [], execResults = [], syntaxBad = [], dryRuns = []
   const fakeGoal = (api) => api.registerCommand('goal', { description: 'upstream', handler: async (args) => upstream.push(args) });
   createMinaGoal(pi, { goalExtension: fakeGoal, env, sandboxAvailable: true, tuning, measure, amendWaitMs, readTuning, snapshot });
   const emit = async (ev, event, ctx = { cwd: DONE, hasUI: false }) => { let out; for (const fn of handlers[ev] ?? []) out = (await fn(event, ctx)) ?? out; return out; };
-  return { pi, tools, commands, entries, messages, upstream, emit, sent };
+  return { pi, tools, commands, entries, messages, upstream, emit, sent, emitted };
 }
 
 test("a new /goal moves the previous goal's working files to .mina/archive/, keeping briefs/; the agent is told where", async () => {
@@ -1030,6 +1031,20 @@ test('an operator agreement shows exact commands, waits for output, and never ex
   assert.match(report.content[0].text, /not verified|not independently verified/);
   assert.equal(report.details.operatorReport.verified, false);
   assert.equal([...statuses.values()].filter(Boolean).join(''), '');
+});
+
+test('each new answer to mina_ask_user goes to the operator ledger, marked typed or chosen; a reused or unanswered one does not', async () => {
+  const { ANSWER_EVENT } = await import('../extensions/goal/ask.mjs');
+  const f = fakePi({ env: { MINA_INSTANCE_ID: `ledger-answers-${project()}` } });
+  const chosen = uiCtx([(opts) => opts[1]]);
+  await f.tools.mina_ask_user.execute('a', { ...askParams, request_id: 'clocks' }, null, null, chosen);
+  await f.tools.mina_ask_user.execute('b', { ...askParams, request_id: 'clocks' }, null, null, { ...uiCtx([(opts) => opts[0]]), cwd: chosen.cwd });   // reused receipt
+  await f.tools.mina_ask_user.execute('c', { ...askParams, request_id: 'closed' }, null, null, uiCtx([() => undefined]));      // closed unanswered
+  await f.tools.mina_ask_user.execute('d', { ...askParams, request_id: 'typed' }, null, null, uiCtx([(opts) => opts.at(-1), () => 'pin only GPU A, never GPU B']));
+  assert.deepEqual(f.emitted.map(([ch, d]) => [ch, d.question, d.answer, d.typed, d.request_id]), [
+    [ANSWER_EVENT, askParams.question, '2. Measure at the production caps (recommended)', false, 'clocks'],
+    [ANSWER_EVENT, askParams.question, 'pin only GPU A, never GPU B', true, 'typed']]);
+  assert.equal(f.emitted[0][1].ctx, chosen, 'the ledger gets the live context of the call');
 });
 
 test('mina_ask_user shows the question, options and recommendation, waits for the choice, and returns it', async () => {

@@ -21,7 +21,9 @@ import { readdirSync, readFileSync } from '../../sandbox/project-fs.mjs';
 import { join } from 'node:path';
 import { loadTuning, readModelTuning } from '../../lib/model-tuning.mjs';
 export { loadTuning } from '../../lib/model-tuning.mjs';
-import { thresholds, carriedGoal, tuningForModel, poolBudget, poolThresholds, spawnFits, handoffDue, renderPacket, goalRestatement, NOTE_REQUEST, GOAL_CONTINUATION_MARKER } from './policy.mjs';
+import { thresholds, carriedGoal, tuningForModel, poolBudget, poolThresholds, spawnFits, handoffDue, renderPacket, compactionRestatement, workInProgress, NOTE_REQUEST, GOAL_CONTINUATION_MARKER } from './policy.mjs';
+import { installLedger, LEDGER } from './ledger.mjs';
+import { oneDialog } from '../../lib/dialog-lock.mjs';
 import { lineage, search, readEntry } from './recall.mjs';
 import { hashCheckFiles, changedFiles } from '../goal/check-files.mjs';
 import { manager, maxTurnsFor, toolsFor, childStatus, nearLimits, describeChild, reserveUnits, limitsText, warningText } from './subagents.mjs';
@@ -31,6 +33,8 @@ import { stripOldReasoning } from './reasoning.mjs';
 
 export const MARKER = 'mina-handoff';
 export const NOTE_ENTRY = 'mina-handoff-note';
+// A recorded note that a handoff to a new session used, or that the user discarded after a restart.
+export const NOTE_SPENT = 'mina-handoff-note-spent';
 // An in-place handoff: its marker (counting starts afresh after it) and the packet message that follows its compaction.
 export const IN_PLACE = 'mina-handoff-in-place';
 export const PACKET_ENTRY = 'mina-handoff-packet';
@@ -51,6 +55,30 @@ const goalStates = (ctx) => (ctx.sessionManager?.getBranch?.() ?? []).filter((e)
 export function sinceLastReset(branch) {
   const at = branch.findLastIndex((e) => e.type === 'custom' && e.customType === IN_PLACE);
   return at < 0 ? branch : branch.slice(at + 1);
+}
+
+// The recorded note that still describes the session: none after a compaction or a model reply that came after it.
+// 2026-11-19 02:24: a restart lost the pending handoff of 11-18 05:36, the new note call was aborted, and
+// /mina-handoff carried the 21-hour-old note into the successor as the current state.
+export function freshNote(branch) {
+  const since = sinceLastReset(branch);
+  const at = since.findLastIndex((e) => e.type === 'custom' && e.customType === NOTE_ENTRY);
+  if (at < 0) return null;
+  const moved = since.slice(at + 1).some((e) => e.type === 'compaction' || (e.type === 'message' && e.message?.role === 'assistant')
+    || (e.type === 'custom' && e.customType === NOTE_SPENT));
+  return moved ? null : { note: since[at].data ?? null, at: since[at].timestamp ?? null };
+}
+
+// The assistant's latest text in the branch (or in the message that ends this turn), for the restatement.
+export function latestAssistantText(branch, message = null) {
+  const text = (m) => (typeof m?.content === 'string' ? m.content : (m?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n')).trim();
+  if (message?.role === 'assistant' && text(message)) return text(message);
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const e = branch[i];
+    if (e.type === 'compaction') return '';
+    if (e.type === 'message' && e.message?.role === 'assistant' && text(e.message)) return text(e.message);
+  }
+  return '';
 }
 
 // pi-goal's goal for the handoff. When mina stopped an active goal's run during the handoff, pi-goal blocked (or
@@ -93,7 +121,7 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
   let requestedBy = null; // 'steer' (inside a run) | 'input' (at a boundary)
   let turnsSinceRequest = 0, reminders = 0;
   let interrupted = false; // the steered note request arrived while the run was in its tool loop
-  let note = null;
+  let note = null, noteRetried = false;
   // An in-place handoff waiting for its boundary ({ fallback }: without a note), and, after one, no handoff decision
   // until the reset context has a size of its own (its first turn).
   let inPlace = null, awaitingBaseline = false;
@@ -136,6 +164,8 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
   globalThis[HANDOFF_STATE] = { pending: () => phase === 'handing-off' };
 
   const notify = (ctx, text, level = 'info') => { if (ctx?.hasUI) ctx.ui.notify(text, level); };
+  // Before this extension's own input handler (see ledger.mjs).
+  const ledger = installLedger(pi, { notify, measure: (kind, data) => measureEvent(kind, data) });
   const compactions = (ctx) => sinceLastReset(ctx.sessionManager?.getBranch?.() ?? []).filter((e) => e.type === 'compaction').length;
   const usage = (ctx) => ctx.getContextUsage?.() ?? null;
   const liveTuning = (ctx) => tuningForModel(tuning, ctx.model, readTuning);
@@ -198,7 +228,7 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
     const file = ctx.sessionManager?.getSessionFile?.() ?? null;
     const userCarried = carried.filter((c) => c.source !== 'extension');
     let packet = renderPacket({ note, goal, fallback: note ? null : fallbackSummary(branch), parentFile: file, briefs: briefs(ctx.cwd), subagents,
-      running: liveChildren(), plan: readPlan(ctx.cwd), minimal: liveTuning(ctx)?.goal_prompt === 'minimal', inPlace: true });
+      running: liveChildren(), plan: readPlan(ctx.cwd), minimal: liveTuning(ctx)?.goal_prompt === 'minimal', inPlace: true, ledger: ledger.section(ctx) });
     packet += extensionSection(carried.filter((c) => c.source === 'extension'));
     const resume = requestedBy === 'steer' && interrupted && !goalActive && !userCarried.length;
     const u = usage(ctx), at = new Date().toISOString();
@@ -257,7 +287,7 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
       + 'Wait for a running subagent to finish, or do the work yourself; do not start several at once.' };
   });
 
-  const request = (by) => { phase = 'note-requested'; requestedBy = by; turnsSinceRequest = 0; reminders = 0; interrupted = false; };
+  const request = (by) => { phase = 'note-requested'; requestedBy = by; turnsSinceRequest = 0; reminders = 0; interrupted = false; noteRetried = false; };
 
   // A successor starts on Pi's default model (newSession does not carry the model over): it switches back to the model
   // and thinking level the earlier session was using, which the marker records. Pi emits session_start after the
@@ -285,13 +315,27 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
     measureEvent('session_end', { duration_s: secondsSince(m.startedAt), turns: m.turns, peak_tokens: m.peak, compactions: m.compactions, reason: m.reason });
   });
 
+  // A restart between the note and the handoff loses the pending handoff (it lives in memory). The note is still fresh
+  // (freshNote): the user decides, without blocking the start, to hand off with it now or to discard it.
+  function offerPendingHandoff(ctx) {
+    const pending = freshNote(ctx?.sessionManager?.getBranch?.() ?? []);
+    if (!pending?.note || !ctx?.hasUI || !ctx.ui?.confirm) return;
+    const at = pending.at ? ` (${String(pending.at).slice(0, 16).replace('T', ' ')})` : '';
+    oneDialog(() => ctx.ui.confirm('Finish the pending handoff?', `mina stopped after the agent wrote a handoff note${at} and before the handoff. `
+      + 'Yes: hand off to a new session now with that note. No: discard the note; the work continues in this session.'))
+      .then((yes) => {
+        if (yes) { pi.sendUserMessage('/mina-handoff now', { expandPromptTemplates: true }); return; }
+        if (yes === false) { pi.appendEntry(NOTE_SPENT, { at: new Date().toISOString(), discarded: true }); notify(ctx, 'mina: the pending handoff note was discarded; mina_recall still finds it.'); }
+      }).catch(() => { /* the session ended first */ });
+  }
+
   pi.on('session_start', async (event, ctx) => {
-    phase = null; requestedBy = null; interrupted = false; note = null; baseline = null; carried.length = 0; handingOffSince = null; handoffWaiting = false;
+    phase = null; requestedBy = null; interrupted = false; note = null; noteRetried = false; baseline = null; carried.length = 0; handingOffSince = null; handoffWaiting = false;
     stopped = null; inPlace = null; awaitingBaseline = false; running.clear(); reserved = 0; handoffWaiting = false; warned.clear(); stopWatch();
     if (ctx?.cwd) lastCwd = ctx.cwd;
     Object.assign(m, { startedAt: Date.now(), reason: event?.reason ?? null, turns: 0, peak: 0, compactions: 0, jobStartedAt: null, pending: null, baselineLogged: false,
       file: ctx?.sessionManager?.getSessionFile?.() ?? null, model: ctx?.model ? `${ctx.model.provider}/${ctx.model.id}` : null });
-    if (event?.reason !== 'new') return;
+    if (event?.reason !== 'new') { offerPendingHandoff(ctx); return; }
     const from = latestCustom(ctx, MARKER)?.model;
     if (!from?.provider || !from?.id) return;
     if (ctx.model?.provider !== from.provider || ctx.model?.id !== from.id) {
@@ -373,7 +417,10 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
     m.pending = { tokens_before: c.tokensBefore ?? usage(ctx)?.tokens ?? null, semantic: /\[Semantic Checkpoint\]/.test(c.summary ?? ''), source: c.details?.source ?? null,
       job_s: secondsSince(m.jobStartedAt), afterTurn: m.turns + 1 };
     m.jobStartedAt = null;
-    const text = goalRestatement(latestCustom(ctx, 'mina-goal'), briefs(ctx.cwd), readPlan(ctx.cwd));
+    const user = ledger.latest(ctx);
+    const text = compactionRestatement({ goal: latestCustom(ctx, 'mina-goal'), briefs: briefs(ctx.cwd), plan: readPlan(ctx.cwd),
+      ledger: ledger.section(ctx, { exclude: user ? [user.id] : [] }),
+      work: workInProgress({ user, assistant: latestAssistantText(ctx.sessionManager?.getBranch?.() ?? [], event.message) }) });
     return text ? { entries: [...event.entries, { type: 'custom_message', customType: 'mina-goal', content: text, display: false }] } : undefined;
   }
 
@@ -422,8 +469,15 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
   // The agent finished without a note. A request steered into a run is asked again at the next input (the run may have
   // ended because the work is done, e.g. goal_complete: then nothing is continued unless the user writes again). A
   // request made at an input boundary was the agent's turn to write it: hand off with the fallback summary.
-  pi.on('agent_settled', (_event, ctx) => {
+  pi.on('agent_settled', (event, ctx) => {
     if (phase !== 'note-requested' || note) return;
+    // The note call itself was cut off (2026-11-19 02:24: an emergency compaction aborted it): asked once more.
+    if (event?.aborted && !noteRetried) {
+      noteRetried = true;
+      notify(ctx, 'mina: the handoff note was interrupted; the agent is asked for it once more.', 'warning');
+      pi.sendUserMessage(NOTE_REQUEST, { deliverAs: 'followUp' });
+      return;
+    }
     if (requestedBy === 'steer' && !carried.length) { phase = null; requestedBy = null; return; }
     phase = 'handing-off'; notify(ctx, 'mina: no handoff note was written; handing off with the last compaction summary.', 'warning'); handoffNow(ctx);
   });
@@ -474,11 +528,11 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
         notify(ctx, `mina: ${running.size} subagent(s) are running, and a handoff would stop them. mina hands off when they finish; "/mina-handoff force" hands off now.`, 'warning');
         return;
       }
-      // A note recorded earlier in this session (for example before mina was restarted) is used rather than lost; one that
-      // an in-place handoff already used is not.
-      note ??= sinceLastReset(ctx.sessionManager?.getBranch?.() ?? []).filter((e) => e.type === 'custom' && e.customType === NOTE_ENTRY).at(-1)?.data ?? null;
+      // A note recorded earlier in this session (for example before mina was restarted) is used rather than lost, if it
+      // is still fresh: not one that an in-place handoff used, and not one the work has moved past.
+      note ??= freshNote(ctx.sessionManager?.getBranch?.() ?? [])?.note ?? null;
       if (!note && !['now', 'force'].includes(String(args ?? '').trim())) {
-        phase = 'note-requested';
+        phase = 'note-requested'; noteRetried = false;
         pi.sendUserMessage(NOTE_REQUEST);
         return;
       }
@@ -492,7 +546,9 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
       const fallback = note ? null : fallbackSummary(branch);
       const subagents = sinceLastReset(branch).filter((e) => e.type === 'custom' && e.customType === 'subagents:record').map((e) => e.data ?? {})
         .filter((r) => !carried.some((c) => c.text.includes(`"${r.description}"`)));
-      let packet = renderPacket({ note, goal, fallback, parentFile: parent, briefs: briefs(ctx.cwd), subagents, plan: readPlan(ctx.cwd), minimal: liveTuning(ctx)?.goal_prompt === 'minimal' });
+      let packet = renderPacket({ note, goal, fallback, parentFile: parent, briefs: briefs(ctx.cwd), subagents, plan: readPlan(ctx.cwd), minimal: liveTuning(ctx)?.goal_prompt === 'minimal',
+        ledger: ledger.section(ctx) });
+      const nextLedger = ledger.successor(ctx);
       const userCarried = carried.filter((c) => c.source !== 'extension');
       const resume = requestedBy === 'steer' && interrupted && !goalActive && !userCarried.length;
       const otherCarried = carried.filter((c) => c.source === 'extension');
@@ -504,12 +560,14 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
       // Right after a restart Pi has no usage reading yet: the last model reply's size stands in for it.
       const lastReply = (ctx.sessionManager.getBranch?.() ?? []).filter((e) => e.type === 'message' && e.message?.role === 'assistant' && e.message.usage?.totalTokens).at(-1);
       measureEvent('handoff', { mode: 'new', tokens: u?.tokens ?? lastReply?.message.usage.totalTokens ?? null, compactions: compactions(ctx), note: Boolean(note), subagents_running: running.size });
+      if (note) pi.appendEntry(NOTE_SPENT, { at: new Date().toISOString(), to: 'new-session' });
       const result = await ctx.newSession({
         parentSession: parent,
         setup: async (sm) => {
           sm.appendCustomEntry(MARKER, { from: parent, at: new Date().toISOString(), tokens_at_handoff: u?.tokens ?? null, note: Boolean(note), packet_bytes: Buffer.byteLength(packet), model });
           if (goal) sm.appendCustomEntry('mina-goal', goal);
           if (decisions) sm.appendCustomEntry('mina-decisions', decisions);
+          sm.appendCustomEntry(LEDGER, nextLedger);
           sm.appendMessage({ role: 'user', content: packet, timestamp: Date.now() });
         },
         withSession: async (next) => {

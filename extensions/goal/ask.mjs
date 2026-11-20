@@ -7,6 +7,12 @@ export const ASK_TOOL = 'mina_ask_user';
 export const WIDGET = 'mina-question';
 export const OTHER = 'Other: type your own answer';
 export const DETAILS = 'Show full details (context, consequences, commands)';
+// Each new answer goes on Pi's event bus to the operator ledger (extensions/handoff/ledger.mjs), which logs it beside
+// the messages the user types: the agent asks here for the final word on new instructions against the goal.
+// Payload: { ctx, question, answer, typed, request_id }. typed: the user wrote the answer, not chose an option the agent wrote.
+export const ANSWER_EVENT = 'mina:operator-answer';
+export const optionLabel = (o, i, recommended) => `${i + 1}. ${o.label}${i === recommended ? ' (recommended)' : ''}`;
+export const answerTyped = ({ options = [], recommended }, answer) => !options.some((o, i) => optionLabel(o, i, recommended) === answer);
 
 export function validateOperatorAction(p, optionCount) {
   if (!p) return;

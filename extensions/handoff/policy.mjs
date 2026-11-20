@@ -113,8 +113,11 @@ const list = (title, items) => (items?.length ? `## ${title}\n${items.map((x) =>
 // header, the goal and the next actions always stay.
 // The objective as the packet and the restatement show it. A file objective (an objective that was a path to a file,
 // for instructions over pi-goal's 4,000-character limit) is named, not copied: the packet keeps its room for the note.
+// It says to read the file when its text is not in the context, never to read it before continuing: a restatement that
+// ended "read it again now, in full, before you continue" displaced the user's open request (2026-11-20 06:28; 14 of 15
+// compactions in that session began with a re-read of the goal).
 export const objectiveText = (goal) => (goal?.objective_file
-  ? `The text of the file ${goal.objective_file} is the objective: read it again now, in full, before you continue.`
+  ? `The text of the file ${goal.objective_file} is the objective. Read it if its text is not in your context; reading it does not restart the work in progress.`
   : goal?.objective ?? '');
 
 // The goal a handoff carries. mina's own record follows pi-goal only on completion and clear, so a goal that pi-goal
@@ -130,7 +133,9 @@ export function carriedGoal(goal, upstream) {
 
 // inPlace: the handoff reset this session's context instead of opening a new session, because subagents were running
 // (a new session would stop them). The goal, its pi-goal run and the subagents carry on in this session.
-export function renderPacket({ note = null, goal = null, fallback = null, parentFile, briefs = [], subagents = [], running = [], plan = '', minimal = false, inPlace = false }, maxBytes = PACKET_MAX_BYTES) {
+// ledger: the user's standing instructions and unsorted messages (ledger.mjs), word for word. It is outside maxBytes and
+// never cut: a summary that drops an instruction is how one was lost.
+export function renderPacket({ note = null, goal = null, fallback = null, parentFile, briefs = [], subagents = [], running = [], plan = '', minimal = false, inPlace = false, ledger = '' }, maxBytes = PACKET_MAX_BYTES) {
   const head = (inPlace ? ['# mina handoff packet',
     minimal ? 'This session\'s context was full and was reset in place; running subagents carry on. mina_recall searches the earlier context.'
       : 'This session\'s context was full, so mina reset it in place: subagents were running, and a new session would have stopped them. '
@@ -167,7 +172,7 @@ export function renderPacket({ note = null, goal = null, fallback = null, parent
   let text = [...required, ...optional].join('\n');
   while (Buffer.byteLength(text) > maxBytes && optional.length) { optional.pop(); text = [...required, ...optional].join('\n'); }
   if (Buffer.byteLength(text) > maxBytes) text = `${Buffer.from(text).subarray(0, maxBytes - 40).toString()}\n[packet truncated at ${maxBytes} bytes]`;
-  return text;
+  return ledger ? `${text}\n${ledger}\n` : text;
 }
 
 export const NOTE_REQUEST = [
@@ -185,7 +190,7 @@ export const NOTE_REQUEST = [
 // (its goal section reads user messages only), and mina's accepted checks are not in pi-goal's own contract.
 export function goalRestatement(goal, briefs = [], plan = '') {
   if (!goal || goal.status !== 'active') return null;
-  return ['mina: the context was just compacted. The active goal, restated:', `Objective: ${goal.objective_file ? objectiveText(goal).replace(/^The text/, 'the text') : goal.objective}`,
+  return ['mina: the context was just compacted. The active goal, restated:', `Objective: ${goal.objective_file ? `the text of the file ${goal.objective_file} (read it when a step depends on its wording)` : goal.objective}`,
     goal.checks?.length ? `${goal.checkPolicy === 'working' ? 'Agent-selected working checks (editable; not independent qualification)' : 'Accepted checks (protected; .mina/checks/ is frozen)'} (mina reruns them on goal_complete):\n${goal.checks.map((c) => `- ${c.id}: ${c.command}`).join('\n')}`
       : (goal.settled === false ? (goal.checkPolicy === 'working' ? 'Working checks: register with mina_propose_checks before completion; ordinary edits are allowed.' : 'Checks: not settled yet (call mina_propose_checks before writing files outside .mina/).') : 'Checks: none (UNVERIFIED).'),
     goal.checks?.length ? `Check approval: ${goal.checkApproval ?? 'legacy, not recorded'}. Protection alone is not independent qualification.` : '',
@@ -193,4 +198,28 @@ export function goalRestatement(goal, briefs = [], plan = '') {
     planText(plan) ? `Your plan (.mina/plan.md):\n${planText(plan)}` : 'No .mina/plan.md yet: write the remaining steps there.',
     briefs.length ? `Research briefs: ${briefs.join(', ')}` : '',
     'For exact earlier text, use context_recall (this session) or mina_recall (earlier sessions).'].filter(Boolean).join('\n');
+}
+
+// Where the work stood when the context was compacted: the last thing in the restatement, so that the model's next step
+// follows the work in progress, not the goal restated above it (2026-11-20 06:28: the user asked for a durable ledger, a
+// compaction committed 26 s later, the agent re-read the goal, and the user had to ask again at 06:32).
+const TAIL_CHARS = 1500;
+const quoted = (s) => String(s).replace(/^/gm, '> ');
+export function workInProgress({ user = null, assistant = '' } = {}) {
+  const said = String(assistant ?? '').trim();
+  if (!user && !said) return '';
+  const tail = said.length > TAIL_CHARS ? `[…]${said.slice(-TAIL_CHARS)}` : said;
+  return ['## Where the work stood at the compaction',
+    user ? `The user's latest message (verbatim, ${String(user.at ?? '').slice(0, 16).replace('T', ' ')}${user.id ? `, ${user.id}` : ''}):\n${quoted(user.text)}` : '',
+    tail ? `Your latest words before the compaction:\n${quoted(tail)}` : '',
+    'Continue from here. If the user\'s latest message is not fully handled yet, it comes first. The restatement above is a reminder, not a new start: '
+    + 'do not begin the work again from the goal.'].filter(Boolean).join('\n');
+}
+
+// The whole post-compaction message: the goal (if one is active), the ledger, and, last, the work in progress.
+export function compactionRestatement({ goal = null, briefs = [], plan = '', ledger = '', work = '' } = {}) {
+  const g = goalRestatement(goal, briefs, plan);
+  if (!g && !ledger && !work) return null;
+  return [g ?? 'mina: the context was just compacted. For exact earlier text, use context_recall (this session) or mina_recall (earlier sessions).', ledger, work]
+    .filter(Boolean).join('\n\n');
 }

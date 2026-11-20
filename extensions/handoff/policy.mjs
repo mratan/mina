@@ -93,10 +93,19 @@ export function hotCompactConfig(user = {}, tuning, contextWindow) {
 }
 
 // Results of the subagents that finished in the earlier session (pi-subagents' `subagents:record` entries): the new
-// session cannot ask pi-subagents for them, which only knows its own process's agents.
-const subagentList = (records) => (records?.length ? `## Subagents that finished in the earlier session\n${records.map((r) =>
-  `- "${r.description}" (${r.status}): ${String(r.result ?? r.error ?? '').replace(/\s+/g, ' ').slice(0, 1200)}`).join('\n')}\n`
-  + 'Their full reports: mina_recall with the description.\n' : '');
+// session cannot ask pi-subagents for them, which only knows its own process's agents. After an in-place handoff the
+// records stay on this session's branch, so the list names the ids that read them in full.
+const subagentList = (records, inPlace = false) => (records?.length ? `## Subagents that finished ${inPlace ? 'since the last handoff' : 'in the earlier session'}\n${records.map((r) =>
+  `- "${r.description}" (${r.status}${inPlace && r.id ? `, id ${r.id}` : ''}): ${String(r.result ?? r.error ?? '').replace(/\s+/g, ' ').slice(0, 1200)}`).join('\n')}\n`
+  + (inPlace ? 'Their full reports: mina_subagents with the id.\n' : 'Their full reports: mina_recall with the description.\n') : '');
+
+// Subagents that run on through an in-place handoff. Always kept in the packet: without it the agent would not know
+// they exist, and could start the same work again.
+const runningList = (children) => (children?.length ? '## Subagents still running\n'
+  + 'They keep running through this handoff. Their results arrive here as messages; steer_subagent and get_subagent_result work with these ids. '
+  + 'Do not start them again.\n'
+  + children.map((c) => `- ${c.id}: "${c.description ?? ''}" (${[c.type, c.turns != null ? `turn ${c.turns}${c.maxTurns ? ` of ${c.maxTurns}` : ''}` : null,
+    c.taskId && c.taskId !== c.id ? `task ${c.taskId}` : null].filter(Boolean).join(', ')})`).join('\n') + '\n' : '');
 
 const list = (title, items) => (items?.length ? `## ${title}\n${items.map((x) => `- ${x}`).join('\n')}\n` : '');
 
@@ -119,18 +128,27 @@ export function carriedGoal(goal, upstream) {
   return { ...goal };
 }
 
-export function renderPacket({ note = null, goal = null, fallback = null, parentFile, briefs = [], subagents = [], plan = '', minimal = false }, maxBytes = PACKET_MAX_BYTES) {
-  const head = ['# mina handoff packet',
-    minimal ? 'This session continues an earlier one, handed off when its context was full. mina_recall searches the earlier sessions.'
-      : 'This session continues an earlier one that was handed off because its context was full. This packet is a summary written at '
-    + 'the handoff, not proof: for exact earlier text (commands, outputs, decisions), use mina_recall, which searches the earlier sessions.',
-    `Earlier session: ${parentFile ?? 'unknown'}`, ''].join('\n');
-  const goalPart = goal?.status && goal.status !== 'active' ? `## Goal (not active)\n${objectiveText(goal)}\nStatus: ${goal.status} in the earlier session. `
+// inPlace: the handoff reset this session's context instead of opening a new session, because subagents were running
+// (a new session would stop them). The goal, its pi-goal run and the subagents carry on in this session.
+export function renderPacket({ note = null, goal = null, fallback = null, parentFile, briefs = [], subagents = [], running = [], plan = '', minimal = false, inPlace = false }, maxBytes = PACKET_MAX_BYTES) {
+  const head = (inPlace ? ['# mina handoff packet',
+    minimal ? 'This session\'s context was full and was reset in place; running subagents carry on. mina_recall searches the earlier context.'
+      : 'This session\'s context was full, so mina reset it in place: subagents were running, and a new session would have stopped them. '
+    + 'This packet is a summary written at the handoff, not proof: for exact earlier text (commands, outputs, decisions), use mina_recall, '
+    + 'which searches this session and the earlier ones.',
+    `Session: ${parentFile ?? 'unknown'}`, '']
+    : ['# mina handoff packet',
+      minimal ? 'This session continues an earlier one, handed off when its context was full. mina_recall searches the earlier sessions.'
+        : 'This session continues an earlier one that was handed off because its context was full. This packet is a summary written at '
+      + 'the handoff, not proof: for exact earlier text (commands, outputs, decisions), use mina_recall, which searches the earlier sessions.',
+      `Earlier session: ${parentFile ?? 'unknown'}`, '']).join('\n');
+  const goalPart = goal?.status && goal.status !== 'active' ? `## Goal (not active)\n${objectiveText(goal)}\nStatus: ${goal.status}${inPlace ? '' : ' in the earlier session'}. `
     + 'There is no active goal: do not resume work on it unless the user asks.'
-    + (goal.resume_on_request ? ' The user continues it here with /goal resume.' : '') + '\n'
+    + (goal.resume_on_request && !inPlace ? ' The user continues it here with /goal resume.' : '') + '\n'
     : goal ? `## Goal\n${objectiveText(goal)}\nStatus: ${goal.status}${goal.unverified ? ', UNVERIFIED (no checks)' : ''}\n`
-    + 'The goal continues in this session as a new pi-goal run with a new goal_id: any goal_id written below or in the earlier session is stale. '
-    + 'Use the goal_id from the current Goal contract.\n'
+    + (inPlace ? 'The goal continues in this session. Use the goal_id from the current Goal contract.\n'
+      : 'The goal continues in this session as a new pi-goal run with a new goal_id: any goal_id written below or in the earlier session is stale. '
+    + 'Use the goal_id from the current Goal contract.\n')
     + (goal.checks?.length ? `${goal.checkPolicy === 'working' ? 'Agent-selected working checks (editable; not independent qualification)' : 'Accepted checks'} (mina reruns them on goal_complete):\n${goal.checks.map((c) => `- ${c.id}: ${c.command}`).join('\n')}\n` : '')
     + (goal.checks?.length ? `Check approval: ${goal.checkApproval ?? 'legacy, not recorded'}. Protection alone is not independent qualification.\n` : '')
     + (goal.lastStatus ? `${formatStatus(goal.lastStatus)}\nRecorded status only. Handoff did not run these checks. Use mina_checks for fresh results.\n` : '')
@@ -139,13 +157,13 @@ export function renderPacket({ note = null, goal = null, fallback = null, parent
   const required = [head, goalPart];
   const optional = [];
   if (note) {
-    required.push(`## State\n${note.state ?? ''}\n`, list('Next actions', note.next_actions));
+    required.push(`## State\n${note.state ?? ''}\n`, list('Next actions', note.next_actions), runningList(running));
     optional.push(list('Decisions', note.decisions), list('Facts (with their source)', note.facts), list('Failed approaches', note.failed_approaches),
-      list('Open questions', note.open_questions), list('Files changed', note.files), list('Research briefs', briefs), subagentList(subagents));
+      list('Open questions', note.open_questions), list('Files changed', note.files), list('Research briefs', briefs), subagentList(subagents, inPlace));
   } else if (fallback) {
-    required.push('## State (automatic summary: the agent did not write a handoff note)\n', fallback, '\n');
-    optional.push(list('Research briefs', briefs), subagentList(subagents));
-  }
+    required.push('## State (automatic summary: the agent did not write a handoff note)\n', fallback, '\n', runningList(running));
+    optional.push(list('Research briefs', briefs), subagentList(subagents, inPlace));
+  } else required.push(runningList(running));
   let text = [...required, ...optional].join('\n');
   while (Buffer.byteLength(text) > maxBytes && optional.length) { optional.pop(); text = [...required, ...optional].join('\n'); }
   if (Buffer.byteLength(text) > maxBytes) text = `${Buffer.from(text).subarray(0, maxBytes - 40).toString()}\n[packet truncated at ${maxBytes} bytes]`;
@@ -153,9 +171,9 @@ export function renderPacket({ note = null, goal = null, fallback = null, parent
 }
 
 export const NOTE_REQUEST = [
-  'mina: this session\'s context is nearly full, so it will be handed off to a fresh session now.',
-  'Pause the conversation and call mina_handoff_note once. Running broker jobs, monitors and background processes keep going',
-  'under their own supervision, and their alarms reach the next session: do not stop, cancel or wait for them.',
+  'mina: this session\'s context is nearly full, so the work will continue from a handoff note in a fresh context now.',
+  'Pause the conversation and call mina_handoff_note once. Running broker jobs, monitors, subagents and background processes keep going',
+  'under their own supervision, and their alarms and results reach the fresh context: do not stop, cancel or wait for them.',
   'Write the note for a capable colleague who has not seen this session:',
   'the current state, including running jobs and monitors with their IDs and how to check them, decisions with their reasons,',
   'facts with their source (file, command, paper), approaches that failed and why, open questions, the exact next actions,',

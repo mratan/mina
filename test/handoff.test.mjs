@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { thresholds, tuningForModel, poolBudget, poolCap, poolThresholds, spawnFits, handoffDue, hotCompactConfig, renderPacket, goalRestatement, NOTE_REQUEST } from '../extensions/handoff/policy.mjs';
 import { lineage, search, readEntry } from '../extensions/handoff/recall.mjs';
 process.env.MINA_METRICS_FILE = join(mkdtempSync(join(tmpdir(), 'mina-metrics-')), 'metrics.jsonl'); // tests never write the real file
-import minaHandoff, { MARKER, REMIND_EVERY, RESUME_REQUEST, fallbackSummary } from '../extensions/handoff/index.js';
+import minaHandoff, { MARKER, REMIND_EVERY, RESUME_REQUEST, fallbackSummary, IN_PLACE, PACKET_ENTRY, IN_PLACE_SUMMARY, RESUME_IN_PLACE, sinceLastReset } from '../extensions/handoff/index.js';
 
 test('thresholds: tuning values, else 40% / 60% of the window, capped at 250K / 350K (usage economics, 2026-10-17)', () => {
   assert.deepEqual(thresholds({ compact_at_tokens: 60000, handoff_at_tokens: 90000 }, 131072), { compactAt: 60000, handoffAt: 90000, maxCompactions: 2 });
@@ -415,17 +415,6 @@ test('running subagents lower the handoff threshold', async () => {
   assert.deepEqual(f.sent.map((x) => x.text), [NOTE_REQUEST]);   // cap 71K with one subagent
 });
 
-test('the handoff waits for running subagents, carries their results, then goes', async () => {
-  const f = fake({ tokens: 95_000, file: '/s/a.jsonl', tuning: POOL });
-  f.pi.events.emit('subagents:started', { id: 'a1' });
-  await f.tools.mina_handoff_note.execute('id', { state: 's', next_actions: ['n'] }, null, null, f.ctx);
-  assert.ok(!f.sent.some((x) => x.text === '/mina-handoff now'));
-  f.pi.events.emit('subagents:completed', { id: 'a1', description: 'Carry strategy family delegate', status: 'completed', result: 'headline carry_z252: ExSh 0.21' });
-  assert.equal(f.sent.at(-1).text, '/mina-handoff now');
-  await f.commands['mina-handoff'].handler('now', f.ctx);
-  assert.match(f.newSessions[0].messages[0].content, /Subagent "Carry strategy family delegate" completed: headline carry_z252/);
-});
-
 test('a manual /mina-handoff waits for running subagents unless forced', async () => {
   const f = fake({ tokens: 95_000, file: '/s/a.jsonl', tuning: POOL });
   f.pi.events.emit('subagents:started', { id: 'a1' });
@@ -532,24 +521,6 @@ test('no handoff decision at the boundary that commits a compaction: the size is
   assert.deepEqual(f.sent.map((x) => x.text), [NOTE_REQUEST]);
 });
 
-test('after the note, a run woken in the old session (a subagent finished) is stopped; its result goes into the packet', async () => {
-  const f = fake({ tokens: 95_000, file: '/s/a.jsonl', tuning: POOL });
-  f.pi.events.emit('subagents:started', { id: 'b1' });
-  f.pi.events.emit('subagents:started', { id: 'b2' });
-  await f.emit('agent_start', {});
-  assert.equal(f.ctx.aborted, 0);                                 // before the note: runs are normal
-  await f.tools.mina_handoff_note.execute('id', { state: 's', next_actions: ['n'] }, null, null, f.ctx);
-  f.pi.events.emit('subagents:completed', { id: 'b1', description: 'B1 overlay', status: 'completed', result: 'overlay ExSh 0.41' });
-  await f.emit('agent_start', {});                                // the completion message starts a run
-  assert.equal(f.ctx.aborted, 1);
-  assert.ok(!f.sent.some((x) => x.text === '/mina-handoff now'));  // B2 still running
-  f.pi.events.emit('subagents:completed', { id: 'b2', description: 'B2 futures', status: 'completed', result: 'futures sweep done' });
-  assert.equal(f.sent.at(-1).text, '/mina-handoff now');
-  await f.commands['mina-handoff'].handler('now', f.ctx);
-  const p = f.newSessions[0].messages[0].content;
-  assert.match(p, /B1 overlay" completed: overlay ExSh 0\.41/); assert.match(p, /B2 futures" completed: futures sweep done/);
-});
-
 test('the packet lists the subagents that finished in the earlier session, also after a restart', async () => {
   const rec = { type: 'custom', customType: 'subagents:record', data: { id: 'x', description: 'B2 micro_futures candidate family', status: 'completed', result: 'Headline mf_vt0.08,\n pre-2016 ExSh 0.58' } };
   const f = fake({ tokens: 95_000, file: '/s/a.jsonl', branch: [rec, { type: 'custom', customType: 'mina-handoff-note', data: { state: 's', next_actions: ['n'] } }] });
@@ -647,8 +618,9 @@ test('when a subagent finishes, mina tells the agent where its result is (pi-sub
     result: 'Race condition (MAJOR)...\nVERDICT: CONCERNS' });
   const note = f.sent.find((x) => /subagent "Audit cache_layer for race conditions" \(a1b2c3d4\) finished[^]*VERDICT: CONCERNS[^]*mina_subagents[^]*a1b2c3d4/.test(x.text));
   assert.ok(note, JSON.stringify(f.sent)); assert.equal(note.opts.deliverAs, 'steer');
-  f.pi.events.emit('subagents:failed', { id: 'b2', description: 'x', status: 'error', error: 'out of turns' });
-  assert.ok(f.sent.some((x) => /subagent "x" \(b2\) failed: out of turns/.test(x.text)));
+  f.pi.events.emit('subagents:failed', { id: 'b2', description: 'x', status: 'failed',
+    error: 'The model hit its output limit. Use Agent with resume: "b2" to continue this child.', result: 'Partial text…' });
+  assert.ok(f.sent.some((x) => /subagent "x" \(b2\) failed: The model hit its output limit.*resume: "b2"/.test(x.text)));
 });
 
 test('with keep_reasoning_turns in the tuning, each request carries reasoning only from the last N assistant messages', async () => {
@@ -699,32 +671,6 @@ test('a handoff that does not start within the stall limit is abandoned, and the
   assert.deepEqual(f.sent.slice(-1).map((x) => [x.text, x.opts.deliverAs]), [['Stop preparing. Run the first GPU arm.', 'steer']]);
   // back to normal: with the context still full, the next message starts a fresh handoff attempt (new stall timer)
   assert.equal((await f.emit('input', { source: 'interactive', text: 'and this' }))?.action, 'transform');
-});
-
-// Seen in a long run: the note waited 12 min for a subagent. "Contiue", typed meanwhile, went to the old session, whose
-// run mina stopped at once (agent_start): the message was lost and the goal blocked. A 120 s stall had also abandoned
-// the handoff while the subagent still ran.
-test('while the handoff waits for a running subagent, typed messages are held for the successor, past the stall limit', async () => {
-  let t = 1_000_000;
-  const f = fake({ tokens: 95_000, file: '/s/a.jsonl', tuning: POOL, extra: { now: () => t, stallMs: 120_000 } });
-  f.pi.events.emit('subagents:started', { id: 'a1' });
-  const reg = Symbol.for('pi-subagents:manager');
-  let status = 'running';
-  globalThis[reg] = { getRecord: (id) => ({ id, status, type: 'delegate' }) };
-  try {
-    await f.tools.mina_handoff_note.execute('id', { state: 's', next_actions: ['n'] }, null, null, f.ctx);
-    assert.ok(!f.sent.some((x) => x.text === '/mina-handoff now'));
-    t += 10 * 60_000;
-    assert.deepEqual(await f.emit('input', { source: 'interactive', text: 'Contiue' }), { action: 'handled' });
-    assert.equal(f.sent.length, 0);                                                        // not abandoned, nothing delivered here
-    status = 'completed';
-    f.pi.events.emit('subagents:completed', { id: 'a1', description: 'audit', status: 'completed', result: 'done' });
-    assert.equal(f.sent.at(-1).text, '/mina-handoff now');
-    t += 30_000;
-    assert.deepEqual(await f.emit('input', { source: 'interactive', text: 'and this' }), { action: 'handled' }); // the stall clock restarted
-    await f.commands['mina-handoff'].handler('now', f.ctx);
-    assert.deepEqual(f.newSessions[0].nextSent.map((x) => x.text), ['Contiue', 'and this']);
-  } finally { delete globalThis[reg]; }
 });
 
 test('without a subagent registry, a waiting handoff still stalls out (a stale running count must not hold messages forever)', async () => {
@@ -799,4 +745,157 @@ test('the shipped tuning files: Claude compacts at 250K, Sol at 200K and hands o
   assert.deepEqual(thresholds(sol), { compactAt: 200000, handoffAt: 265000, maxCompactions: 2 });
   const c = hotCompactConfig({}, sol, sol.context_window);
   assert.ok(c.hardPercent * sol.context_window / 100 < 265000 && 265000 < 272000);
+});
+
+// ---- In-place handoff: subagents run inside this Pi process, and a new session stops them (seen 2026-11-17: a note
+// waited over 30 minutes for one GLM worker, with two finished results unread and the user's messages held).
+function registry(records) {
+  const reg = Symbol.for('pi-subagents:manager');
+  globalThis[reg] = { getRecord: (id) => records[id] };
+  return () => { delete globalThis[reg]; };
+}
+const liveRec = (id, description) => ({ id, description, type: 'delegate', status: 'running', maxTurns: 80, taskId: description, toolUses: 0,
+  session: { messages: [{ role: 'assistant' }], getContextUsage: () => ({ tokens: 5000 }) } });
+
+test('with subagents running, the note hands off in place: a compaction that keeps nothing, then the packet; no new session, nothing stopped', async () => {
+  const goal = { id: 'g1', objective: 'build it', status: 'active', checks: [{ id: 'R1', command: 'pytest -q' }] };
+  const done = registry({ c1: liveRec('c1', 'GLM-WORKER-45c') });
+  const seen = [];
+  try {
+    const f = fake({ tokens: 95_000, file: '/s/a.jsonl', branch: [{ type: 'custom', customType: 'mina-goal', data: goal }], measure: (e) => seen.push(e) });
+    f.pi.events.emit('subagents:started', { id: 'c1' });
+    const res = await f.tools.mina_handoff_note.execute('id', { state: 'tests written', next_actions: ['implement merge()'] }, null, null, f.ctx);
+    assert.equal(res.terminate, true); assert.equal(res.details.mode, 'in-place'); assert.match(res.content[0].text, /reset in place/);
+    assert.ok(!f.sent.some((x) => x.text === '/mina-handoff now'));
+    assert.equal(globalThis[Symbol.for('mina:handoff')].pending(), true);
+    await f.emit('agent_start', {});
+    assert.equal(f.ctx.aborted, 0, 'the commit waits for this run\'s next boundary; the run is not stopped');
+    // pi-hot-compact drafted a checkpoint at the same boundary: the packet replaces it; its other drafts stay
+    const hot = { type: 'compaction', summary: 'hot checkpoint', firstKeptEntryId: 'e5' }, edit = { type: 'context_edit', targetId: 'e3', replacement: {} };
+    const r = await f.emit('turn_end', { entries: [hot, edit], message: { role: 'assistant', stopReason: 'toolUse' } });
+    assert.deepEqual(r.entries.map((e) => e.type), ['context_edit', 'compaction', 'custom', 'custom_message']);
+    const [, c, marker, packet] = r.entries;
+    assert.equal(c.firstKeptEntryId, null); assert.equal(c.summary, IN_PLACE_SUMMARY);
+    assert.equal(marker.customType, IN_PLACE); assert.deepEqual(marker.data.subagents_running, ['c1']);
+    assert.equal(packet.customType, PACKET_ENTRY); assert.equal(packet.display, true);
+    const p = packet.content;
+    assert.match(p, /mina reset it in place/); assert.match(p, /Session: \/s\/a\.jsonl/); assert.doesNotMatch(p, /Earlier session/);
+    assert.match(p, /## State\ntests written/); assert.match(p, /implement merge\(\)/); assert.match(p, /R1: pytest -q/);
+    assert.match(p, /## Subagents still running\n[^]*Do not start them again\.\n- c1: "GLM-WORKER-45c" \(delegate, turn 1 of 80, task GLM-WORKER-45c\)/);
+    assert.match(p, /The goal continues in this session\. Use the goal_id from the current Goal contract\./); assert.doesNotMatch(p, /new goal_id/);
+    assert.equal(f.newSessions.length, 0);
+    assert.equal(globalThis[Symbol.for('mina:handoff')].pending(), false);
+    assert.deepEqual(f.sent, [], 'pi-goal continues the active goal after this run, as after any run');
+    assert.deepEqual(seen.filter((e) => e.kind === 'handoff').map((e) => [e.mode, e.tokens, e.subagents_running, e.note]), [['in-place', 95_000, 1, true]]);
+  } finally { done(); }
+});
+
+test('after an in-place handoff: no decision until the reset context has a size, compactions count from the marker, and the next handoff without subagents opens a new session', async () => {
+  const branch = [{ type: 'compaction', summary: 'c1' }, { type: 'compaction', summary: 'c2' }, { type: 'compaction', summary: 'c3' }];
+  const recs = { k1: liveRec('k1', 'GLM-WORKER-45c') };
+  const done = registry(recs);
+  try {
+    const f = fake({ tokens: 95_000, file: '/s/a.jsonl', branch });
+    f.pi.events.emit('subagents:started', { id: 'k1' });
+    await f.tools.mina_handoff_note.execute('id', { state: 'OLD STATE', next_actions: ['n'] }, null, null, f.ctx);
+    branch.push({ type: 'custom', customType: 'mina-handoff-note', data: { state: 'OLD STATE', next_actions: ['n'] } });
+    branch.push(...(await f.emit('turn_end', {})).entries);                      // Pi commits the drafts
+    assert.deepEqual(sinceLastReset(branch).map((e) => e.customType), [PACKET_ENTRY]);
+    // Pi's usage still shows the size from before the reset: no decision on it
+    assert.equal(await f.emit('input', { source: 'interactive', text: 'status?' }), undefined);
+    f.ctx.usage = { tokens: 20_000, contextWindow: 131072 };
+    await f.emit('turn_end', {});                                                  // the reset context's first size
+    f.ctx.usage = { tokens: 70_000, contextWindow: 131072 };
+    await f.emit('turn_end', {});
+    assert.equal(f.sent.filter((x) => x.text === NOTE_REQUEST).length, 0, 'the compactions before the reset do not count');
+    // the subagent finishes in this session: the agent is told, as always
+    recs.k1.status = 'completed';
+    f.pi.events.emit('subagents:completed', { id: 'k1', description: 'GLM-WORKER-45c', status: 'completed', result: 'scripts done' });
+    assert.match(f.sent.at(-1).text, /subagent "GLM-WORKER-45c" \(k1\) finished: scripts done/);
+    branch.push({ type: 'custom', customType: 'subagents:record', data: { id: 'k1', description: 'GLM-WORKER-45c', status: 'completed', result: 'scripts done' } });
+    f.ctx.usage = { tokens: 95_000, contextWindow: 131072 };
+    await f.emit('turn_end', {});
+    assert.equal(f.sent.at(-1).text, NOTE_REQUEST);
+    await f.tools.mina_handoff_note.execute('id', { state: 'NEW STATE', next_actions: ['m'] }, null, null, f.ctx);
+    assert.equal(f.sent.at(-1).text, '/mina-handoff now');                         // nothing running: a new session
+    await f.commands['mina-handoff'].handler('now', f.ctx);
+    const p = f.newSessions[0].messages[0].content;
+    assert.match(p, /NEW STATE/); assert.doesNotMatch(p, /OLD STATE/);
+    assert.match(p, /Subagents that finished in the earlier session\n- "GLM-WORKER-45c" \(completed\): scripts done/);
+  } finally { done(); }
+});
+
+test('/mina-handoff after an in-place handoff does not reuse the note that handoff used; its fallback starts from the packet', async () => {
+  const branch = [{ type: 'custom', customType: 'mina-handoff-note', data: { state: 'OLD STATE', next_actions: ['n'] } },
+    { type: 'compaction', summary: IN_PLACE_SUMMARY, firstKeptEntryId: null, details: { minaHandoff: 'in-place' } },
+    { type: 'custom', customType: IN_PLACE, data: {} },
+    { type: 'custom_message', customType: PACKET_ENTRY, content: '# mina handoff packet\nPACKET BODY' },
+    { type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'merged the reader' }] } }];
+  const f = fake({ tokens: 95_000, file: '/s/a.jsonl', branch });
+  await f.commands['mina-handoff'].handler('now', f.ctx);
+  const p = f.newSessions[0].messages[0].content;
+  assert.match(p, /automatic summary/); assert.doesNotMatch(p, /## State\nOLD STATE/);
+  assert.match(p, /PACKET BODY[^]*merged the reader/); assert.doesNotMatch(p, /The handoff packet follows/);
+  assert.equal(f.newSessions[0].custom[0].d.note, false);
+});
+
+test('while an in-place handoff waits for its boundary: a typed message is held and delivered after the reset, a finished subagent\'s result goes into the packet', async () => {
+  const recs = { b1: liveRec('b1', 'B1 overlay'), b2: liveRec('b2', 'B2 futures') };
+  const done = registry(recs);
+  try {
+    const f = fake({ tokens: 95_000, file: '/s/a.jsonl' });
+    f.pi.events.emit('subagents:started', { id: 'b1' }); f.pi.events.emit('subagents:started', { id: 'b2' });
+    await f.tools.mina_handoff_note.execute('id', { state: 's', next_actions: ['n'] }, null, null, f.ctx);
+    assert.deepEqual(await f.emit('input', { source: 'interactive', text: 'Contiue' }), { action: 'handled' });
+    recs.b2.status = 'completed';
+    f.pi.events.emit('subagents:completed', { id: 'b2', description: 'B2 futures', status: 'completed', result: 'futures sweep done' });
+    const r = await f.emit('turn_end', { message: { role: 'assistant', stopReason: 'toolUse' } });
+    const p = r.entries.at(-1).content;
+    assert.match(p, /B2 futures" completed: futures sweep done/);
+    assert.match(p, /- b1: "B1 overlay"/); assert.doesNotMatch(p, /- b2: "B2 futures"/);
+    assert.deepEqual(f.sent.map((x) => [x.text, x.opts?.deliverAs]), [['Contiue', 'followUp']]);
+    assert.equal(f.newSessions.length, 0);
+  } finally { done(); }
+});
+
+test('in place, a goal-less run interrupted in its tool loop is resumed; with an active goal pi-goal continues it and mina sends nothing', async () => {
+  const goal = { type: 'custom', customType: 'mina-goal', data: { id: 'g', objective: 'build', status: 'active' } };
+  for (const [branch, expected] of [[[], [RESUME_IN_PLACE]], [[goal], []]]) {
+    const done = registry({ c1: liveRec('c1', 'worker') });
+    try {
+      const f = fake({ tokens: 9_000, file: '/s/a.jsonl', branch });
+      await f.emit('turn_end', { message: { role: 'assistant', stopReason: 'toolUse' } });
+      f.pi.events.emit('subagents:started', { id: 'c1' });
+      f.ctx.usage = { tokens: 97_000, contextWindow: 131072 };
+      await f.emit('turn_end', { message: { role: 'assistant', stopReason: 'toolUse' } });
+      assert.deepEqual(f.sent.map((x) => x.text), [NOTE_REQUEST]);
+      await f.tools.mina_handoff_note.execute('id', { state: 's', next_actions: ['n'] }, null, null, f.ctx);
+      await f.emit('turn_end', { message: { role: 'assistant', stopReason: 'toolUse' } });
+      assert.deepEqual(f.sent.slice(1).map((x) => x.text), expected);
+      assert.equal(f.newSessions.length, 0);
+    } finally { done(); }
+  }
+});
+
+test('a run asked for the note that ends without one hands off in place when subagents are running', async () => {
+  const done = registry({ c1: liveRec('c1', 'worker') });
+  try {
+    const f = fake({ tokens: 95_000, file: '/s/a.jsonl', branch: [{ type: 'compaction', summary: 'SUMMARY-123' }] });
+    f.pi.events.emit('subagents:started', { id: 'c1' });
+    assert.equal((await f.emit('input', { source: 'interactive', text: 'what next?' })).action, 'transform');
+    const r = await f.emit('agent_before_settle', { entries: [] });
+    assert.match(r.entries.at(-1).content, /automatic summary[^]*SUMMARY-123/);
+    await f.emit('agent_settled', {});
+    assert.ok(!f.sent.some((x) => x.text === '/mina-handoff now'));
+    assert.deepEqual(f.sent.map((x) => x.text), ['what next?']);
+    assert.equal(f.newSessions.length, 0);
+  } finally { done(); }
+});
+
+test('the in-place packet header, and in-place handoffs in the measurement summary', async () => {
+  assert.match(renderPacket({ parentFile: '/s/a', inPlace: true, minimal: true }), /^# mina handoff packet\nThis session's context was full and was reset in place; running subagents carry on\./);
+  assert.match(renderPacket({ parentFile: '/s/a', inPlace: true }), /not proof/);
+  const { summarize } = await import('../extensions/handoff/metrics.mjs');
+  const [row] = summarize([{ kind: 'handoff', model: 'm', mode: 'in-place', tokens: 1 }, { kind: 'handoff', model: 'm', mode: 'new', tokens: 2 }]);
+  assert.deepEqual([row.handoffs, row.in_place_handoffs], [2, 1]);
 });

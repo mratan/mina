@@ -1087,7 +1087,7 @@ test('a long question keeps a short dialog; full details open in a scrollable vi
   assert.ok(plainTitle.includes(p.operator_action.commands));
 });
 
-test('a goal parked after exhausted provider retries is resumed with backoff; a usage limit or an agent\'s own wait is not', async () => {
+test('transient errors use short backoff, but usage limits without reset evidence and agent waits do not', async () => {
   const f = fakePi({ tuning: { provider_retry: { delays_s: [0.05, 0.05] } } });
   let goal = { status: 'active', waiting: { reason: 'Provider retries exhausted: Codex error: An error occurred while processing your request.' } };
   const notes = [];
@@ -1111,6 +1111,30 @@ test('a goal parked after exhausted provider retries is resumed with backoff; a 
   goal = { status: 'active', waiting: { reason: 'Waiting for the benchmark to finish' } };
   await settle();
   assert.equal(resumes(), 3);
+});
+
+test('usage-limit recovery is installed in /goal, and /goal pause cancels its persisted timer', async (t) => {
+  const now = Date.parse('2026-01-01T12:00:00Z');
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now });
+  const f = fakePi();
+  let goal = { id: 'limited-goal', status: 'active' };
+  const ctx = { cwd: project(), hasUI: false, model: { provider: 'openai', id: 'gpt-5' },
+    sessionManager: { getBranch: () => [
+      { type: 'custom', customType: 'goal-state', data: { goal } },
+      ...f.entries.map((e) => ({ ...e, type: 'custom', customType: e.type })),
+    ] } };
+  await f.emit('agent_start', {}, ctx);
+  goal = { ...goal, status: 'usage_limited' };
+  await f.emit('turn_end', { message: { role: 'assistant', stopReason: 'error', errorMessage: 'usage limit reached. Try again in ~300 min.' } }, ctx);
+  await f.emit('agent_settled', {}, ctx);
+  const pending = () => f.entries.filter((e) => e.type === 'mina-goal-usage-resume').at(-1)?.data;
+  assert.equal(pending().resumeAt, now + 301 * 60_000);
+  await f.commands.goal.handler('pause', ctx);
+  assert.equal(pending(), null);
+  assert.deepEqual(f.upstream, ['pause']);
+  t.mock.timers.tick(6 * 3_600_000);
+  assert.deepEqual(f.sent, []);
+  await f.emit('session_shutdown', {}, ctx);
 });
 
 test('a --check goal freezes .mina/checks/ at the start, and check bytecode is not a change (2026-10-14: completion refused)', async () => {

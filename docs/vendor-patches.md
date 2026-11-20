@@ -20,6 +20,8 @@ Mina pins its dependencies. One package carries local patches until upstream pro
 
 The first patch forwards Claude Code's `rate_limit_event` frames through Pi's `provider_stream_event` hook.
 The frames need no extra request. The footer (`extensions/codex-usage`) shows the reported plan limits.
+Goal recovery (`extensions/goal/usage-resume.mjs`) uses rejected renewable limits to resume after the reported reset.
+Recovery accepts only events for the selected account and model. It never changes the selected provider or model.
 This patch first shipped in `0.2.4-mina.1`.
 
 The footer reads no Claude Code credentials and makes no requests for these events.

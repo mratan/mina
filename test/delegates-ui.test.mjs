@@ -144,6 +144,9 @@ test('result rows tolerate receipts, summaries, unchanged replies, pages and tas
     receipts: { calls: 2, errors: 0, tools: { literature_search: { calls: 2, ok: 2, items: 50 } }, error_samples: [] }, outcome: { lifecycle: 'completed', task: 'unknown', evidence: 'unknown' } };
   assert.equal(lines(renderAgentResult({ details: base }, {}, theme, {})), '✓ ↻3≤20 · 2 tool uses\n  ⎿  Done');
   assert.equal(lines(renderChildResult('get_subagent_result', { details: { ...base, resultChars: 10 } }, { expanded: true }, theme, {})), '✓ ↻3≤20 · 2 tool uses\n  ⎿  Done');
+  const cutoff = { details: { ...base, status: 'failed', stopReason: 'length', error: 'Output limit', result: 'Partial\u001b[2J report…' } };
+  assert.match(lines(renderChildResult('get_subagent_result', cutoff, { expanded: true }, theme, {})), /Error: Output limit\n {2}Partial report…$/);
+  assert.doesNotMatch(lines(renderChildResult('get_subagent_result', cutoff, {}, theme, {})), /Partial report/);
   assert.equal(lines(renderChildResult('get_subagent_result', { details: { id: 'abc', status: 'completed', revision: 2, resultChars: 10, unchanged: true } }, {}, theme, {})), '  ⎿  Unchanged since revision 2 (completed)');
   assert.match(lines(renderChildResult('get_subagent_result', { details: { ...base, result: 'abc', resultOffset: 4, resultChars: 10, nextOffset: 7 } }, {}, theme, {})), /\n {2}⎿ {2}Characters 4–7 of 10; more from offset 7$/);
   const task = { taskId: 't\u001b[31m1', supersedes: [], supersededBy: ['t2'], attempts: [{ id: 'a', status: 'failed' }, { id: 'b', status: 'completed' }], latest: { id: 'b', status: 'completed' } };

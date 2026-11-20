@@ -155,7 +155,7 @@ Mina then keeps room in the pool for one reply, one compaction job, and each run
 - The context of the session can use at most `tokens` minus the reserves. Each running subagent lowers this cap by its reserve.
 - Mina hands off earlier while subagents run.
 - Mina refuses a subagent that does not fit.
-- Mina waits for running subagents before a handoff.
+- While subagents run, a handoff resets the context in place, and the subagents continue.
 
 In the example, the cap is 91,072 tokens without subagents, 71,072 with one, and 51,072 with two.
 Mina cannot see other Mina instances or other clients of the server. Thus, run only one Mina instance at a time on such a server.

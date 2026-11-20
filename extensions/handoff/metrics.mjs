@@ -43,6 +43,7 @@ export function summarize(events) {
     failed_jobs: s.failures.length,
     median_failed_job_seconds: median(s.failures.map((c) => c.job_s)),
     handoffs: s.handoffs.length,
+    in_place_handoffs: s.handoffs.filter((h) => h.mode === 'in-place').length,
     median_handoff_tokens: median(s.handoffs.map((h) => h.tokens)),
     median_compactions_at_handoff: median(s.handoffs.map((h) => h.compactions)),
     sessions: s.sessions.length,

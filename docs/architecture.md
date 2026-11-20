@@ -42,7 +42,7 @@ Mina then loads only its own explicit layers, and in `--full` mode also your glo
 | Part | Where | What it does |
 |---|---|---|
 | Launcher | `bin/mina.mjs` | Selects the mode and the tuning file, opens the instance scope and the outer sandbox layer, opens a host session, and starts Pi with the layers. |
-| Goal layer | `extensions/goal/` | Wraps the unmodified `pi-goal` package. It adds checks, check runs at completion, questions to the user, operator procedures, provider-error recovery, and the no-effect guard. |
+| Goal layer | `extensions/goal/` | Wraps the unmodified `pi-goal` package. It adds checks, check runs at completion, questions to the user, operator procedures, provider-error recovery, reset-aware usage recovery, and the no-effect guard. |
 | Compaction | `extensions/compact/` | Wraps the unmodified `pi-hot-compact` package. It applies the thresholds of the live model, also after `/model`. |
 | Handoff | `extensions/handoff/` | Writes the handoff packet, starts the successor session, holds typed messages, and gives `mina_recall`. |
 | Research | `adapters/pi-research-search/`, `extensions/literature/`, `literature/` | `research_search`, `web_fetch`, the literature broker tools, `literature_db`, and `supplement_get`. See [research literature](research-literature.md). |
@@ -87,7 +87,21 @@ Behavior is better left to the model and to the deterministic gates. This follow
 
 When Pi's own retries of a provider error are exhausted, pi-goal parks the goal until someone resumes it. One transient error can then stop a run for hours.
 Mina resumes such a goal after a backoff: 2, 5, and 15 minutes by default (tuning key `provider_retry.delays_s`). It tells the user at each attempt and stops after the last one.
-Mina does not retry a usage-limit error (`usage_limited`), because a retry only spends calls until the quota resets.
+
+For a usage-limit error (`usage_limited`), Mina waits for a reset time from the provider, then resumes the same goal.
+Codex OAuth and Anthropic OAuth use their quota-free usage endpoints, including exhausted weekly limits and applicable model limits.
+Claude SDK uses reset events from its own account, including configured account profiles. It reads no credentials and makes no usage request.
+API models use explicit reset information in the error or a 429 response header, when the provider exposes it.
+
+Mina adds one minute for clock differences and rounded reset times. Billing errors and unknown reset times leave the goal parked.
+
+The session stores the pending deadline. Mina restores it when you reopen that session with `/resume`.
+Mina must remain open to resume automatically. It does not start a closed process.
+
+Human input, a model change, session navigation, or `/goal pause` cancels the pending resume.
+Subagent notifications and host alarms do not cancel the pending resume.
+Before the resume, Mina checks the goal, model, idle state, and pending messages. The normal goal budgets and checks still apply.
+The resume keeps the selected provider and model. This recovery never switches from Claude to Codex, or from one Claude account to another.
 
 ### The no-effect guard
 
@@ -120,6 +134,15 @@ It occurs only at a safe point: no tool runs and no queued input waits.
 The agent writes a note with `mina_handoff_note`. Mina then starts a linked successor session with a packet of at most 16 KB: the note, the goal, the checks with their recorded results, the plan, and the research briefs.
 A handoff does not run the checks again. A protected check whose script changed shows NOT RUN, not PASS.
 The successor starts on the model and thinking level of the earlier session. The packet is a summary, not proof. For exact detail, the agent uses `mina_recall`.
+
+Subagents run in the Pi process of the session, and a new session stops them. Thus, if subagents run when the note is recorded, the handoff occurs in place:
+
+- At the next boundary of the run, Mina adds a compaction that keeps no earlier entries, and then the packet as a message. The packet also lists the running subagents with their IDs.
+- The session, the pi-goal run of the goal, and the subagents continue. Their results arrive as usual.
+- The count of compactions for the next handoff starts again after the handoff. Mina makes no handoff decision until the reset context has a size of its own.
+- The next handoff that finds no running subagent starts a new session. Nothing waits for that time.
+
+Only `/mina-handoff` asks for a new session. It waits for running subagents, or stops them with `force`.
 
 ## Model tuning files
 

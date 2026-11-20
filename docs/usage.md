@@ -150,7 +150,19 @@ The agent records your report with `mina_operator_status`. This record is not an
   - A change to the checks or their results.
 
   A run that waits with `goal_wait` for a live broker job does not count.
-- **Provider errors.** After a provider error, Mina resumes the goal after 2, 5, and 15 minutes. It does not resume after a usage-limit error.
+- **Provider errors.** After a transient provider error, Mina resumes the goal after 2, 5, and 15 minutes.
+- **Usage limits.** When the provider reports a reset time, Mina waits until that time plus one minute, then resumes the same goal.
+  Codex OAuth and Anthropic OAuth support usage endpoints. Claude SDK uses reset events from its own account, including configured account profiles.
+  API models require explicit reset information from their errors or 429 response headers.
+  The resume keeps the selected provider and model. This recovery never switches from Claude to Codex.
+
+  Exhausted weekly limits can extend the wait. Billing errors and unknown reset times leave the goal parked.
+  Mina shows the resume time and stores it in the session. `/resume` restores a pending wait after a restart.
+  Mina must remain open for automatic resumption. It does not restart itself.
+
+  Human input, a model change, session navigation, or `/goal pause` cancels the pending resume.
+  Subagent notifications and host alarms do not cancel the pending resume.
+  The goal keeps its checks and cumulative usage. Normal goal budgets still apply.
 - **Turn limits.** pi-goal has its own limits. Set them with `/goal` → **Settings…**, or in `~/.pi/agent/pi-goal.json`:
   - `automaticTurns`: the number of model responses in automatic goal work, tool loops included, before pi-goal pauses the goal. The default is 25.
   - `noProgressTurns`: the number of repeated replies without tools before pi-goal pauses the goal. The default is 3.
@@ -174,15 +186,16 @@ Pi's session file keeps every message and every tool output, and the agent can s
 - **Handoff.** When the context is nearly full, the agent writes a short handoff note.
   The work then continues in a new session with the note, the goal, and the checks.
   Running broker jobs and monitors continue. The note records their IDs.
+  If subagents run, the context of the current session is reset to the note instead, and the subagents continue.
 
 A handoff also occurs at the compaction threshold after two compactions (tuning key `max_compactions`).
 The thresholds of each model are in [the models guide](models.md#context-thresholds).
 
 | Command or tool | What it does |
 |---|---|
-| `/mina-handoff` | Starts a handoff. The agent writes a note first. |
-| `/mina-handoff now` | Starts a handoff without a note. |
-| `/mina-handoff force` | Starts a handoff and stops running subagents. |
+| `/mina-handoff` | Starts a handoff to a new session. The agent writes a note first. The handoff waits for running subagents. |
+| `/mina-handoff now` | Starts a handoff to a new session without a note. |
+| `/mina-handoff force` | Starts a handoff to a new session and stops running subagents. |
 | `/hot-compact status`, `now`, `on`, `off` | Shows or controls the compaction. |
 | `/recall <query>` | Searches the uncompacted history of this session. |
 | `context_recall` (agent tool) | Searches the uncompacted history of this session. The checkpoint refers to its entries as `event://N`. |
@@ -190,9 +203,9 @@ The thresholds of each model are in [the models guide](models.md#context-thresho
 | `mina_subagents` (agent tool) | Lists finished subagents of this session and returns their reports in full. |
 
 During a handoff, Mina holds the messages that you type and delivers them in the new session.
-The handoff waits for running subagents, because a handoff stops them.
+An automatic handoff does not wait for running subagents. It resets the context in place, and the subagents continue.
 If a handoff does not start within 120 seconds, Mina cancels it and delivers the held messages in the current session.
-This limit does not apply while subagents run.
+This limit does not apply while `/mina-handoff` waits for subagents.
 
 ## Subagents
 

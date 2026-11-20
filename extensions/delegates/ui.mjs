@@ -179,19 +179,17 @@ export function renderAgentResult(result, { expanded = false, isPartial = false 
     return box;
   }
   const duration = d.startedAt && d.completedAt ? ` ${theme.fg('dim', '·')} ${theme.fg('dim', formatMs(d.completedAt - d.startedAt))}` : '';
+  const body = expanded ? clean(d.result ?? '') : '';
+  const lines = body ? body.split('\n') : [];
+  const report = lines.slice(0, 50).map((l) => `\n${theme.fg('dim', `  ${l}`)}`).join('')
+    + (lines.length > 50 ? `\n${theme.fg('muted', '  ... (get_subagent_result shows the full result)')}` : '');
   if (status === 'completed') {
-    let line = theme.fg('success', '✓') + (s ? ` ${s}` : '') + duration;
-    const body = clean(d.result ?? '');
-    if (expanded && body) {
-      const lines = body.split('\n');
-      line += lines.slice(0, 50).map((l) => `\n${theme.fg('dim', `  ${l}`)}`).join('');
-      if (lines.length > 50) line += `\n${theme.fg('muted', '  ... (get_subagent_result shows the full result)')}`;
-    } else line += `\n${theme.fg('dim', '  ⎿  Done')}`;
-    return new Text(line, 0, 0);
+    const line = theme.fg('success', '✓') + (s ? ` ${s}` : '') + duration;
+    return new Text(line + (report || `\n${theme.fg('dim', '  ⎿  Done')}`), 0, 0);
   }
-  if (status === 'stopped') return new Text(`${theme.fg('dim', '■')}${s ? ` ${s}` : ''}${duration}\n${theme.fg('dim', '  ⎿  Stopped')}`, 0, 0);
+  if (status === 'stopped') return new Text(`${theme.fg('dim', '■')}${s ? ` ${s}` : ''}${duration}\n${theme.fg('dim', '  ⎿  Stopped')}${report}`, 0, 0);
   const why = status === 'aborted' ? theme.fg('warning', '  ⎿  Aborted (turn limit reached)') : theme.fg('error', `  ⎿  Error: ${firstLine(d.error ?? 'unknown', 400)}`);
-  return new Text(`${theme.fg('error', '✗')}${s ? ` ${s}` : ''}${duration}\n${why}`, 0, 0);
+  return new Text(`${theme.fg('error', '✗')}${s ? ` ${s}` : ''}${duration}\n${why}${report}`, 0, 0);
 }
 
 // `label(id)` names a child this runtime knows ("delegate  description"); otherwise the row shows the short id.

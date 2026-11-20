@@ -10,6 +10,46 @@ import { needsSandbox } from './capabilities.mjs';
 const CAPPED = { '.pi/agents/capped.md': '---\nname: capped\ntools: read\nmax_turns: 3\n---\nWork.' };
 const done = () => fauxAssistantMessage('done');
 
+test('provider length cutoff fails the child, preserves partial text, and can resume the same child', { skip: needsSandbox }, async () => {
+  const f = await fixture([fauxAssistantMessage('Partial report…', { stopReason: 'length' }),
+    (ctx) => {
+      assert.ok(ctx.messages.some((m) => m.role === 'assistant' && m.content.some((c) => c.text === 'Partial report…')));
+      return done();
+    }]);
+  try {
+    const a = body(await f.call('Agent', { prompt: 'x', description: 'x' }));
+    const cut = body(await f.call('get_subagent_result', { agent_id: a.id, wait: true }));
+    assert.equal(cut.status, 'failed');
+    assert.equal(cut.stopReason, 'length');
+    assert.match(cut.error, /output limit/);
+    assert.match(cut.error, /resume/);
+    assert.equal(cut.result, 'Partial report…');
+    assert.equal(f.faux.state.callCount, 1, 'no automatic retry');
+    const resumed = body(await f.call('Agent', { prompt: 'finish', description: 'x', resume: a.id, run_in_background: false }));
+    assert.equal(resumed.id, a.id);
+    assert.equal(resumed.status, 'completed');
+    assert.equal(resumed.stopReason, 'stop');
+    assert.equal(resumed.result, 'done');
+    assert.equal(resumed.turns, 2, 'resume does not reset the turn count');
+  } finally { await f.shutdown(); }
+});
+
+test('a thinking-only cutoff does not reuse a previous report, and an exhausted child cannot resume', { skip: needsSandbox }, async () => {
+  const f = await fixture([done(), fauxAssistantMessage({ type: 'thinking', thinking: 'unfinished' }, { stopReason: 'length' })]);
+  try {
+    const a = body(await f.call('Agent', { prompt: 'x', description: 'x', task_id: 'review', max_turns: 2, run_in_background: false }));
+    const cut = body(await f.call('Agent', { prompt: 'continue', description: 'x', resume: a.id, run_in_background: false }));
+    assert.equal(cut.status, 'failed');
+    assert.equal(cut.result, '');
+    assert.match(cut.error, /No turns remain.*task_id: "review"/);
+    await f.reject('Agent', { prompt: 'continue', description: 'x', resume: a.id }, /no turns remaining.*task_id: "review"/i);
+    const summary = body(await f.call('get_subagent_result', { agent_id: a.id, summary_only: true }));
+    assert.equal(summary.revision, cut.revision, 'the refused resume does not replace the cutoff record');
+    assert.equal(summary.stopReason, 'length');
+    assert.equal(f.faux.state.callCount, 2);
+  } finally { await f.shutdown(); }
+});
+
 test('the Agent schema says max_turns is capped by the role', () => {
   const tools = {};
   delegates({ events: new EventEmitter(), registerTool: (t) => { tools[t.name] = t; }, on: () => {}, appendEntry: () => {} },
@@ -70,11 +110,11 @@ test('a role above the 200-turn maximum is capped at 200 and says why', { skip: 
 test('max_turns on a resume is disclosed as ignored, and a later resume clears the note', { skip: needsSandbox }, async () => {
   const f = await fixture([done(), done(), done()], { files: CAPPED });
   try {
-    const a = await f.call('Agent', { prompt: 'x', description: 'x', subagent_type: 'capped', max_turns: 2, run_in_background: false });
+    const a = await f.call('Agent', { prompt: 'x', description: 'x', subagent_type: 'capped', max_turns: 3, run_in_background: false });
     const r1 = body(await f.call('Agent', { prompt: 'more', description: 'x', resume: a.details.id, max_turns: 50, run_in_background: false }));
-    assert.equal(r1.maxTurns, 2);
+    assert.equal(r1.maxTurns, 3);
     assert.equal(r1.requestedMaxTurns, 50);
-    assert.match(r1.maxTurnsNote, /resumed child keeps the turn limit of its first launch \(2/);
+    assert.match(r1.maxTurnsNote, /resumed child keeps the turn limit of its first launch \(3/);
     const r2 = body(await f.call('Agent', { prompt: 'more', description: 'x', resume: a.details.id, run_in_background: false }));
     assert.equal(r2.requestedMaxTurns, undefined);
     assert.equal(r2.maxTurnsNote, undefined);

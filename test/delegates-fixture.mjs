@@ -15,7 +15,7 @@ export const fakeTool = (name, run) => ({ name, label: name, description: `fake 
   execute: async (_id, params) => run(params) });
 
 // `sessionManager: false` gives the minimal embedding without a branch (compatibility mode).
-export async function fixture(responses, { tools = [], files = {}, dirs = [], sessionManager = true } = {}) {
+export async function fixture(responses, { tools = [], files = {}, dirs = [], sessionManager = true, settings = {} } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'mina-audit-project-'));
   const agentDir = mkdtempSync(join(tmpdir(), 'mina-audit-controller-'));
   for (const [path, body] of Object.entries(files)) { mkdirSync(dirname(join(cwd, path)), { recursive: true }); writeFileSync(join(cwd, path), body); }
@@ -32,7 +32,7 @@ export async function fixture(responses, { tools = [], files = {}, dirs = [], se
   const load = (instance = cwd) => {
     const registered = {}, handlers = {};
     const pi = { events: new EventEmitter(), registerTool: (t) => { registered[t.name] = t; }, on: (e, h) => { handlers[e] = h; },
-      appendEntry: (customType, data) => push({ type: 'custom', customType, data }) };
+      appendEntry: (customType, data) => push({ type: 'custom', customType, data }), getSettings: () => settings };
     delegates(pi, { env: { ...env, MINA_INSTANCE_ID: instance } });
     runtimes.push(handlers);
     return registered;

@@ -28,8 +28,15 @@ only when the role declares it.
 A role's `max_turns` (in its `.md` file) is a ceiling. The default is 100 when the file sets none, and no role goes above 200.
 The `max_turns` of an `Agent` call can lower the ceiling but never raise it. A larger request runs at the ceiling. The receipt then
 carries `requestedMaxTurns` and a `maxTurnsNote` that names the ceiling and where it comes from. A resumed child keeps the
-limit of its first launch. A `max_turns` on a resume is reported in the same two fields. To give a child more turns, raise
-`max_turns` in the role file. The model cannot do this, because role files are controller resources.
+limit of its first launch. A `max_turns` on a resume is reported in the same two fields. A resume does not reset the turn count.
+If no turns remain, start a new child with the same `task_id` and brief it on the partial work. The refused resume leaves
+its previous result unchanged. To raise the ceiling, edit `max_turns` in the role file. The model cannot edit role files.
+
+## Request timeouts
+
+Children use Pi's `httpIdleTimeoutMs` and `websocketConnectTimeoutMs` settings. `retry.provider.timeoutMs` takes precedence over `httpIdleTimeoutMs` for provider requests.
+Mina reads the settings when it starts a child. Project settings apply only if the parent session trusts the project.
+These settings do not change server or proxy deadlines.
 
 ## Receipts and outcome
 
@@ -58,6 +65,11 @@ only calls and errors.
 that the child process stopped without an error, not that the assignment was done. Mina has no structured completion report
 from children. It does not derive task or evidence completion from the final narrative or from successful calls. The
 parent judges completion from the receipts, the report and its own checks. The narrative stays verbatim in `result`.
+
+`stopReason` records how the last model reply ended. If the provider reports `length` on the final reply, the child is `failed`,
+not `completed`. `result` contains the partial text from that reply, or no text if the reply contained only reasoning.
+The failure notification gives the reason. If the child has turns left, use `Agent` with `resume` set to its id and a prompt
+to continue. This keeps the conversation, tools, and remaining turn budget. Mina does not retry cutoffs automatically.
 
 ## Tasks and supersession
 

@@ -1,6 +1,6 @@
 // Small native delegation. Children receive an explicit tool subset, never discovery or host grants.
 import { Agent } from '@earendil-works/pi-agent-core';
-import { SessionManager } from '@earendil-works/pi-coding-agent';
+import { SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -19,8 +19,7 @@ const RESEARCH = new Set(['research_search', 'web_fetch', 'literature_search', '
 const result = (value, extra = {}) => ({ content: [{ type: 'text', text: JSON.stringify(value) }], details: { ...value, ...extra } });
 const schema = (properties, required) => ({ type: 'object', properties, ...(required ? { required } : {}) });
 const text = { type: 'string' };
-const lastText = (agent) => agent.state.messages.filter((m) => m.role === 'assistant').map((m) =>
-  m.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n')).filter(Boolean).at(-1) ?? '';
+const assistantText = (m) => m?.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n') ?? '';
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
 const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,64}$/;
 
@@ -105,6 +104,7 @@ function page(textValue, offset, maxChars) {
 
 export default function minaDelegates(pi, { env = process.env } = {}) {
   const instance = env.MINA_INSTANCE_ID ?? `direct-${process.pid}`;
+  const agentDir = env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), '.pi', 'agent');
   let ledger = globalThis[KEY];
   if (!ledger || ledger.instance !== instance) globalThis[KEY] = ledger = { instance, admissions: 0, records: new Map() };
   const owner = randomUUID();
@@ -114,7 +114,7 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
   // Lifecycle status is process state. Task and evidence completion are never inferred from the narrative or the receipts.
   const outcome = (r) => ({ lifecycle: r.status, task: 'unknown', evidence: 'unknown' });
   const published = (r) => ({ id: r.id, description: r.description, type: r.type, status: r.status,
-    result: r.result, error: r.error, maxTurns: r.maxTurns, requestedMaxTurns: r.requestedMaxTurns, maxTurnsNote: r.maxTurnsNote,
+    result: r.result, error: r.error, stopReason: r.stopReason, maxTurns: r.maxTurns, requestedMaxTurns: r.requestedMaxTurns, maxTurnsNote: r.maxTurnsNote,
     turns: r.turns, tools: r.tools, transcript: r.transcript,
     requiredTools: r.requiredTools, taskId: r.taskId, supersedes: r.supersedes, revision: r.revision, resultRevision: r.resultRevision,
     receipts: receiptSummary(r), outcome: outcome(r) });
@@ -150,7 +150,7 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
     try { body = (await runFileOperation('read', { path: join(cwd, '.pi', 'agents', `${type}.md`) }, { cwd, env })).toString(); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
     if (body === undefined) {
-      const path = join(env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent'), 'agents', `${type}.md`);
+      const path = join(agentDir, 'agents', `${type}.md`);
       validateTrustedResources([path], sandboxSettingsFromEnv(env, { cwd }).writable);
       try { body = readFileSync(path, 'utf8'); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -275,6 +275,8 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
       if (args.task_id !== undefined && args.task_id !== r.taskId) throw new Error(`A resumed child keeps its task (${r.taskId}). Start a new child for another task.`);
       if (args.supersedes !== undefined) throw new Error('A resumed child cannot supersede tasks. Start a new child with supersedes.');
       taskBusy(r.taskId, r.id);
+      if (r.turns >= r.maxTurns) throw new Error(`Child ${r.id} has no turns remaining (${r.turns}/${r.maxTurns}). `
+        + `Start a new child with task_id: "${r.taskId}" and brief it on the partial work. No model request was made.`);
       checkRequired(required, r.tools, r.type, r.declaredTools);
       if (required) r.requiredTools = required;
       const asked = args.max_turns !== undefined && args.max_turns !== r.maxTurns;
@@ -318,7 +320,12 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
       // A requirement the selected tools do not meet refuses the launch here, before any transcript or provider request.
       // The refused launch is not a child start, so its reservation is returned (below).
       checkRequired(required, tools.map((t) => t.name), type, d.tools);
-      const store = SessionManager.create(ctx.cwd, join(env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent'), 'mina-subagents'));
+      // A bare Agent skips Pi's session request setup. Use the parent session's effective settings and Pi's timeout precedence.
+      const settings = SettingsManager.inMemory(pi.getSettings?.() ?? {});
+      const idle = settings.getHttpIdleTimeoutMs();
+      const timeoutMs = settings.getProviderRetrySettings().timeoutMs ?? (idle === 0 ? 2_147_483_647 : idle);
+      const websocketConnectTimeoutMs = settings.getWebSocketConnectTimeoutMs();
+      const store = SessionManager.create(ctx.cwd, join(agentDir, 'mina-subagents'));
       const id = randomUUID();
       r = { id, owner, type, description: args.description ?? type, status: 'starting', maxTurns,
         requestedMaxTurns: reduced ? args.max_turns : undefined,
@@ -334,7 +341,8 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
         streamFn: (m, c, options) => {
           if (retired || record.turns >= record.maxTurns) throw new Error(`Child turn limit reached (${record.maxTurns}); partial results retained.`);
           record.turns++;
-          return ctx.modelRegistry.streamSimple(m, c, options);
+          return ctx.modelRegistry.streamSimple(m, c, { ...options, timeoutMs: options?.timeoutMs ?? timeoutMs,
+            websocketConnectTimeoutMs: options?.websocketConnectTimeoutMs ?? websocketConnectTimeoutMs });
         } });
       r.agent = agent;
       r.session = { get messages() { return agent.state.messages; },
@@ -360,19 +368,31 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
         if (!created) ledger.admissions--;
       }
     }
-    r.status = 'running'; r.error = undefined; r.stopped = false; r.startedAt = Date.now(); r.completedAt = undefined; r.revision++;
+    r.status = 'running'; r.error = undefined; r.stopReason = undefined; r.stopped = false; r.startedAt = Date.now(); r.completedAt = undefined; r.revision++;
     if (r.invocation) r.invocation.runInBackground = args.run_in_background !== false;
     pi.events.emit('subagents:started', { id: r.id });
     ui.attach(ctx);
     ui.started(r);
     const record = r;
-    r.run = r.agent.prompt(args.prompt).then(() => {
-      const error = r.agent.state.errorMessage;
-      record.result = lastText(r.agent);
-      record.error = error || r.agent.state.messages.filter((m) => m.role === 'assistant').at(-1)?.errorMessage
-        || (record.stopped ? 'Stopped by the user; partial results retained.' : undefined);
+    const start = r.agent.state.messages.length;
+    const finish = (error) => {
+      // Inspect this run only: an earlier report (or an inherited parent message) is not a new result.
+      const replies = record.agent.state.messages.slice(start).filter((m) => m.role === 'assistant');
+      const last = replies.at(-1);
+      record.stopReason = last?.stopReason;
+      const cutoff = record.stopReason === 'length';
+      record.result = cutoff ? assistantText(last) : replies.map(assistantText).filter(Boolean).at(-1) ?? '';
+      const recovery = record.turns < record.maxTurns
+        ? `Use Agent with resume: "${record.id}" to continue this child.`
+        : `No turns remain. Start a new child with task_id: "${record.taskId}" and brief it on the partial work.`;
+      record.error = error || record.agent.state.errorMessage || last?.errorMessage
+        || (record.stopped ? 'Stopped by the user; partial results retained.' : undefined)
+        || (cutoff ? `The model hit its output limit. ${recovery}` : undefined)
+        || (record.stopReason === 'error' ? 'The model request failed.' : undefined)
+        || (record.stopReason === 'aborted' ? 'The model request was aborted.' : undefined);
       record.status = record.error ? 'failed' : 'completed';
-    }, (error) => { record.result = lastText(r.agent); record.error = error.message; record.status = 'failed'; }).finally(() => {
+    };
+    r.run = r.agent.prompt(args.prompt).then(() => finish(), (error) => finish(error?.message || String(error))).finally(() => {
       record.completedAt = Date.now();
       record.revision++;
       record.resultRevision = record.revision;
@@ -462,7 +482,9 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
       max_turns: { type: 'integer', minimum: 1, maximum: 200, description: "Turn limit for the child. The role's max_turns (default 100, at most 200) is a ceiling: "
         + 'a call can lower it, never raise it. A larger request runs at the ceiling and the receipt shows requestedMaxTurns and maxTurnsNote. '
         + 'A resumed child keeps the limit of its first launch.' }, run_in_background: { type: 'boolean' },
-      inherit_context: { type: 'boolean' }, resume: text, isolation: text,
+      inherit_context: { type: 'boolean' },
+      resume: { ...text, description: 'Child id from this runtime and branch. Continue with its existing context, tools, and remaining turns. Use task_id for a new attempt if no turns remain.' },
+      isolation: text,
       required_tools: { type: 'array', items: text, maxItems: 32, description: 'Tools the child must have. Checked against its actual tools before launch; never grants a tool.' },
       task_id: { ...text, description: 'Stable task id (1-64 of A-Z a-z 0-9 . _ : -). Defaults to the child id. Reuse for a retry of the same task.' },
       supersedes: { type: 'array', items: text, maxItems: 16, description: 'Task or child ids on the current branch that this child replaces. Their records stay; they are not marked done.' } },

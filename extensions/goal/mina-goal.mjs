@@ -10,6 +10,7 @@
 // - research first, through the mina-research skill, unless --no-research.
 // pi-goal is loaded through a proxy that wraps only its /goal command handler; the rest of pi-goal is unchanged.
 import { randomUUID } from 'node:crypto';
+import { installUsageResume } from './usage-resume.mjs';
 import { existsSync, readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, rmSync, renameSync } from '../../sandbox/project-fs.mjs';
 import { join, relative, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -54,6 +55,7 @@ export function archivePreviousGoal(cwd, { now = new Date() } = {}) {
 export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAvailable, tuning = loadTuning(env), measure = record, amendWaitMs = AMEND_WAIT_MS, readTuning = readModelTuning,
   snapshot = (cwd) => gitSnapshot((...a) => pi.exec(...a), cwd) }) {
   let state = null;
+  let usageRecovery = null;
   let upstreamGoal = null; // pi-goal's own /goal handler: the no-effect guard pauses through it
   const decisions = instanceDecisions(env.MINA_INSTANCE_ID);
   const saveDecisions = () => pi.appendEntry?.('mina-decisions', decisions.snapshot());
@@ -214,6 +216,8 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
           }
         }
         let p = parseGoalArgs(args);
+        const command = String(args ?? '').trim().split(/\s+/, 1)[0];
+        if (!['', 'status', 'checks', 'actions', 'list'].includes(command)) usageRecovery?.cancel(ctx);
         // A goal that a handoff carried as blocked or paused has no pi-goal run in this session to resume: /goal resume
         // continues it the way the handoff would have, now that the user asked.
         const carried = p.pass && String(args ?? '').trim() === 'resume' ? lastEntry(ctx) : null;
@@ -297,6 +301,7 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
     },
   });
   goalExtension(proxy);
+  usageRecovery = installUsageResume(pi, { notify, measure });
 
   // When a run ends, the input box must not hold pi-goal's own prompt (see stripGoalPrompts): Pi returns queued
   // messages there when pi-goal aborts a turn to stop a goal.
@@ -323,17 +328,15 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
     return changed ? { messages } : undefined;
   });
 
-  // Provider errors (2026-10-13 23:33: one transient Codex error parked the goal until a person noticed, hours later).
-  // When pi-goal has parked the goal after Pi's own retries were exhausted, mina resumes it after a backoff
-  // (tuning provider_retry.delays_s, default 2, 5 and 15 minutes), and stops after the last one. A usage limit is a
-  // different state (usage_limited) and is not retried: it only spends calls until the quota resets.
+  // Transient provider errors use bounded backoff after Pi's own retries. Usage limits use a separate,
+  // persisted deadline from provider evidence (usage-resume.mjs), not these short retries.
   let retryTimer = null, retryCount = 0;
   const latestGoalState = (ctx) => (ctx?.sessionManager?.getBranch?.() ?? []).filter((e) => e.type === 'custom' && e.customType === 'goal-state').at(-1)?.data?.goal ?? null;
   const scheduleProviderRetry = (ctx) => {
     const retryDelaysMs = (liveTuning(ctx)?.provider_retry?.delays_s ?? [120, 300, 900]).map((s) => s * 1000);
     const g = latestGoalState(ctx);
     const reason = String(g?.waiting?.reason ?? '');
-    if (!g || g.status !== 'active' || !reason.startsWith('Provider retries exhausted')) return;
+    if (usageRecovery.waiting() || !g || g.status !== 'active' || !reason.startsWith('Provider retries exhausted')) return;
     if (retryTimer) return;
     if (retryCount >= retryDelaysMs.length) {
       notify(ctx, `mina: the goal is still parked after ${retryCount} automatic resumes (${reason.slice(0, 160)}). Run /goal resume when the provider works again.`, 'warning');
@@ -345,7 +348,7 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
     retryTimer = setTimeout(() => {
       retryTimer = null;
       const now = latestGoalState(ctx);
-      if (now?.status === 'active' && String(now?.waiting?.reason ?? '').startsWith('Provider retries exhausted')) {
+      if (!usageRecovery.waiting() && now?.id === g.id && now?.status === 'active' && String(now?.waiting?.reason ?? '') === reason) {
         pi.sendUserMessage('/goal resume', { expandPromptTemplates: true });
       }
     }, delay);

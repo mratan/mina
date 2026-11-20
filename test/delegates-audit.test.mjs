@@ -298,7 +298,7 @@ test('literature_db outcomes ok, empty and not_found are counted as such and do 
   try {
     const out = await f.call('Agent', { prompt: 'x', description: 'x', subagent_type: 'db', run_in_background: false });
     assert.deepEqual(out.details.receipts.tools.literature_db, { calls: 3, ok: 1, empty: 1, not_found: 1 });
-    assert.deepEqual(out.details.outcome, { lifecycle: 'completed', task: 'unknown', evidence: 'unknown' });
+    assert.deepEqual(out.details.outcome, { lifecycle: 'completed', termination: 'normal', task: 'unknown', evidence: 'unknown' });
   } finally { await f.shutdown(); }
 });
 

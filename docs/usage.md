@@ -235,8 +235,10 @@ In the sandbox, the agent can start subagents with the `Agent` tool.
 - One launch of Mina can start a maximum of 64 subagents.
 - Each subagent has a maximum of 100 turns by default (200 at most).
 - Subagents run in the sandbox and have no host access.
+- A model request of a subagent that fails with a connection error or a timeout is retried at most two times. No tool call runs again.
 
-Mina records each tool call of a subagent. The parent agent reads these records, not only the final report of the subagent.
+Mina records each tool call of a subagent, and the command, status and exit code of each bash run. It also records how the subagent stopped.
+The parent agent reads these records, not only the final report of the subagent. An exit code of 0 is not a verified test pass.
 See [delegation](delegation.md).
 
 ## Research

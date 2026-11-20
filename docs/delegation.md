@@ -38,6 +38,34 @@ Children use Pi's `httpIdleTimeoutMs` and `websocketConnectTimeoutMs` settings. 
 Mina reads the settings when it starts a child. Project settings apply only if the parent session trusts the project.
 These settings do not change server or proxy deadlines.
 
+## Retries of failed model requests
+
+A child is a bare agent, so Pi's own retry does not apply to it. Mina retries a failed model request of a child when all of these conditions are true:
+
+- Pi classifies the error as transient (`isRetryableAssistantError`), for example a connection error or a timeout.
+- The error is not a context overflow and not the child's turn limit. A usage limit or a quota error is not transient.
+- The child was not stopped, and the runtime is not shutting down.
+
+Mina makes at most two retries. If `retry.maxRetries` is lower, Mina uses that value. If `retry.enabled` is `false`, Mina makes no retries.
+The wait before each retry is Pi's backoff (`retry.baseDelayMs`, doubled for each attempt).
+
+A reply that fails with an error runs none of its tool calls. Mina removes only that reply from the child's context and
+continues. The tool results that the child has already received stay in its context, and no tool call runs again. The
+transcript keeps the failed reply. A retried request does not use a turn. A stop or a shutdown during the wait cancels
+the retry, and the child fails with the error. `retries` lists each retry with its attempt number and error (at most 200 characters).
+
+Mina does not retry an output-limit cutoff, a refused or aborted request, or a failed tool call.
+
+## Instructions to every child
+
+Each child's system prompt ends with the same instruction, whatever its role file says. It tells the child to use its own
+technical judgment, to treat a method in the brief as a suggestion, to say when an assumption in the brief is wrong, and to
+report uncertainty and any verification that it did not complete. It also tells the child not to override a constraint
+that the brief gives as the operator's, and to report the conflict instead.
+
+A child does not see the operator ledger. The `Agent` tool description tells the parent to put the operator's standing
+constraints that apply into the brief, together with the objective and the evidence it wants.
+
 ## Receipts and outcome
 
 Each child record carries `receipts`, which are counted from the structured result of every finished tool call:
@@ -58,11 +86,55 @@ Each child record carries `receipts`, which are counted from the structured resu
 - `error_samples`: the last five error messages, at most 200 characters each, with terminal controls removed.
 - `unfinished`: tool calls that started but did not report an end, for example after an abort.
 
-Receipts never read result text, output files or controller paths. Tools without a structured status (`read`, `bash`, …) count
+Receipts never read result text, output files or controller paths. Tools without a structured status (`read`, `write`, …) count
 only calls and errors.
 
-`outcome` is `{ lifecycle, task: "unknown", evidence: "unknown" }`. `lifecycle` repeats `status`. `completed` means
-that the child process stopped without an error, not that the assignment was done. Mina has no structured completion report
+## Command receipts
+
+Each child record with at least one `bash` run carries `commands`:
+
+- `cwd`: the working folder of the child's commands. A command can change folder itself.
+- `total`, `exited_0`, `exited_nonzero`, and `no_exit`: counts for all runs. Runs that did not finish are in `total` only.
+- `runs`: the last eight runs. Each run has `run_id`, `command` (at most 200 characters), and `status`. It can also have
+  `exit_code`, `seconds`, and `log` (the file with the full output, when the output was too large for the result).
+
+`status` comes from the structured result of the bash tool, not from the child's report:
+
+| Status | Meaning |
+|---|---|
+| `running` | The run started and has not ended. |
+| `exited` | The shell reported `exit_code`. |
+| `interrupted` | The child's run was aborted during the command. |
+| `timed_out` | The bash tool stopped the command at its timeout. |
+| `killed` | The command ended without an exit code, for example by a signal. |
+| `error` | The tool failed without an exit status, for example a sandbox refusal. |
+
+An exit code of 0 is not a verified test pass. It only shows that the shell exited with 0. The assertions are in the output.
+`get_subagent_result({ agent_id, run_id })` returns the command, its status and its output text, paged with `offset` and
+`max_chars`. It reads a live child's context, or else the child's transcript in the controller's `mina-subagents` folder.
+It never reads a transcript path outside that folder. The output is the text that the child received: Pi's bash tool keeps
+the end of a large output, and `log` names the file with the rest.
+
+`outcome` is `{ lifecycle, termination, task: "unknown", evidence: "unknown" }`. `lifecycle` repeats `status`. `completed` means
+that the child process stopped without an error, not that the assignment was done.
+
+`termination` is set when a run ends. It tells how the run ended, not whether the task is done:
+
+| Termination | Cause |
+|---|---|
+| `normal` | The model ended its last reply without an error. |
+| `output_limit` | The last reply reached the output limit (`stopReason: length`). |
+| `transport` | A transient provider error, after the retries. |
+| `provider_error` | A provider error that is not transient, for example a usage limit. |
+| `context_overflow` | The context did not fit the model's window. |
+| `turn_limit` | The child used all its turns. |
+| `stopped` | A person stopped the child. |
+| `aborted` | The model request was aborted for another reason. |
+| `shutdown` | The runtime shut down during the run. |
+| `exception` | The run failed with an internal error. |
+| `other` | The child failed for a reason that is not in this list. |
+
+A count of `normal` terminations is not a count of correct or verified results. Mina has no structured completion report
 from children. It does not derive task or evidence completion from the final narrative or from successful calls. The
 parent judges completion from the receipts, the report and its own checks. The narrative stays verbatim in `result`.
 
@@ -120,6 +192,8 @@ finishes. `resultRevision` is the revision at which the result text last changed
   for example when a resumed run finishes. Tool progress alone does not invalidate pages. An offset past the end fails.
   Nothing is cut silently.
 - `wait: true` waits for a live child in every mode. It has no effect on a historical record.
+- `run_id`: the output of one bash run. See [command receipts](#command-receipts). It cannot be used with `summary_only`,
+  `since_revision` or `revision`.
 
 ## Limits
 

@@ -129,7 +129,7 @@ test('two successful searches stay on record when the child narrative says nothi
     assert.equal(out.details.result, 'Work completed: none.', 'the narrative is kept verbatim');
     assert.deepEqual(out.details.receipts.tools.literature_search, { calls: 2, ok: 2, items: 50 });
     assert.equal(out.details.receipts.calls, 2);
-    assert.deepEqual(out.details.outcome, { lifecycle: 'completed', task: 'unknown', evidence: 'unknown' });
+    assert.deepEqual(out.details.outcome, { lifecycle: 'completed', termination: 'normal', task: 'unknown', evidence: 'unknown' });
     const record = f.state.branch.filter((e) => e.customType === 'subagents:record').at(-1).data;
     assert.deepEqual(record.receipts.tools.literature_search, { calls: 2, ok: 2, items: 50 }, 'durable');
   } finally { await f.shutdown(); }
@@ -165,7 +165,7 @@ test('receipts tell a zero-result search from a failed one, partial text from un
     const sample = out.details.receipts.error_samples.find((e) => e.tool === 'literature_search');
     assert.match(sample.message, /broker timeout/);
     assert.doesNotMatch(sample.message, /\u001b/);
-    assert.deepEqual(out.details.outcome, { lifecycle: 'completed', task: 'unknown', evidence: 'unknown' });
+    assert.deepEqual(out.details.outcome, { lifecycle: 'completed', termination: 'normal', task: 'unknown', evidence: 'unknown' });
   } finally { await f.shutdown(); }
 });
 

@@ -1,9 +1,10 @@
 // Small native delegation. Children receive an explicit tool subset, never discovery or host grants.
 import { Agent } from '@earendil-works/pi-agent-core';
+import { isContextOverflow, isRetryableAssistantError, retryDelayMs } from '@earendil-works/pi-ai';
 import { SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative, resolve, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { runFileOperation } from '../../sandbox/worker-client.mjs';
 import { createSandboxTools } from '../sandbox/tools.mjs';
@@ -22,6 +23,11 @@ const text = { type: 'string' };
 const assistantText = (m) => m?.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n') ?? '';
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
 const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,64}$/;
+const RUN_ID = /^[\x21-\x7e]{1,128}$/;
+// Every child gets this, whatever its role file says.
+const JUDGMENT = 'Use your own technical judgment. The brief states the objective; a method it suggests is not necessarily the best one. '
+  + 'Say when an assumption in the brief is wrong, and propose a better approach when you have one. Report uncertainty and any verification you did not complete. '
+  + 'Do not override a constraint that the brief gives as the operator\'s: report the conflict instead.';
 
 // ---- Tool receipts: what the child's tools reported, counted from structured results, never from its prose. ----
 // A structured `details.status` (or, failing that, `details.outcome`, as literature_db reports it) maps onto a small outcome
@@ -88,6 +94,42 @@ const receiptSummary = (r) => {
     ...(unfinished > 0 ? { unfinished } : {}) };
 };
 
+// ---- Command receipts: each bash run of the child, from the tool's structured result, never from the child's prose. ----
+// `exited` with `exit_code` is what the shell reported. Exit 0 is not a test verdict: the assertions are in the output, which
+// get_subagent_result returns for a run_id. Only the latest runs are listed; the counts cover every run.
+const RECENT_RUNS = 8, COMMAND_CHARS = 200, CHILD_RETRIES = 2;
+const emptyCommands = () => ({ total: 0, exited_0: 0, exited_nonzero: 0, no_exit: 0, runs: [] });
+function startCommand(commands, runId, args) {
+  commands.total++;
+  commands.runs = [...commands.runs, { run_id: String(runId), command: clip(typeof args?.command === 'string' ? args.command : '', COMMAND_CHARS), status: 'running' }].slice(-RECENT_RUNS);
+}
+// A run without an exit status is interrupted when the child's run was aborted; otherwise it is classified from the status
+// line that Pi's bash tool appends to the end of its error.
+function endCommand(commands, runId, res, isError, aborted) {
+  const s = res?.structuredContent;
+  const tail = (Array.isArray(res?.content) ? res.content : []).filter((x) => x?.type === 'text').map((x) => x.text).join('\n').slice(-600);
+  const exited = Number.isInteger(s?.exit_code);
+  const status = exited ? 'exited' : aborted || /Command aborted/.test(tail) ? 'interrupted' : /Command timed out after/.test(tail) ? 'timed_out'
+    : /terminated without an exit code/.test(tail) ? 'killed' : isError ? 'error' : 'no_exit_status';
+  if (!exited) commands.no_exit++;
+  else if (s.exit_code === 0) commands.exited_0++;
+  else commands.exited_nonzero++;
+  const run = commands.runs.find((x) => x.run_id === String(runId));
+  if (run) Object.assign(run, { status, ...(exited ? { exit_code: s.exit_code } : {}),
+    ...(typeof s?.wall_time_seconds === 'number' ? { seconds: s.wall_time_seconds } : {}),
+    ...(typeof s?.full_output_path === 'string' ? { log: s.full_output_path } : {}) });
+}
+const commandSummary = (r) => (r.commands?.total ? { cwd: r.cwd, ...r.commands, runs: r.commands.runs.map((x) => ({ ...x })) } : undefined);
+// One bash run in a list of messages: its command and its tool result.
+function findRun(messages, runId) {
+  let command, out;
+  for (const m of messages) {
+    if (m?.role === 'assistant' && Array.isArray(m.content)) for (const c of m.content) if (c?.type === 'toolCall' && c.id === runId) command = c.arguments?.command;
+    if (m?.role === 'toolResult' && m.toolCallId === runId) out = m;
+  }
+  return out ? { command, out } : null;
+}
+
 // ---- Bounded result reads ----
 // Offsets count UTF-16 code units (JavaScript string indices); a page never starts or ends inside a surrogate pair.
 function page(textValue, offset, maxChars) {
@@ -112,12 +154,17 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
   globalThis[MANAGER] = { getRecord: (id) => records.get(id) };
   let retired = false;
   // Lifecycle status is process state. Task and evidence completion are never inferred from the narrative or the receipts.
-  const outcome = (r) => ({ lifecycle: r.status, task: 'unknown', evidence: 'unknown' });
+  // `termination` says how the child's run ended (normal, or the failure cause); it says nothing about the task.
+  const outcome = (r) => ({ lifecycle: r.status, ...(r.termination ? { termination: r.termination } : {}), task: 'unknown', evidence: 'unknown' });
+  const terminationOf = (r, last, thrown) => r.stopped ? 'stopped' : retired ? 'shutdown' : r.turnLimit ? 'turn_limit' : thrown ? 'exception'
+    : last?.stopReason === 'length' ? 'output_limit' : last?.stopReason === 'aborted' ? 'aborted'
+    : last?.stopReason === 'error' ? (isContextOverflow(last, r.agent?.state.model?.contextWindow ?? 0) ? 'context_overflow'
+      : isRetryableAssistantError(last) ? 'transport' : 'provider_error') : 'other';
   const published = (r) => ({ id: r.id, description: r.description, type: r.type, status: r.status,
     result: r.result, error: r.error, stopReason: r.stopReason, maxTurns: r.maxTurns, requestedMaxTurns: r.requestedMaxTurns, maxTurnsNote: r.maxTurnsNote,
     turns: r.turns, tools: r.tools, transcript: r.transcript,
     requiredTools: r.requiredTools, taskId: r.taskId, supersedes: r.supersedes, revision: r.revision, resultRevision: r.resultRevision,
-    receipts: receiptSummary(r), outcome: outcome(r) });
+    receipts: receiptSummary(r), commands: commandSummary(r), retries: r.retries?.length ? r.retries.map((x) => ({ ...x })) : undefined, outcome: outcome(r) });
   const display = (r) => ({ startedAt: r.startedAt, completedAt: r.completedAt, toolUses: r.toolUses, lifetimeUsage: r.lifetimeUsage,
     stopped: r.stopped, modelName: r.invocation?.modelName });
 
@@ -139,6 +186,7 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
     if (retired || r?.owner !== owner || r.status !== 'running') return false;
     r.stopped = true;
     r.agent.abort();
+    r.wake?.();
     return true;
   }
   const ui = createDelegateUI({ list: () => [...records.values()].filter((r) => r.owner === owner && r.agent), steer: steerChild, stop: stopChild });
@@ -333,13 +381,17 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
           + `(${why}). A call can lower a role's turn limit, never raise it.` : undefined,
         turns: 0, toolUses: 0, compactionCount: 0, tools: tools.map((t) => t.name), transcript: store.getSessionFile(), color: d.color,
         lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0 }, declaredTools: d.tools, requiredTools: required,
-        taskId: taskId ?? id, supersedes, revision: 0, resultRevision: 0, receipts: emptyReceipts(), anchor: ctx.sessionManager?.getLeafId?.() ?? null };
+        taskId: taskId ?? id, supersedes, revision: 0, resultRevision: 0, receipts: emptyReceipts(), anchor: ctx.sessionManager?.getLeafId?.() ?? null,
+        cwd: ctx.cwd, commands: emptyCommands(), retry: settings.getRetrySettings() };
       const record = r;
       const agent = new Agent({ initialState: { model, thinkingLevel: args.thinking ?? ctx.thinkingLevel ?? 'off', tools,
-        systemPrompt: `${d.prompt}\nYou are a bounded child in ${ctx.cwd}. Use only your declared tools. You have no host grants, compaction or handoff. Preserve partial work and report it.`,
+        systemPrompt: `${d.prompt}\nYou are a bounded child in ${ctx.cwd}. Use only your declared tools. You have no host grants, compaction or handoff. Preserve partial work and report it.\n${JUDGMENT}`,
         messages: args.inherit_context ? (ctx.sessionManager.getBranch() ?? []).filter((e) => e.type === 'message' && e.message?.role !== 'system').map((e) => e.message) : [] },
         streamFn: (m, c, options) => {
-          if (retired || record.turns >= record.maxTurns) throw new Error(`Child turn limit reached (${record.maxTurns}); partial results retained.`);
+          if (retired || record.turns >= record.maxTurns) {
+            record.turnLimit = !retired;
+            throw new Error(`Child turn limit reached (${record.maxTurns}); partial results retained.`);
+          }
           record.turns++;
           return ctx.modelRegistry.streamSimple(m, c, { ...options, timeoutMs: options?.timeoutMs ?? timeoutMs,
             websocketConnectTimeoutMs: options?.websocketConnectTimeoutMs ?? websocketConnectTimeoutMs });
@@ -351,8 +403,12 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
         abort: async () => { agent.abort(); await agent.waitForIdle(); } };
       agent.subscribe((event) => {
         // Tool progress is observable (toolUses, receipts, unfinished), so it moves the revision; the result text does not change.
-        if (event.type === 'tool_execution_start') { record.toolUses++; record.revision++; }
-        if (event.type === 'tool_execution_end') { recordReceipt(record.receipts, event.toolName, event.result, event.isError); record.revision++; }
+        if (event.type === 'tool_execution_start') { record.toolUses++; record.revision++; if (event.toolName === 'bash') startCommand(record.commands, event.toolCallId, event.args); }
+        if (event.type === 'tool_execution_end') {
+          recordReceipt(record.receipts, event.toolName, event.result, event.isError);
+          if (event.toolName === 'bash') endCommand(record.commands, event.toolCallId, event.result, event.isError, record.agent?.signal?.aborted === true);
+          record.revision++;
+        }
         if (event.type === 'message_end') store.appendMessage(event.message);
         const usage = event.type === 'message_end' && event.message?.role === 'assistant' ? event.message.usage : null;
         if (usage) for (const k of ['input', 'output', 'cacheWrite', 'cacheRead']) record.lifetimeUsage[k] += usage[k] ?? 0;
@@ -369,6 +425,7 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
       }
     }
     r.status = 'running'; r.error = undefined; r.stopReason = undefined; r.stopped = false; r.startedAt = Date.now(); r.completedAt = undefined; r.revision++;
+    r.termination = undefined; r.turnLimit = false; r.retries = [];
     if (r.invocation) r.invocation.runInBackground = args.run_in_background !== false;
     pi.events.emit('subagents:started', { id: r.id });
     ui.attach(ctx);
@@ -391,8 +448,9 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
         || (record.stopReason === 'error' ? 'The model request failed.' : undefined)
         || (record.stopReason === 'aborted' ? 'The model request was aborted.' : undefined);
       record.status = record.error ? 'failed' : 'completed';
+      record.termination = record.error ? terminationOf(record, last, error) : 'normal';
     };
-    r.run = r.agent.prompt(args.prompt).then(() => finish(), (error) => finish(error?.message || String(error))).finally(() => {
+    r.run = drive(record, () => record.agent.prompt(args.prompt)).then(() => finish(), (error) => finish(error?.message || String(error))).finally(() => {
       record.completedAt = Date.now();
       record.revision++;
       record.resultRevision = record.revision;
@@ -411,6 +469,29 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
     return result({ ...published(r), message: 'Started in background. Completion notification follows; do not poll.' }, { ...display(r), background: true });
   }
 
+  // A model request that failed in transport (Pi's own classification; never a context overflow, a usage limit or the
+  // turn limit) is sent again, at most CHILD_RETRIES times, after Pi's backoff. A failed reply ran none of its tool calls:
+  // only that reply is dropped from the child's context, and its completed tool results stay. The transcript keeps it.
+  // A retried request does not use a turn. A stop or a shutdown during the backoff ends the run with the failure.
+  async function drive(record, first) {
+    await first();
+    const policy = record.retry ?? { enabled: false };
+    const max = policy.enabled ? Math.min(CHILD_RETRIES, policy.maxRetries ?? CHILD_RETRIES) : 0;
+    for (let attempt = 1; attempt <= max; attempt++) {
+      const messages = record.agent.state.messages, last = messages.at(-1);
+      if (retired || record.stopped || record.turnLimit || last?.role !== 'assistant' || !isRetryableAssistantError(last)
+        || isContextOverflow(last, record.agent.state.model?.contextWindow ?? 0)) return;
+      record.retries.push({ attempt, error: clip(last.errorMessage, SAMPLE_CHARS) });
+      record.revision++;
+      await new Promise((done) => { const t = setTimeout(done, retryDelayMs(policy, attempt)); record.wake = () => { clearTimeout(t); done(); }; });
+      record.wake = undefined;
+      if (retired || record.stopped) return;
+      record.agent.state.messages = messages.slice(0, -1);
+      record.turns--;
+      await record.agent.continue();
+    }
+  }
+
   // ---- get_subagent_result ----
   const nonNegative = (v, name, min = 0) => { if (v !== undefined && (!Number.isSafeInteger(v) || v < min)) throw new Error(`${name} must be an integer of at least ${min}.`); };
   async function readResult(args, ctx) {
@@ -420,6 +501,10 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
     }
     if (typeof args.agent_id !== 'string' || !args.agent_id) throw new Error('Give agent_id or task_id.');
     nonNegative(args.offset, 'offset'); nonNegative(args.max_chars, 'max_chars', 1);
+    if (args.run_id !== undefined) {
+      if (typeof args.run_id !== 'string' || !RUN_ID.test(args.run_id)) throw new Error('run_id must be a run_id from the child\'s commands receipt.');
+      if (args.summary_only || args.since_revision !== undefined || args.revision !== undefined) throw new Error('run_id reads one command\'s output; drop summary_only, since_revision and revision.');
+    }
     nonNegative(args.since_revision, 'since_revision'); nonNegative(args.revision, 'revision');
     const paged = args.offset !== undefined || args.max_chars !== undefined;
     if (args.summary_only && paged) throw new Error('summary_only returns no result text; drop offset and max_chars, or drop summary_only.');
@@ -440,6 +525,7 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
       if (!old) throw new Error('Child not found in this instance or on the current branch. Consult the recorded transcript.');
       value = { ...old, historical: true }; extra = {};
     }
+    if (args.run_id !== undefined) return readRun(args, value, live?.owner === owner ? live : null, extra);
     const full = typeof value.result === 'string' ? value.result : '';
     const resultChars = full.length;
     if (args.since_revision !== undefined && value.revision !== undefined && args.since_revision === value.revision)
@@ -454,6 +540,28 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
     const offset = args.offset ?? 0;
     const { slice, next } = page(full, offset, args.max_chars);
     return result({ ...value, result: slice, resultOffset: offset, resultChars, nextOffset: next }, extra);
+  }
+  // The full output of one bash run: from the live child's context, else from the child's transcript under mina-subagents.
+  function readRun(args, value, live, extra) {
+    let messages = live?.agent?.state.messages;
+    let found = messages && findRun(messages, args.run_id);
+    if (!found && typeof value.transcript === 'string') {
+      const root = resolve(agentDir, 'mina-subagents'), path = resolve(value.transcript), rel = relative(root, path);
+      if (rel && !rel.startsWith('..') && !isAbsolute(rel)) {
+        try {
+          messages = readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+            .filter((e) => e?.type === 'message').map((e) => e.message);
+          found = findRun(messages, args.run_id);
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      }
+    }
+    if (!found) throw new Error(`No command run ${args.run_id} in child ${value.id}. Use a run_id from its commands receipt.`);
+    const output = (Array.isArray(found.out.content) ? found.out.content : []).filter((c) => c?.type === 'text').map((c) => c.text).join('\n');
+    const receipt = value.commands?.runs?.find((x) => x.run_id === args.run_id);
+    const { slice, next } = page(output, args.offset ?? 0, args.max_chars);
+    return result({ id: value.id, run_id: args.run_id, command: typeof found.command === 'string' ? found.command : undefined,
+      ...(receipt ? { status: receipt.status, exit_code: receipt.exit_code, log: receipt.log } : {}), isError: found.out.isError === true,
+      output: slice, outputOffset: args.offset ?? 0, outputChars: output.length, nextOffset: next }, extra);
   }
   function readTask(taskId, ctx) {
     if (typeof taskId !== 'string' || !TASK_ID.test(taskId)) throw new Error('task_id is not a valid task id.');
@@ -477,6 +585,10 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
     description: 'Run delegate, independent, researcher, or a project/user role. Children use explicit safe tools. Four concurrent children, 64 starts per launcher. No child host access or executable resource discovery. '
       + 'For literature or web research use subagent_type "researcher" or pass required_tools (for example ["literature_search","paper_get"]): a launch whose child would lack a required tool fails before any model request. '
       + 'The receipt lists the actual tools, tool receipts (counts by outcome) and a lifecycle status; completed means the child stopped, not that its task or evidence is complete. '
+      + 'outcome.termination is normal or the failure cause (output_limit, transport, provider_error, context_overflow, turn_limit, stopped, aborted, shutdown, exception). '
+      + 'A transport failure is retried twice at most, without replaying tool calls; retries lists them. '
+      + 'commands lists the latest bash runs with status and exit_code: exit 0 is not a verified test pass; read the output with get_subagent_result run_id. '
+      + 'Brief a child with the objective, the constraints (include the operator\'s standing constraints that apply) and the evidence you want; leave the method to the child unless it is a constraint. The child may disagree with the brief. '
       + 'task_id names a task (reuse it for a retry); supersedes records that this child replaces earlier tasks without changing their history.',
     parameters: schema({ prompt: text, description: text, subagent_type: text, model: text, thinking: text,
       max_turns: { type: 'integer', minimum: 1, maximum: 200, description: "Turn limit for the child. The role's max_turns (default 100, at most 200) is a ceiling: "
@@ -495,8 +607,10 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
   pi.registerTool({ name: 'get_subagent_result', label: 'Child result',
     description: 'Read a child result. Background completion sends a notification; do not poll. For a status check use summary_only (status, receipts, revision, result length; no text). '
       + 'Default returns the full result. Large results: page with offset and max_chars, follow nextOffset until null and pass revision to refuse a page from a changed result. '
-      + 'since_revision returns a short "unchanged" reply when nothing changed. task_id returns a task\'s attempts and supersession on the current branch.',
+      + 'since_revision returns a short "unchanged" reply when nothing changed. task_id returns a task\'s attempts and supersession on the current branch. '
+      + 'run_id (from the commands receipt) returns that bash run\'s command and output, paged with offset and max_chars.',
     parameters: schema({ agent_id: text, task_id: text, wait: { type: 'boolean' },
+      run_id: { ...text, description: 'A run_id from the child\'s commands receipt: return that bash run\'s output instead of the result.' },
       summary_only: { type: 'boolean', description: 'Omit the result text; return status, receipts, revision and resultChars.' },
       offset: { type: 'integer', minimum: 0, description: 'Start of a result page, in UTF-16 code units.' },
       max_chars: { type: 'integer', minimum: 1, description: 'Page length; the reply gives nextOffset (null at the end) and resultChars.' },
@@ -528,7 +642,7 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
     retired = true;
     ui.dispose();
     const owned = [...records.values()].filter((r) => r.owner === owner && r.status === 'running');
-    for (const r of owned) r.agent.abort();
+    for (const r of owned) { r.agent.abort(); r.wake?.(); }
     await Promise.all(owned.map((r) => r.run));
   });
 }

@@ -232,7 +232,7 @@ In the sandbox, the agent can start subagents with the `Agent` tool.
 | Your own type | Defined in `~/.pi/agent/agents/<type>.md` or `.pi/agents/<type>.md` |
 
 - A maximum of four subagents run at the same time.
-- One launch of Mina can start a maximum of 64 subagents.
+- The number of subagents that one launch of Mina can start in total has no limit.
 - Each subagent has a maximum of 100 turns by default (200 at most).
 - Subagents run in the sandbox and have no host access.
 - A model request of a subagent that fails with a connection error or a timeout is retried at most two times. No tool call runs again.

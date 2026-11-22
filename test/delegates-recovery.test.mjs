@@ -143,6 +143,17 @@ test('every child is told to use its own judgment and to report a conflict with 
   } finally { await f.shutdown(); }
 });
 
+test('a launch has no lifetime cap on child starts: the 65th child starts', { skip: needsSandbox }, async () => {
+  const f = await fixture(Array.from({ length: 65 }, done));
+  try {
+    for (let i = 0; i < 65; i++) {
+      const out = body(await f.call('Agent', { prompt: 'x', description: `c${i}`, run_in_background: false }));
+      assert.equal(out.status, 'completed', `child ${i + 1}: ${out.error}`);
+    }
+    assert.equal(f.ledger().admissions, 65);
+  } finally { await f.shutdown(); }
+});
+
 test('the Agent description tells the parent how to brief, what termination means, and that exit 0 is not a test pass', () => {
   const tools = {};
   delegates({ events: new EventEmitter(), registerTool: (t) => { tools[t.name] = t; }, on: () => {}, appendEntry: () => {} },
@@ -152,5 +163,7 @@ test('the Agent description tells the parent how to brief, what termination mean
   assert.match(d, /may disagree/);
   assert.match(d, /termination/);
   assert.match(d, /exit 0 is not a verified test pass/);
+  assert.match(d, /Four concurrent children/);
+  assert.doesNotMatch(d, /64 starts/);
   assert.ok(tools.get_subagent_result.parameters.properties.run_id);
 });

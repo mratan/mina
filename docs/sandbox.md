@@ -159,9 +159,9 @@ Use `mina_host` `workload_status` and `workload_stop` for these jobs. Their lock
 
 ### Subagents and outputs
 
-- The `Agent` tool permits four children at the same time and 64 child starts for each launch.
+- The `Agent` tool permits four children at the same time. The total number of child starts has no limit.
 - Each child has a fixed tool set, no host tool, and no resource discovery.
-- Each child has a limited number of turns, at most 200. A resume or a handoff does not reset these allowances.
+- Each child has a limited number of turns, at most 200. A resume or a handoff does not reset this allowance.
 - Saved files, transcripts, partial reports, and errors stay separate.
 
 Large outputs of the model's commands stay readable at `/run/mina-outputs`. They are kept on the host in `~/.local/share/mina/artifacts/INSTANCE_ID`.

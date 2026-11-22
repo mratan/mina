@@ -13,8 +13,8 @@ These rules prevent three problems that occur in practice:
 
 `Agent` accepts `required_tools`, a list of tool names. Mina compares the list with the child's selected tools: the role's
 declared tools, filtered by what the sandbox and the parent session provide. The child's selected tools never grow to meet it.
-A missing tool refuses the launch before the transcript, the `Agent`, or any provider request exists. The refusal does not count
-against the 64-start allowance. The error names the missing tools and the child's actual tools. It distinguishes a tool the role does not declare
+A missing tool refuses the launch before the transcript, the `Agent`, or any provider request exists. The refusal is not a
+child start. The error names the missing tools and the child's actual tools. It distinguishes a tool the role does not declare
 from a declared tool this session lacks. For research tools, it points to `subagent_type: "researcher"`.
 
 Mina does not infer requirements from the prompt. A literature task needs a `researcher` child or an explicit `required_tools`.
@@ -153,7 +153,7 @@ any reservation or request: unknown ids, a task superseding itself, and a direct
 supersedes B; or A→C→B→A). A plain retry of A without `supersedes` stays valid. A resumed child keeps its task and cannot
 supersede.
 
-A launch refused before its child record exists returns its admission, so it does not count against the 64-start allowance.
+A launch refused before its child record exists is not a child start, and it does not hold one of the four places for running children.
 This covers an unknown role, an unreadable definition, an unknown model, an invalid `max_turns` and a missing required tool,
 and in each case no provider request is made. It also frees its task id.
 

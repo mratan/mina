@@ -416,7 +416,7 @@ See [host operations](docs/usage.md#host-operations), [host setup](docs/host-pro
 ### Subagents
 
 The agent can delegate to general workers, read-only reviewers, and researchers.
-Up to four subagents run concurrently, with a limit of 64 launches per Mina instance.
+Up to four subagents run concurrently. The total number of launches has no limit.
 Subagents run in the sandbox and have no host access.
 
 Each role has an explicit tool set.

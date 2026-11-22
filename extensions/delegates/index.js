@@ -316,7 +316,7 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
     const live = [...records.values()].filter((r) => r.status === 'running');
     if (live.length + (ledger.pending ?? 0) >= 4) throw new Error('Four children already run in this instance. Wait for one to finish.');
     let r = args.resume && records.get(args.resume);
-    if (args.resume && (!r || r.owner !== owner)) throw new Error('Cannot resume a historical child as live authority. Start a new child within the instance allowance.');
+    if (args.resume && (!r || r.owner !== owner)) throw new Error('Cannot resume a historical child as live authority. Start a new child.');
     if (r?.status === 'running') throw new Error('Child still runs. Use steer_subagent.');
     if (r) {
       if (!branchView(ctx).launches.has(r.id)) throw new Error('This child was launched on another branch and has no authority here. Start a new child on this branch. No model request was made.');
@@ -335,9 +335,9 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
       let supersedes = validateTask(args, ctx);
       const taskId = args.task_id;
       if (taskId) taskBusy(taskId);
-      if (ledger.admissions >= 64) throw new Error('Instance child-start allowance exhausted (64). A handoff does not reset it.');
-      // Reserve before async definition loading so concurrent starts cannot evade the cap or share a task. Any failure before
-      // the child record exists returns the admission (no child, no provider request) and frees the task id.
+      // Reserve before async definition loading so concurrent starts cannot evade the four-child limit or share a task. Any
+      // failure before the child record exists returns the admission (no child, no provider request) and frees the task id.
+      // `admissions` counts child starts; it is not capped.
       ledger.admissions++;
       ledger.pending = (ledger.pending ?? 0) + 1;
       if (taskId) reserved.add(taskId);
@@ -582,7 +582,7 @@ export default function minaDelegates(pi, { env = process.env } = {}) {
   const label = (id) => { const r = records.get(id); return r ? { type: clean(r.type), description: clean(r.description) } : null; };
 
   pi.registerTool({ name: 'Agent', label: 'Agent',
-    description: 'Run delegate, independent, researcher, or a project/user role. Children use explicit safe tools. Four concurrent children, 64 starts per launcher. No child host access or executable resource discovery. '
+    description: 'Run delegate, independent, researcher, or a project/user role. Children use explicit safe tools. Four concurrent children. No child host access or executable resource discovery. '
       + 'For literature or web research use subagent_type "researcher" or pass required_tools (for example ["literature_search","paper_get"]): a launch whose child would lack a required tool fails before any model request. '
       + 'The receipt lists the actual tools, tool receipts (counts by outcome) and a lifecycle status; completed means the child stopped, not that its task or evidence is complete. '
       + 'outcome.termination is normal or the failure cause (output_limit, transport, provider_error, context_overflow, turn_limit, stopped, aborted, shutdown, exception). '

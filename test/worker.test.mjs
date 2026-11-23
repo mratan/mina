@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { createEgressProxy } from '../lib/egress-proxy.mjs';
-import { runFileOperation, runWorker } from '../sandbox/worker-client.mjs';
+import { runFileOperation, runWorker, workerRefusal } from '../sandbox/worker-client.mjs';
 import { createSandboxTools } from '../extensions/sandbox/tools.mjs';
 import { validateWritableRoots } from '../sandbox/sandbox.mjs';
 import { needsSandbox } from './capabilities.mjs';
@@ -16,6 +16,25 @@ const fixture = () => {
   const cwd = mkdtempSync(join(tmpdir(), 'mina-worker-'));
   return { cwd, env: { MINA_SANDBOX_PROJECT: cwd, MINA_SANDBOX_WRITE: JSON.stringify([cwd]), MINA_SANDBOX_NET: 'offline' } };
 };
+
+test('a worker that cannot create a thread names the instance task limit and its setting, not a native stack', () => {
+  const crash = [
+    '  #  /run/mina-node[2]: std::unique_ptr<long unsigned int> node::WorkerThreadsTaskRunner::DelayedTaskScheduler::Start() at ../../src/node_platform.cc:109',
+    '  #  Assertion failed: (0) == (uv_thread_create(t.get(), start_thread, this))', '', ' ----- Native stack trace -----', '',
+    '  1: 0x558cfa7254c4  [/run/mina-node]', '  2: 0x558cfa725579 node::Assert(node::AssertionInfo const&) [/run/mina-node]',
+  ].join('\n').repeat(2);
+  const e = workerRefusal(crash, 134);
+  assert.match(e.message, /instance task limit/);
+  assert.match(e.message, /`limits\.maxProcesses`/);
+  assert.match(e.message, /docs\/usage\.md, "Limits and instances"/);
+  assert.match(e.message, /Cause: Assertion failed: \(0\) == \(uv_thread_create/);
+  assert.doesNotMatch(e.message, /Native stack trace|0x558cfa/);
+  assert.ok(e.message.length < 500, e.message);
+  assert.match(workerRefusal('bwrap: Creating new namespace failed: Resource temporarily unavailable', 1).message, /`limits\.maxProcesses`/);
+  // Any other refusal keeps the worker's own words.
+  assert.equal(workerRefusal('bwrap: Can\'t mount on symlink destination', 1).message, 'File worker refused: bwrap: Can\'t mount on symlink destination');
+  assert.equal(workerRefusal('', 9).message, 'File worker refused: 9');
+});
 
 test('real worker reads and writes project bytes without exposing unrelated files', { skip: needsSandbox }, async () => {
   const f = fixture();

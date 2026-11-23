@@ -16,6 +16,21 @@ function workerCommand(argv, s) {
   return { command: BWRAP_PATH, args, env: { PATH: '/usr/bin:/bin' } };
 }
 
+// A worker that cannot create a thread or a process fails with EAGAIN, and Node prints a native stack. In an instance the
+// usual cause is the instance task limit (every process and thread counts), so the error names that setting instead.
+const TASK_LIMIT = /uv_thread_create|pthread_create|Resource temporarily unavailable|\bEAGAIN\b/;
+const taskLimitError = (cause) => new Error('A sandbox worker could not create a thread or a process. The usual cause is the '
+  + 'instance task limit, where every process and thread counts. To raise it, set `limits.maxProcesses` in the sandbox settings '
+  + `(docs/usage.md, "Limits and instances"). Cause: ${cause.slice(0, 200)}`);
+
+export function workerRefusal(stderr, status) {
+  const text = String(stderr ?? '');
+  const cause = text.split('\n').map((line) => line.replace(/^\s*#?\s*/, '').trim()).find((line) => TASK_LIMIT.test(line));
+  return cause ? taskLimitError(cause) : new Error(`File worker refused: ${text.slice(0, 2000) || status}`);
+}
+
+const spawnError = (error) => (error?.code === 'EAGAIN' ? taskLimitError(error.message) : error);
+
 export function runWorker(argv, { cwd = process.cwd(), env = process.env, signal, input, timeout = 120,
   onData, egressSocket, network = 'offline' } = {}) {
   const s = { ...sandboxSettingsFromEnv(env, { cwd }), env, network, egressSocket };
@@ -29,7 +44,7 @@ export function runWorker(argv, { cwd = process.cwd(), env = process.env, signal
     const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', kill); };
     signal?.addEventListener('abort', kill, { once: true });
     if (signal?.aborted) kill();
-    child.on('error', (error) => { cleanup(); reject(error); });
+    child.on('error', (error) => { cleanup(); reject(spawnError(error)); });
     const capture = (chunks, data) => {
       onData?.(data);
       if (!onData) {
@@ -58,9 +73,9 @@ export function runFileOperationSync(action, args, { cwd = process.cwd(), env = 
   const child = spawnSync(w.command, w.args, {
     env: w.env, input: JSON.stringify({ action, args }), encoding: 'utf8', timeout: 15_000, maxBuffer: 92 * 1024 ** 2,
   });
-  if (child.error) throw child.error;
+  if (child.error) throw spawnError(child.error);
   let out;
-  try { out = JSON.parse(child.stdout); } catch { throw new Error(`File worker refused: ${child.stderr?.slice(0, 2000) || child.status}`); }
+  try { out = JSON.parse(child.stdout); } catch { throw workerRefusal(child.stderr, child.status); }
   if (!out.ok) throw Object.assign(new Error(out.error.message), { code: out.error.code });
   return action === 'read' ? Buffer.from(out.result.data, 'base64') : out.result;
 }
@@ -71,7 +86,7 @@ export async function runFileOperation(action, args, options = {}) {
   });
   let reply;
   try { reply = JSON.parse(out.stdout.toString()); }
-  catch { throw new Error(`File worker refused: ${out.stderr.toString().slice(0, 2000) || `exit ${out.exitCode}`}`); }
+  catch { throw workerRefusal(out.stderr, `exit ${out.exitCode}`); }
   if (!reply.ok) throw Object.assign(new Error(reply.error.message), { code: reply.error.code });
   if (action === 'read') return Buffer.from(reply.result.data, 'base64');
   return reply.result;

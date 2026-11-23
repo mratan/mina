@@ -367,6 +367,7 @@ Command network access has three modes:
 
 These flags govern commands, not the separate model and research connections.
 Resource limits apply to each instance.
+To change a limit, for example the number of processes and threads, set `limits` in `~/.config/mina/sandbox.json` (see [limits and instances](docs/usage.md#limits-and-instances)).
 `mina status` lists instances, and `mina stop ID` stops an instance and its processes.
 
 Mina also checks git storage at startup.

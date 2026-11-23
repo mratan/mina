@@ -411,8 +411,15 @@ Each launch of Mina is an instance with its own systemd scope (on macOS: its own
 |---|---|---|
 | Memory | Half of the host memory, maximum 32 GiB | `memoryBytes` |
 | CPU | 8 cores | `cpuPercent` (800 = 8 cores) |
-| Processes | 1024 | `maxProcesses` |
+| Processes and threads | 1024 | `maxProcesses` |
 | Total time | No limit | `maxWallS` |
+
+Each process and each thread in the instance counts against `maxProcesses`.
+This includes subagents, their commands, and the workers of Mina.
+Parallel builds and tests that use many threads can reach the limit.
+When a worker cannot start because of the limit, its error names `limits.maxProcesses`.
+A changed setting applies to new instances.
+To raise the limit of a running instance on Linux, use `systemctl --user set-property --runtime mina-ID.scope TasksMax=N`, where `mina status` shows the ID.
 
 Each command of the agent has a default limit of 120 seconds when the agent gives no timeout.
 A command can write a maximum of 92 MiB of output.

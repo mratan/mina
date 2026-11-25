@@ -96,10 +96,12 @@ API models use explicit reset information in the error or a 429 response header,
 Mina adds one minute for clock differences and rounded reset times. Billing errors and unknown reset times leave the goal parked.
 
 The session stores the pending deadline. Mina restores it when you reopen that session with `/resume`.
+A handoff to a new session carries the deadline if the parked goal and the model still match.
 Mina must remain open to resume automatically. It does not start a closed process.
 
 Human input, a model change, session navigation, or `/goal pause` cancels the pending resume.
 Subagent notifications and host alarms do not cancel the pending resume.
+During a quota wait, Mina records broker alarms in the conversation and shows them to the operator without starting a model turn.
 Before the resume, Mina checks the goal, model, idle state, and pending messages. The normal goal budgets and checks still apply.
 The resume keeps the selected provider and model. This recovery never switches from Claude to Codex, or from one Claude account to another.
 
@@ -133,6 +135,7 @@ A handoff occurs at the handoff threshold, or at the compaction threshold after 
 It occurs only at a safe point: no tool runs and no queued input waits.
 The agent writes a note with `mina_handoff_note`. Mina then starts a linked successor session with a packet of at most 16 KB: the note, the goal, the checks with their recorded results, the plan, and the research briefs.
 A handoff does not run the checks again. A protected check whose script changed shows NOT RUN, not PASS.
+If you change the objective with `/goal edit`, Mina carries the latest accepted objective. The operator ledger and approved checks stay with the goal. An objective edit discards recorded check results, not the checks.
 The successor starts on the model and thinking level of the earlier session. The packet is a summary, not proof. For exact detail, the agent uses `mina_recall`.
 
 Subagents run in the Pi process of the session, and a new session stops them. Thus, if subagents run when the note is recorded, the handoff occurs in place:

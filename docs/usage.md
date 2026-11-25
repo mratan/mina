@@ -187,6 +187,7 @@ Pi's session file keeps every message and every tool output, and the agent can s
 - **Handoff.** When the context is nearly full, the agent writes a short handoff note.
   The work then continues in a new session with the note, the goal, and the checks.
   Running broker jobs and monitors continue. The note records their IDs.
+  If the goal waits for a known provider reset, the successor keeps that deadline on the same model.
   If subagents run, the context of the current session is reset to the note instead, and the subagents continue.
 
 Mina saves each message that you type in the operator ledger of the goal. It also saves your answers to the questions of the agent.
@@ -213,6 +214,7 @@ The thresholds of each model are in [the models guide](models.md#context-thresho
 | `mina_subagents` (agent tool) | Lists finished subagents of this session and returns their reports in full. |
 
 During a handoff, Mina holds the messages that you type and delivers them in the new session.
+During a quota wait, the messages stay in the operator ledger without starting a model turn.
 An automatic handoff does not wait for running subagents. It resets the context in place, and the subagents continue.
 If a handoff does not start within 120 seconds, Mina cancels it and delivers the held messages in the current session.
 If Mina stops after the agent wrote a handoff note but before the handoff, the next start asks you to finish the handoff or to discard the note.

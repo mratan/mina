@@ -11,12 +11,13 @@
 // copy of this extension (loaded while the parent's is live) registers nothing: subagents get no host operations.
 import { connect } from 'node:net';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdirSync, writeFileSync } from '../../sandbox/project-fs.mjs';
 import { join } from 'node:path';
 import { oneDialog } from '../../lib/dialog-lock.mjs';
 
 const CLAIM = Symbol.for('mina:host-claim');
+const ALARM_ENTRY = 'mina-host-alarm';
 const POLL_MS = 10_000;
 const CONFIRMATION_PROTOCOL = 'mina-confirmation-v1';
 const MUTATION_PROTOCOL = 'mutate_v2';
@@ -163,6 +164,10 @@ export default function minaHost(pi, { env = process.env, pollMs = POLL_MS, term
 
   let manifest = unavailable ? manifestText(null, unavailable) : '## Host capabilities (mina-hostd)\nNot checked yet: call mina_host capabilities.\n';
   let timer = null, polling = false;
+  const queued = new Set(); // Pi may defer appending until the current turn's tool results are in the transcript.
+  const handoffPending = () => globalThis[Symbol.for('mina:handoff')]?.pending?.();
+  const deliveredIds = (ctx) => new Set((ctx.sessionManager?.getBranch?.() ?? [])
+    .filter((e) => e.type === 'custom_message' && e.customType === ALARM_ENTRY).map((e) => e.details?.id));
 
   async function refresh(ctx, force = false) {
     if (unavailable) return;
@@ -175,34 +180,51 @@ export default function minaHost(pi, { env = process.env, pollMs = POLL_MS, term
     } catch { /* the manifest in the prompt is enough */ }
   }
 
-  async function deliver(ctx) {
-    if (unavailable || polling || !claim.live) return;
+  async function deliver(ctx, sessionStartReason) {
     // During a handoff an alarm would start a run that mina stops at once: it stays pending for the new session.
-    if (globalThis[Symbol.for('mina:handoff')]?.pending?.()) return;
+    if (unavailable || polling || !claim.live || handoffPending()) return;
     polling = true;
     try {
       const out = await call('alarms');
       const pending = out.ok ? out.result.pending : [];
-      if (!pending.length) return;
+      if (!claim.live || handoffPending() || !pending.length) return;
+      if (ctx.isIdle?.() !== false) queued.clear(); // retry any unpersisted steering from a stopped run
+      const alreadyDelivered = deliveredIds(ctx);
+      let triggerTurn = true;
+      // Ask at delivery, not poll start: the provider may have parked the session while the broker read was in flight.
+      pi.events?.emit?.('mina:automatic-turn-check', { ctx, sessionStartReason, suppress: () => { triggerTurn = false; } });
       for (const a of pending) {
-        pi.sendMessage({ customType: 'mina-host-alarm', display: true, details: a,
+        if (alreadyDelivered.has(a.id) || queued.has(a.id)) continue;
+        // The broker has no typed workload field on alarms; its terminal workload monitors use this message format.
+        const workload = /^workload .+ (\d{14}-[a-f0-9]{6}) ended: \S+ \(rc /.exec(a.message)?.[1];
+        const instructions = workload ? `Inspect this existing workload by id ${workload} with mina_host workload_status and read retained `
+          + 'results with workload_output; do not rerun or resubmit it in response to this alarm.' : 'Check it with mina_host before continuing.';
+        pi.sendMessage({ customType: ALARM_ENTRY, display: true, details: a,
           content: `mina host alarm (${a.label}, ${new Date(a.at * 1000).toISOString()}): ${a.message}\n`
-            + 'This comes from a host-side monitor that runs independently of this session. Check it with mina_host before continuing.' },
-        { triggerTurn: true, deliverAs: 'steer' });
+            + `This comes from a host-side monitor that runs independently of this session. ${instructions}` },
+        // In Pi, false (not an omitted option) also prevents steering mid-run; nextTurn would only queue in memory.
+        triggerTurn ? { triggerTurn: true, deliverAs: 'steer' } : { triggerTurn: false });
+        queued.add(a.id);
         try { ctx?.ui?.notify?.(`mina host alarm: ${a.label}`, 'warning'); } catch { /* no UI */ }
       }
-      await call('alarms', { ack: pending.map((a) => a.id) }); // acknowledged only once they are in the conversation
+      // sendMessage returns void, and appending may be deferred even with triggerTurn:false. Ack only entries that
+      // reached the active branch; a lost ack reply can then be retried without repeating the alarm or its wake.
+      const written = deliveredIds(ctx), file = ctx.sessionManager?.getSessionFile?.();
+      const ack = pending.filter((a) => written.has(a.id)).map((a) => a.id);
+      for (const id of ack) queued.delete(id);
+      // A new Pi session does not create its file until the first user or assistant message.
+      if (ack.length && (!file || existsSync(file))) await call('alarms', { ack });
     } finally { polling = false; }
   }
 
-  pi.on('session_start', async (_event, ctx) => {
+  pi.on('session_start', async (event, ctx) => {
     // A continued conversation (-c, /resume) gets the tool loadout of its transcript. One begun when this project had no
     // broker session never declared mina_host, so the tool stayed inactive while the host section of the prompt offered it.
     const active = pi.getActiveTools?.();
     if (active && !active.includes('mina_host')) pi.setActiveTools([...active, 'mina_host']);
     await refresh(ctx).catch(() => {});
-    await deliver(ctx).catch(() => {});
-    if (!unavailable && !timer) { timer = setInterval(() => deliver(ctx).catch(() => {}), pollMs); timer.unref?.(); }
+    await deliver(ctx, event?.reason).catch(() => {});
+    if (claim.live && !unavailable && !timer) { timer = setInterval(() => deliver(ctx).catch(() => {}), pollMs); timer.unref?.(); }
   });
   pi.on('session_shutdown', async () => { claim.live = false; if (timer) clearInterval(timer); timer = null; });
   // A section, never a returned systemPrompt: Pi forces a returned string over every other layer's prompt options,

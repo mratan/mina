@@ -11,9 +11,9 @@
 // pi-goal is loaded through a proxy that wraps only its /goal command handler; the rest of pi-goal is unchanged.
 import { randomUUID } from 'node:crypto';
 import { installUsageResume } from './usage-resume.mjs';
-import { existsSync, readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, rmSync, renameSync } from '../../sandbox/project-fs.mjs';
+import { existsSync, readdirSync, readFileSync, mkdirSync, writeFileSync, rmSync, renameSync } from '../../sandbox/project-fs.mjs';
 import { join, relative, dirname, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { readObjective, reconcileObjective } from './revision.mjs';
 import { checkCommand } from './check-execution.mjs';
 import { hashCheckFiles, changedFiles } from './check-files.mjs';
 import { DEFAULT_STALL_RUNS, observeWorkload, liveWorkload, toolEffect, gitSnapshot, nextStall } from './stall.mjs';
@@ -196,7 +196,12 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
       + 'mina reruns these when you call goal_complete.' }, { triggerTurn: true });
   }
 
-  const lastEntry = (ctx) => (ctx?.sessionManager?.getBranch?.() ?? []).filter((e) => e.type === 'custom' && e.customType === ENTRY).at(-1)?.data ?? null;
+  const lastEntry = (ctx) => (ctx?.sessionManager?.getBranch?.() ?? []).findLast((e) => e.type === 'custom' && e.customType === ENTRY)?.data ?? null;
+  const latestGoalState = (ctx) => (ctx?.sessionManager?.getBranch?.() ?? []).findLast((e) => e.type === 'custom' && e.customType === 'goal-state')?.data?.goal ?? null;
+  const syncObjective = (ctx) => {
+    const current = reconcileObjective(state, latestGoalState(ctx), ctx?.cwd);
+    if (current !== state) { state = current; save(); }
+  };
 
   function wrapGoalCommand(options) {
     upstreamGoal = options.handler;
@@ -223,9 +228,9 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
         const carried = p.pass && String(args ?? '').trim() === 'resume' ? lastEntry(ctx) : null;
         if (carried?.resume_on_request && carried.status !== 'active') p = { sub: 'mina-continue', rest: '', resumed: carried.status };
         if (p.pass) {
-          const first = String(args ?? '').trim().split(/\s+/, 1)[0];
           await options.handler(args, serialUi(ctx));
-          if ((first === 'clear' || first === 'stop') && state?.status === 'active') { state = { ...state, status: 'cleared' }; save(); }
+          if (command === 'edit') syncObjective(ctx);
+          if ((command === 'clear' || command === 'stop') && state?.status === 'active') { state = { ...state, status: 'cleared' }; save(); }
           return;
         }
         if (p.sub === 'checks') { notify(ctx, describe()); return; }
@@ -269,11 +274,7 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
         const mode = p.noCheck ? 'none' : p.checks.length ? 'given' : p.protectChecks ? 'plan' : 'working';
         // An objective that is only a path to a file: the instructions are in the file (pi-goal limits an objective to
         // 4,000 characters, and its error says to do this). pi-goal keeps the path; mina gives the agent the text.
-        let objectiveFile = null, objectiveBody = null;
-        if (/^\S+$/.test(p.objective)) {
-          const abs = resolve(ctx?.cwd ?? '.', p.objective.replace(/^~(?=\/)/, homedir()));
-          try { if (statSync(abs).isFile() && statSync(abs).size <= 65536) { objectiveFile = abs; objectiveBody = readFileSync(abs, 'utf8').trim(); } } catch { /* not a file */ }
-        }
+        const { file: objectiveFile, body: objectiveBody } = readObjective(p.objective, ctx?.cwd);
         let archived = null;
         try { archived = archivePreviousGoal(ctx?.cwd); } catch { /* best effort */ }
         state = { id: randomUUID(), objective: p.objective, mode, completionPolicy: 'checks-only', checkPolicy: mode === 'working' ? 'working' : 'protected',
@@ -331,7 +332,6 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
   // Transient provider errors use bounded backoff after Pi's own retries. Usage limits use a separate,
   // persisted deadline from provider evidence (usage-resume.mjs), not these short retries.
   let retryTimer = null, retryCount = 0;
-  const latestGoalState = (ctx) => (ctx?.sessionManager?.getBranch?.() ?? []).filter((e) => e.type === 'custom' && e.customType === 'goal-state').at(-1)?.data?.goal ?? null;
   const scheduleProviderRetry = (ctx) => {
     const retryDelaysMs = (liveTuning(ctx)?.provider_retry?.delays_s ?? [120, 300, 900]).map((s) => s * 1000);
     const g = latestGoalState(ctx);
@@ -436,8 +436,10 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
   pi.on('session_start', (_event, ctx) => {
     uiContext = ctx;
     const entries = ctx.sessionManager?.getBranch?.() ?? [];
-    const last = entries.filter((e) => e.type === 'custom' && e.customType === ENTRY).at(-1);
+    const last = entries.findLast((e) => e.type === 'custom' && e.customType === ENTRY);
     state = last?.data ?? null;
+    syncObjective(ctx);
+    if (state?.objective !== last?.data?.objective) notify(ctx, `mina: recovered the edited goal: ${state.objective}. Approved checks did not change.`);
     workloads = null; run = null; stallNotice = null;
     if (state?.status === 'active' && state.completionPolicy !== 'checks-only') {
       notify(ctx, 'mina: recovered a legacy active goal. Completion requires the matching legacy runtime; use that runtime '
@@ -742,6 +744,8 @@ export function createMinaGoal(pi, { goalExtension, env = process.env, sandboxAv
   });
 
   pi.on('tool_call', async (event, ctx) => {
+    // The native edit can queue its first turn before the /goal command handler returns.
+    if (event.toolName === 'goal_complete') syncObjective(ctx);
     if (!state || state.status !== 'active') return undefined;
     if (event.toolName === 'write' || event.toolName === 'edit') {
       const path = event.input?.path;

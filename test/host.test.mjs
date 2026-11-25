@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:net';
+import { createHash } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { createAgentSession, createEventBus, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent';
+import { fauxProvider, fauxAssistantMessage } from '@earendil-works/pi-ai';
+import { installUsageResume, USAGE_RESUME_ENTRY } from '../extensions/goal/usage-resume.mjs';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, symlinkSync, unlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,7 +28,7 @@ async function fakeBroker(handler) {
   const seen = [];
   const server = createServer((c) => {
     let data = '';
-    c.on('data', (d) => { data += d; if (data.endsWith('\n')) { const req = JSON.parse(data); seen.push(req); c.end(`${JSON.stringify(handler(req))}\n`); } });
+    c.on('data', async (d) => { data += d; if (data.endsWith('\n')) { const req = JSON.parse(data); seen.push(req); c.end(`${JSON.stringify(await handler(req))}\n`); } });
   });
   await new Promise((r) => server.listen(socket, r));
   const grantFile = join(dir, 'grant');
@@ -32,11 +37,17 @@ async function fakeBroker(handler) {
 }
 
 function fakePi() {
-  const pi = { tools: {}, handlers: {}, sent: [], order: [] };
+  const pi = { tools: {}, handlers: {}, sent: [], order: [], entries: [], events: createEventBus() };
   pi.registerTool = (t) => { pi.tools[t.name] = t; };
   pi.on = (ev, fn) => { (pi.handlers[ev] ??= []).push(fn); };
-  pi.sendMessage = (m, o) => { pi.sent.push({ m, o }); pi.order.push(`sent:${m.details?.id}`); };
-  pi.emit = async (ev, event = {}, ctx = {}) => { let out; for (const fn of pi.handlers[ev] ?? []) out = await fn(event, ctx); return out; };
+  pi.appendEntry = (customType, data) => pi.entries.push({ type: 'custom', customType, data });
+  pi.sendMessage = (m, o) => { pi.sent.push({ m, o }); pi.entries.push({ type: 'custom_message', ...m }); pi.order.push(`sent:${m.details?.id}`); };
+  pi.emit = async (ev, event = {}, ctx = {}) => {
+    ctx.sessionManager ??= { getBranch: () => pi.entries };
+    let out;
+    for (const fn of pi.handlers[ev] ?? []) out = await fn(event, ctx);
+    return out;
+  };
   return pi;
 }
 
@@ -217,14 +228,12 @@ test('the capability cache cannot overwrite a controller file through a project 
 test('alarms: put into the conversation first, acknowledged after; a pending alarm reaches the successor at session_start', async () => {
   delete globalThis[CLAIM];
   let pending = [{ id: 'a-1', label: 'beat', message: 'stale', at: 1760000000 }];
-  const order = [];
-  const pi = fakePi();
+  const pi = fakePi(), order = pi.order;
   const b = await fakeBroker((req) => {
     if (req.op === 'alarms' && req.ack) { order.push(`ack:${req.ack.join(',')}`); pending = []; return { ok: true, result: { pending: [], acked: req.ack } }; }
     if (req.op === 'alarms') return { ok: true, result: { pending, acked: [] } };
     return { ok: true, result: CAPS };
   });
-  pi.sendMessage = (m, o) => { pi.sent.push({ m, o }); order.push(`sent:${m.details.id}`); };
   minaHost(pi, { env: { MINA_HOST_SOCKET: b.socket, MINA_HOST_GRANT_FILE: b.grantFile }, pollMs: 60_000 });
   await pi.emit('session_start', {}, { cwd: mkdtempSync(join(tmpdir(), 'mina-proj-')) });
   assert.deepEqual(order, ['sent:a-1', 'ack:a-1']);
@@ -232,6 +241,167 @@ test('alarms: put into the conversation first, acknowledged after; a pending ala
   assert.match(pi.sent[0].m.content, /mina host alarm \(beat/);
   await pi.emit('session_shutdown');
   await b.close();
+});
+
+const quotaAlarm = (i) => ({ id: `a-fixture-${i}`, label: `workload monitor ${i}`, at: 1760000000 + i,
+  message: `workload campaign 20260101000000-abcdef ended: succeeded (rc 0, verified exit True)` });
+const quotaGoal = { id: 'g-host', status: 'usage_limited' };
+const deadlineFor = (g, m, resumeAt) => ({ resumeAt,
+  goalSignature: createHash('sha256').update(JSON.stringify(g)).digest('hex'), model: JSON.stringify([m.provider, m.id, m.baseUrl, false]) });
+const hostEnvFor = (broker) => ({ MINA_HOST_SOCKET: broker.socket, MINA_HOST_GRANT_FILE: broker.grantFile });
+async function until(check) {
+  const end = Date.now() + 5000;
+  while (!check()) {
+    assert.ok(Date.now() < end, 'fixture did not reach expected state');
+    await sleep(5);
+  }
+}
+
+test('real Pi restores quota after host session_start: 13 visible, durable, acked alarms reach the one reset turn', async () => {
+  const alarms = Array.from({ length: 13 }, (_, i) => quotaAlarm(i)), pending = new Map(alarms.map((a) => [a.id, a]));
+  const provider = fauxProvider({ provider: 'mina-host-fixture' });
+  const model = provider.getModel();
+  let clock = Date.now(), wake, onDiskAtAck, requests = [], resumeArgs = [];
+  const deadline = deadlineFor(quotaGoal, model, clock + 3600_000);
+  const broker = await fakeBroker((req) => {
+    if (req.op === 'capabilities') return { ok: true, result: CAPS };
+    if (req.ack) {
+      onDiskAtAck = readFileSync(sm.getSessionFile(), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+        .filter((e) => e.customType === 'mina-host-alarm').map((e) => e.details.id);
+      for (const id of req.ack) pending.delete(id);
+    }
+    return { ok: true, result: { pending: [...pending.values()], acked: req.ack ?? [] } };
+  });
+  const project = join(broker.dir, 'project'), agentDir = join(broker.dir, 'agent'), sessions = join(broker.dir, 'sessions');
+  mkdirSync(project); mkdirSync(agentDir); mkdirSync(sessions);
+  const sm = SessionManager.create(project, sessions);
+  sm.appendMessage({ role: 'user', content: 'Evaluate the workload.', timestamp: clock });
+  sm.appendCustomEntry('goal-state', { goal: quotaGoal });
+  sm.appendCustomEntry(USAGE_RESUME_ENTRY, deadline);
+  const settingsManager = SettingsManager.inMemory();
+  const modelRuntime = await ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), refreshOnCreate: false });
+  const options = { cwd: project, agentDir, settingsManager, modelRuntime, model };
+  const host = (pi) => minaHost(pi, { env: hostEnvFor(broker), pollMs: 60_000 });
+  const recovery = (pi) => {
+    installUsageResume(pi, { now: () => clock, setTimer: (fn) => { wake = fn; return {}; }, clearTimer: () => { wake = null; } });
+    pi.registerCommand('goal', { description: 'fixture reset wake', handler: (args) => {
+      resumeArgs.push(args);
+      pi.appendEntry('goal-state', { goal: { ...quotaGoal, status: 'active' } });
+      pi.sendUserMessage('Continue goal after reset.');
+    } });
+  };
+  const resourceLoader = new DefaultResourceLoader({ ...options, noExtensions: true, noSkills: true,
+    noContextFiles: true, noPromptTemplates: true, noThemes: true,
+    extensionFactories: [host, recovery, (pi) => pi.registerProvider(provider.provider)] });
+  provider.setResponses([(context) => { requests.push(context.messages); return fauxAssistantMessage('Fixture complete.'); }]);
+  let session;
+  try {
+    await resourceLoader.reload();
+    ({ session } = await createAgentSession({ ...options, resourceLoader, sessionManager: SessionManager.open(sm.getSessionFile(), sessions, project) }));
+    await session.bindExtensions({});
+    assert.equal(provider.state.callCount, 0, 'a restored wait must be recognized before later session_start handlers');
+    assert.equal(session.isStreaming, false);
+    assert.equal(pending.size, 0);
+    assert.deepEqual(broker.seen.filter((r) => r.ack).map((r) => r.ack), [alarms.map((a) => a.id)]);
+    assert.deepEqual(onDiskAtAck, alarms.map((a) => a.id));
+    const messages = session.messages.filter((m) => m.customType === 'mina-host-alarm');
+    assert.equal(messages.length, 13);
+    assert.ok(messages.every((m) => m.display === true));
+    assert.match(messages[0].content, /workload_status.*workload_output.*do not (?:rerun|resubmit)/s);
+    assert.ok(wake, 'the alarm batch neither cancels nor consumes the timer');
+    clock = deadline.resumeAt;
+    wake();
+    await until(() => requests.length === 1 && !session.isStreaming);
+    assert.equal(provider.state.callCount, 1);
+    assert.deepEqual(resumeArgs, ['resume']);
+    const text = requests[0].flatMap((m) => Array.isArray(m.content) ? m.content.map((b) => b.text) : [m.content]).join('\n');
+    for (const a of alarms) assert.ok(text.includes(a.label), `missing ${a.id} in model context`);
+    assert.equal(broker.seen.some((r) => r.op === WIRE || r.op === 'workload_run'), false);
+  } finally {
+    if (session) { await session.abort(); await session.extensionRunner.emit({ type: 'session_shutdown' }); session.dispose(); }
+    await broker.close();
+    rmSync(broker.dir, { recursive: true, force: true });
+  }
+});
+
+test('poll uses the current quota state after an in-flight broker read; parked Pi queues without steering or premature ack', async () => {
+  const pi = fakePi(), a = quotaAlarm(1), queued = [];
+  let releasePoll, acked = false, busy = true, finishLookup;
+  const broker = await fakeBroker(async (req) => {
+    if (req.op === 'capabilities') return { ok: true, result: CAPS };
+    if (req.ack) { acked = true; return { ok: true, result: { pending: [], acked: req.ack } }; }
+    if (broker.seen.filter((r) => r.op === 'alarms').length === 1 || acked) return { ok: true, result: { pending: [] } };
+    if (!releasePoll) await new Promise((resolve) => { releasePoll = resolve; });
+    return { ok: true, result: { pending: [a] } };
+  });
+  const ctx = { cwd: broker.dir, model: { provider: 'fixture', id: 'fixture' }, isIdle: () => !busy };
+  const deliver = pi.sendMessage;
+  pi.sendMessage = (m, o) => busy ? queued.push({ m, o }) : deliver(m, o);
+  installUsageResume(pi, { resolveReset: () => new Promise((resolve) => { finishLookup = resolve; }) });
+  minaHost(pi, { env: hostEnvFor(broker), pollMs: 10 });
+  try {
+    pi.appendEntry('goal-state', { goal: { ...quotaGoal, status: 'active' } });
+    await pi.emit('session_start', {}, ctx);
+    await pi.emit('agent_start', {}, ctx);
+    await until(() => releasePoll);
+    const message = { role: 'assistant', stopReason: 'error', errorMessage: 'usage limit reached' };
+    await pi.emit('turn_end', { message }, ctx);
+    pi.appendEntry('goal-state', { goal: quotaGoal });
+    const settling = pi.emit('agent_settled', {}, ctx);
+    await until(() => finishLookup);
+    releasePoll();
+    await until(() => queued.length > 0);
+    assert.equal(queued[0].o.triggerTurn, false, 'park even while evidence is being resolved, before a deadline is saved');
+    assert.notEqual(queued[0].o.deliverAs, 'nextTurn', 'not a volatile next-turn-only message');
+    finishLookup(Date.now() + 3600_000);
+    await settling;
+    await until(() => broker.seen.filter((r) => r.op === 'alarms').length >= 4);
+    assert.equal(queued.length, 1, 'do not stack copies while Pi holds deferred custom messages');
+    assert.equal(acked, false, 'the send API returning does not mean its message was logged');
+    busy = false;
+    for (const { m, o } of queued) deliver(m, o);
+    await until(() => acked);
+    assert.equal(pi.sent.length, 1);
+  } finally {
+    releasePoll?.(); finishLookup?.(null);
+    await pi.emit('session_shutdown', {}, ctx);
+    await broker.close();
+    rmSync(broker.dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed ack is retried without adding another parked message; the next alarm wakes after cancellation', async () => {
+  const pi = fakePi(), model = { provider: 'fixture', id: 'fixture' }, a = quotaAlarm(1), next = quotaAlarm(2);
+  let pending = [a], failedAck = false, acked = [];
+  const broker = await fakeBroker((req) => {
+    if (req.op === 'capabilities') return { ok: true, result: CAPS };
+    if (req.ack) {
+      if (!failedAck) { failedAck = true; return { ok: false, error: { code: 'FAILED', message: 'fixture ack failed' } }; }
+      acked.push(...req.ack);
+      pending = pending.filter((item) => !req.ack.includes(item.id));
+    }
+    return { ok: true, result: { pending, acked: req.ack ?? [] } };
+  });
+  const ctx = { cwd: broker.dir, model };
+  pi.appendEntry('goal-state', { goal: quotaGoal });
+  pi.appendEntry(USAGE_RESUME_ENTRY, deadlineFor(quotaGoal, model, Date.now() + 3600_000));
+  installUsageResume(pi); // the opposite extension registration order from the real-Pi fixture
+  minaHost(pi, { env: hostEnvFor(broker), pollMs: 10 });
+  try {
+    await pi.emit('session_start', { reason: 'resume' }, ctx);
+    assert.equal(pi.sent[0].o.triggerTurn, false);
+    await until(() => acked.includes(a.id));
+    assert.deepEqual(pi.sent.map(({ m }) => m.details.id), [a.id]);
+    assert.deepEqual(broker.seen.filter((r) => r.ack).map((r) => r.ack), [[a.id], [a.id]]);
+    await pi.emit('input', { source: 'rpc' }, ctx);
+    pending = [next];
+    await until(() => acked.includes(next.id));
+    assert.deepEqual(pi.sent.at(-1).o, { triggerTurn: true, deliverAs: 'steer' });
+  } finally {
+    await pi.emit('session_shutdown', {}, ctx);
+    await broker.close();
+    rmSync(broker.dir, { recursive: true, force: true });
+  }
 });
 
 test('alarms stay pending at the broker while a handoff is under way', async () => {
@@ -245,7 +415,6 @@ test('alarms stay pending at the broker while a handoff is under way', async () 
     if (req.op === 'alarms') return { ok: true, result: { pending: [{ id: 'a-1', label: 'beat', message: 'stale', at: 1760000000 }], acked: [] } };
     return { ok: true, result: CAPS };
   });
-  pi.sendMessage = (m, o) => pi.sent.push({ m, o });
   try {
     minaHost(pi, { env: { MINA_HOST_SOCKET: b.socket, MINA_HOST_GRANT_FILE: b.grantFile }, pollMs: 60_000 });
     const ctx = { cwd: mkdtempSync(join(tmpdir(), 'mina-proj-')) };

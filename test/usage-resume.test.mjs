@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { installUsageResume, USAGE_RESUME_ENTRY, resetFromError, resetFromHeaders, codexReset, claudeReset, claudeSdkReset, usageReset } from '../extensions/goal/usage-resume.mjs';
+import * as usage from '../extensions/goal/usage-resume.mjs';
+import { createEventBus } from '@earendil-works/pi-coding-agent';
+const { installUsageResume, USAGE_RESUME_ENTRY, resetFromError, resetFromHeaders, codexReset, claudeReset, claudeSdkReset, usageReset } = usage;
 
 const NOW = Date.parse('2026-01-01T12:00:00Z');
 const HOUR = 3_600_000;
@@ -84,7 +86,7 @@ function harness({ entries = [], at = NOW + 5 * HOUR, resolver, model = { provid
   if (fresh) entries.push({ type: 'custom', customType: 'goal-state', data: { goal: { id: 'g1', status: 'active' } } });
   const ctx = { model, modelRegistry: { isUsingOAuth: () => false },
     isIdle: () => true, hasPendingMessages: () => false, hasUI: false, sessionManager: { getBranch: () => entries } };
-  const pi = { on: (ev, fn) => (handlers[ev] ??= []).push(fn),
+  const pi = { events: createEventBus(), on: (ev, fn) => (handlers[ev] ??= []).push(fn),
     appendEntry: (customType, data) => entries.push({ type: 'custom', customType, data: structuredClone(data) }),
     sendUserMessage: (text, opts) => { sent.push({ text, opts }); resumedModels.push(structuredClone(ctx.model)); },
     setModel: () => assert.fail('recovery must never switch the selected model') };
@@ -102,7 +104,12 @@ function harness({ entries = [], at = NOW + 5 * HOUR, resolver, model = { provid
     for (const fn of handlers.turn_end ?? []) fn({ message: { role: 'assistant', stopReason: 'error', errorMessage: 'usage limit reached' } }, ctx);
     setGoal({ id: 'g1', status: 'usage_limited' });
   }
-  return { ctx, entries, timers, sent, notes, measures, recovery, emit, tick, setGoal, saved, resumedModels };
+  const suppressesWake = (sessionStartReason) => {
+    let suppressed = false;
+    pi.events.emit('mina:automatic-turn-check', { ctx, sessionStartReason, suppress: () => { suppressed = true; } });
+    return suppressed;
+  };
+  return { ctx, entries, timers, sent, notes, measures, recovery, emit, tick, setGoal, saved, resumedModels, events: pi.events, suppressesWake };
 }
 
 test('a usage-limited goal waits until reset plus margin and resumes once through upstream /goal', async () => {
@@ -136,6 +143,98 @@ test('pending schedules survive shutdown and /resume, including an overdue reset
   reopened.tick(NOW + 6 * HOUR + 1000);
   assert.equal(reopened.sent.length, 1);
   assert.equal(h.sent.length, 0);
+});
+
+test('quotaHandoffState copies the full matching native state, never a stale, cancelled or other-provider deadline', async () => {
+  const h = harness();
+  await h.emit('agent_settled');
+  const state = h.entries.filter((e) => e.customType === 'goal-state').at(-1).data;
+  state.legacyQueue = { retained: true };
+  const deadline = h.saved();
+  const carry = usage.quotaHandoffState;
+  assert.deepEqual(carry(h.ctx), { state, deadline });
+  const overdue = harness({ entries: structuredClone(h.entries) });
+  overdue.tick(deadline.resumeAt + 1);
+  assert.deepEqual(carry(overdue.ctx), { state, deadline }, 'an overdue wait is still pending until its timer runs');
+  for (const update of [
+    (r) => { r.ctx.model = { provider: 'another-provider', id: r.ctx.model.id }; },
+    (r) => { r.ctx.model = { ...r.ctx.model, baseUrl: 'https://other.example/' }; },
+    (r) => { r.ctx.modelRegistry.isUsingOAuth = () => true; },
+    (r) => { r.ctx.model = undefined; r.ctx.modelRegistry.isUsingOAuth = (model) => { assert.ok(model); return false; }; },
+    (r) => r.setGoal({ id: 'g1', status: 'usage_limited', objective: 'different signature' }),
+    (r) => r.setGoal({ id: 'g1', status: 'complete' }),
+    (r) => { r.saved().resumeAt = Infinity; },
+    (r) => r.entries.push({ type: 'custom', customType: USAGE_RESUME_ENTRY, data: null }),
+  ]) {
+    const r = harness({ entries: structuredClone(h.entries) });
+    update(r);
+    assert.equal(carry(r.ctx), null);
+  }
+});
+
+test('native accounting updates on reopen do not discard a provider reset for the same waiting goal', async () => {
+  const waiting = { id: 'g1', text: 'revise the checker', status: 'active', waiting: { reason: 'Provider retries exhausted: rate limited' }, tokensUsed: 200 };
+  const h = harness({ entries: [{ type: 'custom', customType: 'goal-state', data: { goal: { ...waiting, waiting: undefined } } }] });
+  await h.emit('agent_start');
+  await h.emit('after_provider_response', { status: 429, headers: { 'Retry-After': '900' } });
+  await h.emit('turn_end', { message: { role: 'assistant', stopReason: 'error', errorMessage: 'rate limited' } });
+  h.setGoal(waiting);
+  await h.emit('agent_settled');
+  const reopened = harness({ entries: structuredClone(h.entries) });
+  reopened.setGoal({ ...waiting, tokensUsed: 210, updatedAt: NOW + 1000 });
+  await reopened.emit('session_start');
+  assert.equal(reopened.suppressesWake(), true);
+  reopened.tick(h.saved().resumeAt);
+  assert.equal(reopened.sent.length, 1);
+});
+
+test('new-session restore arms only after handoff restores the exact saved model; later manual switches do not revive it', async () => {
+  const h = harness();
+  await h.emit('agent_settled');
+  const otherModel = { provider: 'other', id: 'fixture' };
+  for (const finishRestore of ['matching', 'failed', 'cancelled']) {
+    const r = harness({ entries: structuredClone(h.entries), model: otherModel,
+      resolver: () => assert.fail('no provider query for a persisted wait') });
+    assert.equal(r.suppressesWake('resume'), false, 'a different provider is not parked on an ordinary restore');
+    assert.equal(r.suppressesWake('new'), true, 'host session_start runs on the default before handoff can switch models');
+    await r.emit('session_start', { reason: 'new' });
+    assert.equal(r.timers.size, 0, 'do not arm a timer on the default model');
+    assert.equal(r.suppressesWake(), true, 'polls during handoff model restoration must not start a run either');
+    if (finishRestore === 'cancelled') await r.emit('input', { source: 'interactive' });
+    if (finishRestore !== 'failed') {
+      r.ctx.model = h.ctx.model;
+      await r.emit('model_select', { model: r.ctx.model, previousModel: otherModel, source: 'set' });
+    }
+    r.events.emit('mina:handoff-model-ready', r.ctx);
+    if (finishRestore === 'matching') {
+      assert.equal(r.timers.size, 1);
+      r.events.emit('mina:handoff-model-ready', r.ctx);
+      assert.equal(r.timers.size, 1, 'duplicate ready event is harmless');
+      assert.equal(r.suppressesWake(), true);
+    } else {
+      assert.equal(r.saved(), null, 'failed or cancelled restoration consumes the copied wait');
+      assert.equal(r.suppressesWake(), false);
+      assert.equal(r.timers.size, 0);
+      r.ctx.model = h.ctx.model;
+      await r.emit('model_select', { model: r.ctx.model, previousModel: otherModel, source: 'set' });
+      assert.equal(r.timers.size, 0, 'an ordinary model change never re-arms a saved deadline');
+    }
+    r.tick(h.saved().resumeAt);
+    assert.equal(r.sent.length, finishRestore === 'matching' ? 1 : 0);
+  }
+});
+
+test('an automatic wake is suppressed after a goal-owned quota failure even before agent_settled', async () => {
+  const h = harness();
+  await h.emit('session_start');
+  h.setGoal({ id: 'g1', status: 'active' });
+  await h.emit('agent_start');
+  await h.emit('turn_end', { message: { role: 'assistant', stopReason: 'error', errorMessage: 'usage limit reached' } });
+  h.setGoal({ id: 'g1', status: 'usage_limited' });
+  assert.equal(h.saved(), undefined);
+  assert.equal(h.suppressesWake(), true);
+  await h.emit('input', { source: 'interactive' });
+  assert.equal(h.suppressesWake(), false, 'historical usage_limited alone is not a scheduled wait');
 });
 
 test('manual input, model selection, navigation, and explicit goal commands cancel automatic resumes', async () => {

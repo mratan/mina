@@ -9,8 +9,28 @@ const finiteTime = (n) => Number.isFinite(n) && n > 0 && n < 8.64e15 ? n : null;
 const latest = (ctx, type) => (ctx?.sessionManager?.getBranch?.() ?? []).filter((e) => e.type === 'custom' && e.customType === type).at(-1)?.data;
 const goal = (ctx) => latest(ctx, 'goal-state')?.goal;
 const signature = (g) => createHash('sha256').update(JSON.stringify(g ?? null)).digest('hex');
-const modelKey = (ctx) => JSON.stringify([ctx?.model?.provider, ctx?.model?.id, ctx?.model?.baseUrl, !!ctx?.modelRegistry?.isUsingOAuth?.(ctx.model)]);
+const modelKey = (ctx) => {
+  const m = ctx?.model;
+  return JSON.stringify([m?.provider, m?.id, m?.baseUrl, !!(m && ctx.modelRegistry?.isUsingOAuth?.(m))]);
+};
 const parked = (g) => g?.status === 'usage_limited' || (g?.status === 'active' && String(g.waiting?.reason ?? '').startsWith('Provider retries exhausted'));
+// pi-goal can save new usage counters on session_start without changing the objective or the wait.
+const waitRevision = (g) => typeof g?.text === 'string' ? signature([g.id, g.text, g.status, g.tokenBudget, g.waiting?.reason, g.waiting?.resumeAt]) : null;
+const matchesGoal = (g, record) => parked(g) && (record.goalRevision ? waitRevision(g) === record.goalRevision : signature(g) === record.goalSignature);
+const matches = (ctx, record) => record.model === modelKey(ctx) && matchesGoal(goal(ctx), record);
+
+function savedWait(ctx) {
+  const deadline = latest(ctx, USAGE_RESUME_ENTRY);
+  if (typeof deadline?.model !== 'string' || !finiteTime(deadline.resumeAt)) return null;
+  const state = latest(ctx, 'goal-state');
+  return matchesGoal(state?.goal, deadline) ? { state, deadline } : null;
+}
+
+// Handoff seeds these exact entries in the successor; an overdue deadline is still valid until consumed.
+export function quotaHandoffState(ctx) {
+  const saved = savedWait(ctx);
+  return saved && ctx?.model && saved.deadline.model === modelKey(ctx) ? saved : null;
+}
 
 function durationMs(text) {
   const units = { ms: 1, s: 1000, sec: 1000, seconds: 1000, m: 60_000, min: 60_000, minutes: 60_000, h: 3_600_000, hours: 3_600_000 };
@@ -104,18 +124,37 @@ export async function usageReset(ctx, error, { now = Date.now(), fetch = globalT
 export function installUsageResume(pi, { notify, measure, now = () => Date.now(), resolveReset = usageReset, claudeProfiles,
   setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
   const sdkProviders = claudeCodeLabels(claudeProfiles);
-  let pending = null, timer = null, generation = 0, responseReset = null, sdkReset = null, failure = null, runGoalId = null, resolving = false;
-  let manuallyParkedGoal = null;
+  let pending = null, timer = null, generation = 0, responseReset = null, sdkReset = null, failure = null, runGoalId = null, resolving = null;
+  let manuallyParkedGoal = null, started = false, restoringModel = false;
   const currentSdkReset = (ctx) => sdkReset?.model === modelKey(ctx) ? sdkReset.at : null;
   const stop = () => { if (timer !== null) clearTimer(timer); timer = null; };
   const clearRequest = () => { responseReset = null; sdkReset = null; failure = null; runGoalId = null; };
   const status = (ctx, at) => ctx?.ui?.setStatus?.(USAGE_RESUME_ENTRY, at ? `mina: goal resumes after ${new Date(at).toISOString()} · /goal pause cancels` : undefined);
   const cancel = (ctx, persist = true) => {
-    generation++; stop(); resolving = false; clearRequest();
-    if (pending && persist) pi.appendEntry(USAGE_RESUME_ENTRY, null);
-    pending = null; status(ctx, null);
+    generation++; stop(); resolving = null; clearRequest();
+    if ((pending || restoringModel) && persist) pi.appendEntry(USAGE_RESUME_ENTRY, null);
+    pending = null; restoringModel = false; status(ctx, null);
   };
-  const matches = (ctx, record) => parked(goal(ctx)) && signature(goal(ctx)) === record.goalSignature && modelKey(ctx) === record.model;
+  const recoveryCandidate = (ctx) => {
+    const g = goal(ctx), interrupted = failure;
+    // An inactive goal can remain in history during unrelated conversation. Only a fresh failure of its own run
+    // can create a new schedule. Persisted schedules have a separate restoration path.
+    if (!parked(g) || !interrupted || interrupted.goalId !== g.id || manuallyParkedGoal === g.id
+      || (sdkReset?.model === modelKey(ctx) && sdkReset.billing) || BILLING.test(interrupted.error)) return null;
+    const fromError = resetFromError(interrupted.error, interrupted.at), fromSdk = currentSdkReset(ctx);
+    if (g.status !== 'usage_limited' && responseReset === null && fromError === null && fromSdk === null) return null;
+    return { g, interrupted, fromError, fromSdk };
+  };
+  // A synchronous, session-local Pi event: the caller doesn't need to know how quota waits are represented.
+  // Host can poll in session_start before our own handler, so check the branch then rather than requiring an armed timer.
+  pi.events?.on?.('mina:automatic-turn-check', ({ ctx, sessionStartReason, suppress }) => {
+    if (!started) {
+      if (sessionStartReason === 'new' ? savedWait(ctx) : quotaHandoffState(ctx)) suppress();
+      return;
+    }
+    if ((pending && matches(ctx, pending)) || (resolving && matches(ctx, resolving)) || (restoringModel && savedWait(ctx))
+      || recoveryCandidate(ctx)) suppress();
+  });
   const arm = (ctx) => {
     stop();
     const mine = generation;
@@ -135,17 +174,13 @@ export function installUsageResume(pi, { notify, measure, now = () => Date.now()
   };
   const schedule = async (ctx) => {
     if (pending) return matches(ctx, pending);
-    const g = goal(ctx), interrupted = failure;
-    // An inactive goal can remain in history during unrelated conversation. Only a fresh failure of its own run
-    // can create a new schedule. Persisted schedules have a separate restoration path.
-    if (!parked(g) || resolving || !interrupted || interrupted.goalId !== g.id || manuallyParkedGoal === g.id
-      || (sdkReset?.model === modelKey(ctx) && sdkReset.billing)) return false;
-    const fromError = resetFromError(interrupted.error, interrupted.at), fromSdk = currentSdkReset(ctx);
-    if (g.status !== 'usage_limited' && responseReset === null && fromError === null && fromSdk === null) return false;
-    if (BILLING.test(interrupted.error)) return false;
+    if (resolving || restoringModel) return false;
+    const candidate = recoveryCandidate(ctx);
+    if (!candidate) return false;
+    const { g, interrupted, fromError, fromSdk } = candidate;
     const mine = generation, key = modelKey(ctx), sig = signature(g), fromResponse = responseReset;
     failure = null;
-    resolving = true;
+    resolving = { goalSignature: sig, model: key };
     try {
       const at = await resolveReset(ctx, interrupted.error, { now: now() });
       if (mine !== generation || key !== modelKey(ctx) || sig !== signature(goal(ctx))) return false;
@@ -154,19 +189,20 @@ export function installUsageResume(pi, { notify, measure, now = () => Date.now()
         notify?.(ctx, 'mina: no reset time is available for this usage limit. Run /goal resume when usage is available.', 'warning');
         return false;
       }
-      pending = { goalSignature: sig, model: key, resumeAt: Math.max(...evidence, now()) + MARGIN_MS };
+      const revision = waitRevision(g);
+      pending = { goalSignature: sig, ...(revision ? { goalRevision: revision } : {}), model: key, resumeAt: Math.max(...evidence, now()) + MARGIN_MS };
       pi.appendEntry(USAGE_RESUME_ENTRY, pending);
       status(ctx, pending.resumeAt);
       notify?.(ctx, `mina: usage limit. The goal resumes after ${new Date(pending.resumeAt).toISOString()}. /goal pause cancels the automatic resume.`, 'warning');
       measure?.({ kind: 'usage_limit_wait', resume_at: pending.resumeAt });
       arm(ctx);
       return true;
-    } finally { if (mine === generation) resolving = false; }
+    } finally { if (mine === generation) resolving = null; }
   };
   pi.on('agent_start', (_event, ctx) => {
-    // Subagent notices and host alarms can start a run while the goal is quota-parked. They do not revoke its
-    // pending resume. Human input and goal/model/session changes cancel explicitly at their own boundaries.
-    if ((pending && matches(ctx, pending)) || (resolving && parked(goal(ctx)))) { clearRequest(); return; }
+    // Other extensions can still start a run while quota-parked. That does not revoke the pending resume.
+    // Human input and goal/model/session changes cancel explicitly at their own boundaries.
+    if ((pending && matches(ctx, pending)) || (resolving && matches(ctx, resolving)) || restoringModel) { clearRequest(); return; }
     cancel(ctx);
     const g = goal(ctx);
     runGoalId = g?.status === 'active' && g.id !== manuallyParkedGoal ? g.id : null;
@@ -208,24 +244,38 @@ export function installUsageResume(pi, { notify, measure, now = () => Date.now()
     observeAssistant((event.messages ?? []).filter((m) => m?.role === 'assistant').at(-1));
   });
   pi.on('agent_settled', async (_event, ctx) => { await schedule(ctx); });
-  pi.on('cache_warming_decision', () => pending || resolving ? { action: 'stop' } : undefined);
+  pi.on('cache_warming_decision', () => pending || resolving || restoringModel ? { action: 'stop' } : undefined);
   pi.on('input', (event, ctx) => {
     if (event.source === 'extension') return;
-    if (pending || resolving) manuallyParkedGoal = goal(ctx)?.id ?? null;
+    if (pending || resolving || restoringModel) manuallyParkedGoal = goal(ctx)?.id ?? null;
     cancel(ctx);
   });
-  pi.on('model_select', (_event, ctx) => { manuallyParkedGoal = null; cancel(ctx); });
-  pi.on('session_start', (_event, ctx) => {
+  pi.on('model_select', (_event, ctx) => {
+    if (restoringModel) return; // Handoff announces when its initial model selection is finished.
+    manuallyParkedGoal = null; cancel(ctx);
+  });
+  const restore = (ctx, { deadline }) => {
+    pending = deadline; status(ctx, pending.resumeAt); arm(ctx);
+    notify?.(ctx, `mina: the goal resumes after ${new Date(pending.resumeAt).toISOString()}. /goal pause cancels the automatic resume.`, 'info');
+  };
+  pi.on('session_start', (event, ctx) => {
+    started = true;
     manuallyParkedGoal = null;
     cancel(ctx, false);
-    const saved = latest(ctx, USAGE_RESUME_ENTRY);
-    if (saved && finiteTime(saved.resumeAt) && matches(ctx, saved)) {
-      pending = saved; status(ctx, saved.resumeAt); arm(ctx);
-      notify?.(ctx, `mina: the goal resumes after ${new Date(saved.resumeAt).toISOString()}. /goal pause cancels the automatic resume.`, 'info');
-    }
+    // Pi selects a default before newSession setup. Only a copied, matching goal wait can defer restore to handoff.
+    const carried = quotaHandoffState(ctx);
+    if (carried) restore(ctx, carried);
+    else restoringModel = event?.reason === 'new' && !!savedWait(ctx);
+  });
+  pi.events?.on?.('mina:handoff-model-ready', (ctx) => {
+    if (!restoringModel) return;
+    const carried = quotaHandoffState(ctx);
+    if (!carried) { cancel(ctx); return; }
+    restoringModel = false;
+    restore(ctx, carried);
   });
   // Branch navigation must not revive a schedule from a branch the user left.
   for (const event of ['session_before_switch', 'session_before_fork', 'session_before_tree']) pi.on(event, (_event, ctx) => cancel(ctx));
   pi.on('session_shutdown', (_event, ctx) => cancel(ctx, false)); // Keep the persisted deadline for /resume.
-  return { cancel: (ctx) => { manuallyParkedGoal = null; cancel(ctx); }, schedule, waiting: () => !!pending || resolving };
+  return { cancel: (ctx) => { manuallyParkedGoal = null; cancel(ctx); }, schedule, waiting: () => !!(pending || resolving || restoringModel) };
 }

@@ -1,10 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { thresholds, tuningForModel, poolBudget, poolCap, poolThresholds, spawnFits, handoffDue, hotCompactConfig, renderPacket, goalRestatement, NOTE_REQUEST } from '../extensions/handoff/policy.mjs';
 import { lineage, search, readEntry } from '../extensions/handoff/recall.mjs';
+import { installUsageResume } from '../extensions/goal/usage-resume.mjs';
+import minaHost from '../extensions/host/index.js';
 process.env.MINA_METRICS_FILE = join(mkdtempSync(join(tmpdir(), 'mina-metrics-')), 'metrics.jsonl'); // tests never write the real file
 import minaHandoff, { MARKER, REMIND_EVERY, RESUME_REQUEST, fallbackSummary, IN_PLACE, PACKET_ENTRY, IN_PLACE_SUMMARY, RESUME_IN_PLACE, sinceLastReset } from '../extensions/handoff/index.js';
 
@@ -85,13 +89,14 @@ test('recall searches the current session and its parents, and reads an entry', 
 // A fake Pi runtime for the extension.
 function fake({ tokens = 10_000, window = 131072, branch = [], file = null, tuning = { compact_at_tokens: 60000, handoff_at_tokens: 90000, context_window: window },
   model = { provider: 'p', id: 'm' }, readTuning = () => null, measure = undefined, exec = undefined, extra = {} } = {}) {
-  const handlers = {}, tools = {}, commands = {}, sent = [], entries = [], switched = [], bus = {};
+  const handlers = {}, tools = {}, commands = {}, sent = [], entries = [], switched = [], bus = {}, posted = [];
   const pi = {
     events: { on: (ch, fn) => { (bus[ch] ??= []).push(fn); return () => {}; }, emit: (ch, d) => (bus[ch] ?? []).forEach((fn) => fn(d)) },
     on: (ev, fn) => { (handlers[ev] ??= []).push(fn); },
     registerTool: (t) => { tools[t.name] = t; },
     registerCommand: (n, o) => { commands[n] = o; },
     sendUserMessage: (text, opts) => sent.push({ text, opts }),
+    sendMessage: (message, opts) => posted.push({ message, opts }),
     appendEntry: (type, data) => entries.push({ type, data }),
     setModel: async (m) => { switched.push(m); return true; },
     setThinkingLevel: (l) => switched.push(l),
@@ -123,7 +128,7 @@ function fake({ tokens = 10_000, window = 131072, branch = [], file = null, tuni
     return Reflect.get(target, key);
   } });
   const emit = async (ev, event) => { let out; for (const fn of handlers[ev] ?? []) out = (await fn(event, live)) ?? out; return out; };
-  return { pi, tools, commands, sent, entries, ctx: live, emit, newSessions, switched, unstale: () => { stale = false; } };
+  return { pi, tools, commands, sent, posted, entries, ctx: live, emit, newSessions, switched, unstale: () => { stale = false; } };
 }
 
 test('handoff carries native receipts and recorded check results without executing checks', async () => {
@@ -145,6 +150,117 @@ test('handoff carries native receipts and recorded check results without executi
   assert.match(f.newSessions[0].messages[0].content, /Agent-selected working checks/);
   assert.match(f.newSessions[0].messages[0].content, /[Hh]andoff did not run/);
   assert.doesNotMatch(goalRestatement(goal), /is frozen|before writing files/);
+});
+
+test('handoff continues the edited file objective, not the old Mina mirror, with the same checks and operator ledger', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'mina-handoff-edit-'));
+  writeFileSync(join(cwd, 'new.md'), 'Edited objective');
+  const f = fake({ file: '/s/old.jsonl', branch: [
+    { type: 'custom', customType: 'mina-goal', data: { id: 'g', status: 'active', objective: 'old.md', objective_file: join(cwd, 'old.md'),
+      checks: [{ id: 'R1', command: 'true' }], lastStatus: { lines: ['R1: PASS under the old objective'] } } },
+    { type: 'custom', customType: 'goal-state', data: { goal: { id: 'u2', status: 'active', text: 'new.md', tokenBudget: 8000 } } },
+    { type: 'custom', customType: 'mina-operator-message', data: { id: 'm1', goal: 'g', text: 'Ship only after my review', at: '2026-11-21T12:00:00Z' } },
+  ] });
+  f.ctx.cwd = cwd;
+  await f.emit('session_start', { reason: 'startup' });
+  await f.commands['mina-handoff'].handler('now', f.ctx);
+  const successor = f.newSessions[0];
+  const carried = successor.custom.find((e) => e.t === 'mina-goal').d;
+  assert.equal(carried.id, 'g');
+  assert.equal(carried.objective, 'new.md');
+  assert.equal(carried.objective_file, join(cwd, 'new.md'));
+  assert.equal(carried.tokens, 8000);
+  assert.deepEqual(carried.checks, [{ id: 'R1', command: 'true' }]);
+  assert.equal(carried.lastStatus, null);
+  assert.match(successor.messages[0].content, /new\.md/);
+  assert.doesNotMatch(successor.messages[0].content, /old\.md/);
+  assert.match(successor.messages[0].content, /Ship only after my review/);
+  assert.equal(successor.nextSent[0].text, '/goal mina-continue');
+});
+
+test('handoff and reopen carry the edited goal through quota and surface a broker completion without replaying work', async () => {
+  const model = { provider: 'p', id: 'm' };
+  const goal = { id: 'u2', status: 'usage_limited', text: 'revised objective' };
+  const deadline = { goalSignature: createHash('sha256').update(JSON.stringify(goal)).digest('hex'),
+    model: '["p","m",null,false]', resumeAt: Date.now() + 120_000 };
+  const f = fake({ file: '/s/old.jsonl', model, branch: [
+    { type: 'custom', customType: 'mina-goal', data: { id: 'g', status: 'active', objective: 'old objective', checks: [] } },
+    { type: 'custom', customType: 'goal-state', data: { goal } },
+    { type: 'custom', customType: 'mina-goal-usage-resume', data: deadline },
+    { type: 'custom', customType: 'mina-operator-message', data: { id: 'm1', goal: 'g', text: 'Verify job j42 before continuing', at: '2026-11-21T12:00:00Z' } },
+  ] });
+  await f.emit('session_start', { reason: 'startup' });
+  await f.commands['mina-handoff'].handler('now', f.ctx);
+  const { custom, messages, nextSent } = f.newSessions[0];
+  assert.equal(custom.find((e) => e.t === 'mina-goal').d.objective, 'revised objective');
+  assert.equal(custom.find((e) => e.t === 'mina-goal').d.status, 'active', 'Mina still enforces completion checks after native resume');
+  assert.deepEqual(custom.find((e) => e.t === 'goal-state')?.d, { goal });
+  assert.deepEqual(custom.find((e) => e.t === 'mina-goal-usage-resume')?.d, deadline);
+  assert.match(messages[0].content, /Verify job j42 before continuing/);
+  assert.match(messages[0].content, /automatically resumes.*reset/i);
+  assert.deepEqual(nextSent, [], 'handoff must not restart a parked goal or replay work');
+
+  // Reopen the successor's transcript and deliver the completion that the independent broker retained.
+  const cwd = mkdtempSync(join(tmpdir(), 'mina-quota-'));
+  const socket = join(cwd, 'sock'), grant = join(cwd, 'grant');
+  writeFileSync(grant, 'test-grant\n');
+  const alarm = { id: 'a42', label: 'job j42', at: Date.now() / 1000, message: 'Completed; inspect job j42' };
+  const requests = [];
+  let acknowledged = false;
+  const broker = createServer((c) => {
+    let input = '';
+    c.on('data', (bytes) => {
+      input += bytes;
+      if (!input.endsWith('\n')) return;
+      const req = JSON.parse(input);
+      requests.push(req);
+      if (req.ack?.includes(alarm.id)) acknowledged = true;
+      const result = req.op === 'capabilities' ? { confirmation_protocol: 'mina-confirmation-v1', mutation_protocol: 'mutate_v2', capabilities: [] }
+        : { pending: acknowledged ? [] : [alarm] };
+      c.end(JSON.stringify({ ok: true, result }) + '\n');
+    });
+  });
+  await new Promise((onListen, reject) => broker.once('error', reject).listen(socket, onListen));
+  const file = join(cwd, 'successor.jsonl');
+  writeFileSync(file, '');
+  const branch = custom.map(({ t, d }) => ({ type: 'custom', customType: t, data: d }));
+  const reopened = fake({ file, model, branch });
+  reopened.ctx.cwd = cwd;
+  const post = reopened.pi.sendMessage;
+  reopened.pi.sendMessage = (message, opts) => {
+    post(message, opts);
+    branch.push({ ...message, type: 'custom_message' });
+  };
+  let now = deadline.resumeAt - 1000, timer;
+  installUsageResume(reopened.pi, { now: () => now, setTimer: (fn) => (timer = fn, 1), clearTimer: () => { timer = null; } });
+  minaHost(reopened.pi, { env: { MINA_HOST_SOCKET: socket, MINA_HOST_GRANT_FILE: grant } });
+  try {
+    await reopened.emit('session_start', { reason: 'startup' });
+    assert.match(reopened.posted[0].message.content, /job j42/);
+    assert.equal(reopened.posted[0].opts.triggerTurn, false);
+    assert.equal(acknowledged, true);
+    timer();
+    assert.deepEqual(reopened.sent, []);
+    now = deadline.resumeAt;
+    timer();
+    assert.equal(reopened.sent.length, 1);
+    assert.match(reopened.sent[0].text, /^\/goal resume/);
+    assert.deepEqual(requests.map((req) => req.op), ['capabilities', 'alarms', 'alarms'], 'recovery cannot replay the workload submission');
+  } finally {
+    await reopened.emit('session_shutdown', {});
+    await new Promise((resolve) => broker.close(resolve));
+  }
+});
+
+test('handoff does not attach the previous native run to a newer Mina contract', async () => {
+  const f = fake({ file: '/s/old.jsonl', branch: [
+    { type: 'custom', customType: 'goal-state', data: { goal: { id: 'u1', text: 'old objective', status: 'paused', startedAt: 1000 } } },
+    { type: 'custom', customType: 'mina-goal', data: { id: 'g2', objective: 'new objective', status: 'active', started_at: '1970-01-01T00:00:02.000Z', checks: [] } },
+  ] });
+  await f.commands['mina-handoff'].handler('now', f.ctx);
+  const carried = f.newSessions[0].custom.find((e) => e.t === 'mina-goal').d;
+  assert.equal(carried.objective, 'new objective');
+  assert.equal(carried.status, 'active');
 });
 
 test('handoff refuses to rerun changed protected scripts instead of carrying a misleading pass', async () => {

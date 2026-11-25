@@ -148,8 +148,9 @@ export function renderPacket({ note = null, goal = null, fallback = null, parent
       + 'the handoff, not proof: for exact earlier text (commands, outputs, decisions), use mina_recall, which searches the earlier sessions.',
       `Earlier session: ${parentFile ?? 'unknown'}`, '']).join('\n');
   const goalPart = goal?.status && goal.status !== 'active' ? `## Goal (not active)\n${objectiveText(goal)}\nStatus: ${goal.status}${inPlace ? '' : ' in the earlier session'}. `
-    + 'There is no active goal: do not resume work on it unless the user asks.'
-    + (goal.resume_on_request && !inPlace ? ' The user continues it here with /goal resume.' : '') + '\n'
+    + (goal.resume_at_reset ? 'Mina automatically resumes after the provider reset if the model still matches. Do not restart work before then.'
+      : 'There is no active goal: do not resume work on it unless the user asks.'
+        + (goal.resume_on_request && !inPlace ? ' The user continues it here with /goal resume.' : '')) + '\n'
     : goal ? `## Goal\n${objectiveText(goal)}\nStatus: ${goal.status}${goal.unverified ? ', UNVERIFIED (no checks)' : ''}\n`
     + (inPlace ? 'The goal continues in this session. Use the goal_id from the current Goal contract.\n'
       : 'The goal continues in this session as a new pi-goal run with a new goal_id: any goal_id written below or in the earlier session is stale. '

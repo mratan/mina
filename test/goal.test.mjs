@@ -276,7 +276,7 @@ const project = (cwd = mkdtempSync(join(tmpdir(), 'mina-goal-'))) => {
 const DONE = project();
 
 // A fake Pi with the parts the extension uses, and a fake pi-goal that registers /goal and goal_complete.
-function fakePi({ execCodes = [], execResults = [], syntaxBad = [], dryRuns = [], env, onExec, tuning = null, measure, amendWaitMs, readTuning, snapshot = async () => null } = {}) {
+function fakePi({ execCodes = [], execResults = [], syntaxBad = [], dryRuns = [], env, onExec, onGoal, tuning = null, measure, amendWaitMs, readTuning, snapshot = async () => null } = {}) {
   const handlers = {}, tools = {}, commands = {}, entries = [], messages = [], upstream = [], sent = [], emitted = [];
   const pi = {
     events: { emit: (channel, data) => emitted.push([channel, data]) },
@@ -291,7 +291,7 @@ function fakePi({ execCodes = [], execResults = [], syntaxBad = [], dryRuns = []
       : opts?.timeout === DRY_RUN_TIMEOUT_MS ? (dryRuns.shift() ?? { code: 1, killed: false, stdout: 'FAIL: not done yet', stderr: '' })
         : (execResults.shift() ?? { code: execCodes.shift() ?? 0, killed: false, stdout: 'out', stderr: '' })),
   };
-  const fakeGoal = (api) => api.registerCommand('goal', { description: 'upstream', handler: async (args) => upstream.push(args) });
+  const fakeGoal = (api) => api.registerCommand('goal', { description: 'upstream', handler: async (args, ctx) => { upstream.push(args); await onGoal?.(args, ctx); } });
   createMinaGoal(pi, { goalExtension: fakeGoal, env, sandboxAvailable: true, tuning, measure, amendWaitMs, readTuning, snapshot });
   const emit = async (ev, event, ctx = { cwd: DONE, hasUI: false }) => { let out; for (const fn of handlers[ev] ?? []) out = (await fn(event, ctx)) ?? out; return out; };
   return { pi, tools, commands, entries, messages, upstream, emit, sent, emitted };
@@ -324,6 +324,33 @@ test('an objective that is a path to a file: mina gives the agent the file text,
   assert.match(f.messages[0].content, /objective is the text of the file [^]*goal\.md[^]*Third pass\. Find the best strategy\.\nKill ideas quickly\./);
   await f.commands.goal.handler('build a parser for goal.md files --protect-checks', { cwd, hasUI: false });   // prose that names a file is not a file objective
   assert.equal(f.entries.at(-1).data.objective_file, undefined);
+});
+
+test('a native /goal edit updates the Mina contract without replacing it or approving new checks', async () => {
+  const cwd = project(), branch = [];
+  writeFileSync(join(cwd, 'next.md'), 'Use the revised objective');
+  const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => branch } };
+  const f = fakePi({ onGoal: (args) => {
+    // A rejected edit leaves the native transcript untouched; a successful one rotates the native ID.
+    if (args === 'edit next.md') branch.push({ type: 'custom', customType: 'goal-state',
+      data: { goal: { id: 'u2', text: 'next.md', status: 'active', tokenBudget: 8000 } } });
+  } });
+  await f.commands.goal.handler('prior.md --check "test -f proof"', ctx);
+  writeFileSync(join(cwd, '.mina', 'plan.md'), 'in-flight work');
+  await f.emit('tool_call', { toolName: 'goal_complete' }, ctx);
+  const from = f.entries.at(-1).data;
+  await f.commands.goal.handler('edit', ctx);
+  assert.equal(f.entries.at(-1).data.objective, 'prior.md');
+  await f.commands.goal.handler('edit next.md', ctx);
+  const to = f.entries.at(-1).data;
+  assert.equal(to.id, from.id);
+  assert.equal(to.objective, 'next.md');
+  assert.equal(to.objective_file, join(cwd, 'next.md'));
+  assert.equal(to.tokens, 8000);
+  assert.deepEqual(to.checks, from.checks);
+  assert.deepEqual(to.frozen, from.frozen);
+  assert.equal(to.lastStatus, null);
+  assert.equal(readFileSync(join(cwd, '.mina', 'plan.md'), 'utf8'), 'in-flight work');
 });
 
 test('a first /goal in a fresh project archives nothing', async () => {

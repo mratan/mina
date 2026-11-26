@@ -799,6 +799,99 @@ test('after a restart, a fresh note means a pending handoff: the user finishes i
   assert.equal(asked.length, 0);
 });
 
+async function focusFixture(f) {
+  const call = (p) => f.tools.mina_ledger.execute('id', p, null, null, f.ctx);
+  const record = async (text) => {
+    await f.emit('input', typed(text));
+    const m = f.entries.filter((e) => e.type === 'mina-operator-message').at(-1).data;
+    const add = await call({ action: 'add', kind: 'task', message_id: m.id, quote: text, meaning: text });
+    assert.equal(add.isError, undefined);
+    await call({ action: 'sort', message_ids: [m.id] });
+    return m;
+  };
+  await record('Run the old experiment');
+  const open = await record('Instead, inspect the existing receipt for job j42');
+  const former = await call({ action: 'focus', id: 'L1', next_step: 'Launch the old experiment' });
+  assert.equal(former.isError, undefined, former.content[0].text);
+  const retired = await call({ action: 'retire', id: 'L1', status: 'superseded', message_id: open.id, quote: open.text });
+  assert.equal(retired.isError, undefined);
+  await f.emit('input', typed('Thanks, that helps.'));
+  return { call, open };
+}
+
+const CONTINUATION_GOAL = { type: 'custom', customType: 'mina-goal', data: { id: 'g1', objective: 'finish the work', status: 'active', checks: [] } };
+const FOCUS_STEP = 'Look up job j42 with workload_status; do not submit another job.';
+
+test('compaction keeps an older open request in focus despite newer chatter and a superseded task', async () => {
+  const f = fake({ file: '/s/continuation.jsonl', branch: [CONTINUATION_GOAL] });
+  const { call, open } = await focusFixture(f);
+  const focus = await call({ action: 'focus', id: 'L2', next_step: FOCUS_STEP });
+  assert.equal(focus.isError, undefined, focus.content[0].text);
+  const after = await f.emit('turn_end', { entries: [{ type: 'compaction', summary: 'The old experimental approach is mentioned in history.' }] });
+  const restatement = after.entries.at(-1).content;
+  assert.match(restatement, /Thanks, that helps/);
+  const footer = restatement.split('## Continuation to check')[1];
+  assert.ok(footer);
+  assert.ok(footer.includes(open.id) && footer.includes(open.text) && footer.includes(FOCUS_STEP));
+  assert.doesNotMatch(footer, /Launch the old experiment|Run the old experiment/);
+});
+
+test('retired or inactive work is not revived by the continuation record', async () => {
+  const branch = [CONTINUATION_GOAL];
+  const f = fake({ file: '/s/continuation.jsonl', branch });
+  const { call } = await focusFixture(f);
+  assert.match((await call({ action: 'focus', id: 'L1', next_step: 'Launch the old experiment' })).content[0].text, /requires an active task/);
+  assert.equal((await call({ action: 'focus', id: 'L2', next_step: FOCUS_STEP })).isError, undefined);
+  branch.push({ ...CONTINUATION_GOAL, data: { ...CONTINUATION_GOAL.data, status: 'complete' } });
+  const event = { systemPromptOptions: {} };
+  await f.emit('before_agent_start', event);
+  assert.match(event.systemPromptOptions.sections?.['mina-continuation'] ?? '', /goal is not active/i);
+  assert.doesNotMatch(event.systemPromptOptions.sections?.['mina-continuation'] ?? '', /Look up job j42/);
+  branch.push(CONTINUATION_GOAL);
+  await call({ action: 'retire', id: 'L2', status: 'done', evidence: 'Verified receipt from job j42' });
+  await f.commands['mina-ledger'].handler('restore L2', f.ctx);
+  const list = await call({ action: 'list' });
+  assert.match(list.content[0].text, /No task is selected/, 'restoring a task did not restore its old next step');
+});
+
+test('focus survives an in-place reset, a successor handoff with a stale note, and a process restart', async () => {
+  const branch = [CONTINUATION_GOAL];
+  const f = fake({ tokens: 30_000, file: '/s/continuation.jsonl', branch });
+  const { call, open } = await focusFixture(f);
+  await call({ action: 'focus', id: 'L2', next_step: FOCUS_STEP, waiting: true });
+  const reg = Symbol.for('pi-subagents:manager');
+  const child = { id: 'c1', type: 'delegate', status: 'running' };
+  globalThis[reg] = { getRecord: (id) => id === child.id ? child : null };
+  const check = (text) => {
+    const footer = text.split('## Continuation to check').at(-1);
+    assert.ok(footer.includes(open.id) && footer.includes(FOCUS_STEP));
+    assert.match(footer, /L2 \(waiting.*Check this blocker before continuing/s);
+    assert.doesNotMatch(footer, /Launch the old experiment/);
+  };
+  try {
+    f.pi.events.emit('subagents:started', { id: child.id });
+    f.ctx.usage.tokens = 95_000;
+    await f.emit('input', { source: 'extension', text: 'Continue the active /goal <!-- pi-goal-continuation:abc -->' });
+    await f.tools.mina_handoff_note.execute('id', { state: 'old experimental route appears in the note', next_actions: ['Launch the old experiment'] }, null, null, f.ctx);
+    const reset = await f.emit('turn_end', { message: { role: 'assistant', stopReason: 'toolUse' } });
+    assert.equal(f.newSessions.length, 0);
+    check(reset.entries.at(-1).content);
+    // A noisy transcript can fill the optional packet budget without clipping the continuation.
+    branch.push(...reset.entries, { type: 'compaction', summary: 'x'.repeat(30_000) });
+    child.status = 'completed';
+    f.pi.events.emit('subagents:completed', { id: child.id, status: 'completed', result: 'ok' });
+    await f.commands['mina-handoff'].handler('now', f.ctx);
+    const successor = f.newSessions.at(-1);
+    check(successor.messages[0].content);
+    const reopened = fake({ file: '/s/successor.jsonl', branch: asBranch(successor.custom) });
+    await reopened.emit('session_start', { reason: 'startup' });
+    const event = { systemPromptOptions: {} };
+    await reopened.emit('before_agent_start', event);
+    check(Object.values(event.systemPromptOptions.sections ?? {}).join('\n'));
+    assert.deepEqual(reopened.sent, [], 'restoring the record does not trigger a model turn');
+  } finally { delete globalThis[reg]; }
+});
+
 test('the user\'s instruction survives an in-place handoff and a new session word for word, sorted or not (2026-11-19 02:26 -> 11:10)', async () => {
   const goal = { id: 'g1', status: 'active', objective: 'orchestrate', checks: [] };
   const recs = {};

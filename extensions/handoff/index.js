@@ -242,6 +242,8 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
     let packet = renderPacket({ note, goal, fallback: note ? null : fallbackSummary(branch), parentFile: file, briefs: briefs(ctx.cwd), subagents,
       running: liveChildren(), plan: readPlan(ctx.cwd), minimal: liveTuning(ctx)?.goal_prompt === 'minimal', inPlace: true, ledger: ledger.section(ctx) });
     packet += extensionSection(carried.filter((c) => c.source === 'extension'));
+    const continuation = ledger.continuation(ctx);
+    if (continuation) packet += `\n${continuation}\n`;
     const resume = requestedBy === 'steer' && interrupted && !goalActive && !quota && !userCarried.length;
     const u = usage(ctx), at = new Date().toISOString();
     measureEvent('handoff', { mode: 'in-place', tokens: u?.tokens ?? null, compactions: compactions(ctx), note: Boolean(note), subagents_running: running.size });
@@ -360,6 +362,13 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
       m.model = `${from.provider}/${from.id}`;
     } finally { pi.events?.emit?.('mina:handoff-model-ready', ctx); }
   });
+  // A reopened transcript can have an older snapshot in its context. Show the current selection on the next run,
+  // without initiating a model turn at session_start or replacing the provider's system prompt.
+  pi.on('before_agent_start', (event, ctx) => {
+    const options = event.systemPromptOptions;
+    const continuation = ledger.continuation(ctx);
+    if (options && continuation) options.sections = { ...options.sections, 'mina-continuation': continuation };
+  });
   // Measurements name the model that runs, also after /model or the switch back above.
   pi.on('model_select', (event) => { if (event?.model) m.model = `${event.model.provider}/${event.model.id}`; });
   // Inside a run: a long tool loop can outgrow the window without ever reaching an input boundary. After each turn, if a
@@ -436,7 +445,8 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
     const text = compactionRestatement({ goal, briefs: briefs(ctx.cwd), plan: readPlan(ctx.cwd),
       ledger: ledger.section(ctx, { exclude: user ? [user.id] : [] }),
       work: workInProgress({ user, assistant: latestAssistantText(ctx.sessionManager?.getBranch?.() ?? [], event.message) }) });
-    return text ? { entries: [...event.entries, { type: 'custom_message', customType: 'mina-goal', content: text, display: false }] } : undefined;
+    const content = [text, ledger.continuation(ctx)].filter(Boolean).join('\n\n');
+    return content ? { entries: [...event.entries, { type: 'custom_message', customType: 'mina-goal', content, display: false }] } : undefined;
   }
 
   // The boundary: the next input after the context passed the threshold.
@@ -570,6 +580,8 @@ export default function minaHandoff(pi, { tuning = loadTuning(), readTuning = re
       const resume = requestedBy === 'steer' && interrupted && !goalActive && !quota && !userCarried.length;
       const otherCarried = carried.filter((c) => c.source === 'extension');
       packet += extensionSection(otherCarried);
+      const continuation = ledger.continuation(ctx);
+      if (continuation) packet += `\n${continuation}\n`;
       // Everything read from ctx is read here: by the time setup runs, Pi has replaced the session and this ctx is stale
       // (any access throws, and Pi exits on the error).
       const u = usage(ctx);

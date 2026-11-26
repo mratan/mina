@@ -154,6 +154,12 @@ The work in progress is the latest message of the user, word for word, and the l
 The message tells the agent to continue that work. The goal restatement is a reminder, not a new start.
 The reason: the model follows the last instruction in its context. An order to read the goal file again pushed an open request of the user aside.
 
+The agent can select one active operator task with `mina_ledger` action `focus`.
+The record links the task to the user’s words and stores a short next step or blocker.
+Compaction and handoff show this record after the summary. A reopened session uses it on the next run without starting a turn.
+New messages do not clear the selection. The user can still redirect the work. A closed or superseded task loses its selection.
+The record does not start work on its own, verify a receipt, or grant access.
+
 A recorded handoff note describes the session only at the time when the agent wrote it.
 Thus `/mina-handoff` uses a recorded note only if no compaction and no model reply came after it, and no handoff used it.
 Otherwise, the packet uses the automatic summary.

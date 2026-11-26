@@ -1,6 +1,6 @@
 # MI->NA | Mapping Information to Next Actions
 
-Mina adds research tools, checked goals, long sessions, and a sandbox to the [Pi](https://pi.dev) coding agent.
+Mina adds research tools, goals with checks, session continuity, and a sandbox to the [Pi](https://pi.dev) coding agent.
 It works with Pi's model providers, including Claude, OpenAI Codex, and local models.
 You can use it for software development, literature research, and controlled jobs on shared GPU machines.
 
@@ -253,16 +253,16 @@ Mina supports these controls:
 - **Budgets:** A goal can have a token budget and limits on automatic responses.
 - **Questions:** The agent can request a decision through a dialog with a recommendation and alternatives.
 - **Operator procedures:** The agent records commands for steps that require a person. Approval does not run those commands.
+- **Edit:** `/goal edit <objective>` changes the objective without replacing the approved checks. Handoffs use the new objective.
 - **Reopen:** `/goal reopen <reason>` reopens a completed goal with its existing checks.
 
 Mina pauses a goal after three automatic runs with no observable progress.
 It retries transient provider errors after 2, 5, and 15 minutes.
 
-If the provider reports a usage reset time, Mina waits until that time plus one minute and resumes the goal.
-This recovery keeps the selected provider, model, checks, and cumulative usage.
-It does not switch accounts or providers to escape a limit.
-Mina must remain open for automatic recovery.
-Billing errors and unknown reset times leave the goal paused.
+If the provider reports a usage reset time, Mina waits until one minute after that time. Then Mina resumes the goal on the same model and account.
+Mina stores the reset deadline in the session. A handoff can carry it to the next session. Reopening a session on the same model can restore the deadline.
+During the wait, broker alarms remain visible without starting a model turn.
+Billing errors and unknown reset times do not schedule an automatic resume.
 
 A passed check proves only what the check examines.
 Mina does not automatically commission an independent reviewer or certify scientific results.
@@ -276,9 +276,16 @@ Recent turns stay unchanged.
 Long tool outputs can also shrink in the model's context.
 The session file retains the original messages and tool outputs.
 
-Near the context limit, Mina continues the goal in a new session with a handoff note, the plan, and the checks.
-Broker jobs and monitors continue across the handoff.
-Messages that you type during the handoff go to the new session.
+Near the context limit, Mina prepares a handoff note.
+If subagents are active, Mina resets the context in place without stopping them.
+Otherwise, Mina opens a successor session with the note, the plan, and the checks.
+Broker jobs and monitors continue in either case.
+
+The operator ledger stores your instructions in your own words.
+The agent can select one open task with the `mina_ledger` action `focus`. This action records the next step or blocker.
+Mina shows this selection after compaction, handoff, or restart.
+A closed or superseded task loses its selection.
+The selection does not start work or grant permission.
 
 The agent can retrieve details that a summary omits:
 
@@ -422,7 +429,8 @@ Subagents run in the sandbox and have no host access.
 
 Each role has an explicit tool set.
 The parent can steer a running subagent and read its paged results.
-Mina records their tool calls so that the parent can inspect evidence, not only their final reports.
+Mina records tool calls and why each subagent stops. A normal stop does not prove that the task is complete.
+Mina can retry a transient model request without repeating completed tool calls.
 Completed reports remain available after context compaction.
 See [subagents](docs/usage.md#subagents) and [delegation](docs/delegation.md).
 

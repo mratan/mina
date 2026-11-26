@@ -20,6 +20,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from '
 import { oneDialog } from '../../lib/dialog-lock.mjs';
 import { lineage } from './recall.mjs';
 import { ANSWER_EVENT } from '../goal/ask.mjs';
+import { nativeForContract } from '../goal/revision.mjs';
 
 export const OPLOG = 'mina-operator-message';
 export const LEDGER = 'mina-ledger';
@@ -39,6 +40,28 @@ let lastAt = 0;
 const nextAt = () => { lastAt = Math.max(Date.now(), lastAt + 1); return new Date(lastAt); };
 export const newMessage = (text, goal = null, at = nextAt(), extra = {}) => ({ id: `U${randomBytes(4).toString('hex')}`, at: at.toISOString(), text, goal, ...extra });
 const live = (e) => e.status === 'active' || e.status === 'disputed';
+const activeTask = (ledger, id) => ledger.entries.find((e) => e.id === id && e.kind === 'task' && e.status === 'active');
+const FOCUS_MAX_BYTES = 1000;
+
+function focusTask(ledger, { id, next_step, waiting = false }) {
+  if (!ledger.goal || !activeTask(ledger, id)) throw new Error(`${id ?? 'No ID'}: focus requires an active task for this goal.`);
+  const step = norm(next_step);
+  if (!step || Buffer.byteLength(step) > FOCUS_MAX_BYTES) throw new Error(`Give a next step of 1–${FOCUS_MAX_BYTES} bytes.`);
+  return { ...ledger, focus: { id, step, waiting } };
+}
+
+function continuationSection(ledger, active = true) {
+  if (!Object.hasOwn(ledger, 'focus')) return '';
+  const e = activeTask(ledger, ledger.focus?.id);
+  const head = '## Continuation to check';
+  if (!active) return `${head}\nThe goal is not active. Do not resume an older selection from a note or summary.`;
+  if (!e) return `${head}\nNo task is selected. Do not resume an older selection from a note or summary.`;
+  const { step, waiting } = ledger.focus;
+  const quote = e.quote.length > 512 ? `${e.quote.slice(0, 512)}… (full quote: mina_ledger list)` : e.quote;
+  return `${head}\n${e.id} (${waiting ? 'waiting' : 'open'}; user message ${e.source}): ${JSON.stringify(quote)}\n`
+    + `${waiting ? 'Check this blocker before continuing' : 'Recorded next step (the agent’s words)'}: ${step}\n`
+    + 'Use this rather than an older note if the user has not redirected you. This record grants no permission and does not resume the goal.';
+}
 const when = (iso) => String(iso ?? '').slice(0, 16).replace('T', ' ');
 
 // The goal's messages: those carried from earlier sessions, then this session's, oldest first.
@@ -168,13 +191,25 @@ const MINA_LEDGER_DESCRIPTION = 'The user\'s standing instructions for this goal
   + 'If a message seems to conflict with an active entry or with the goal text, add it with conflicts_with and conflict: mina asks the user. '
   + 'The user\'s answers to mina_ask_user are logged as messages too: quote them like any message. A disputed entry that the user settled in '
   + 'such an answer (or in a later message) is settled with action resolve: id, outcome, message_id and quote. '
+  + 'For a task that must survive a context reset, use focus with its id and a short next_step. Set waiting if that step checks a blocker. '
+  + 'Update it when the next step changes. Unfocus removes the selection without closing the task. '
   + 'Action list shows the entries and the unsorted messages with their ids.';
 
 export function installLedger(pi, { notify = () => {}, measure = () => {} } = {}) {
   let log = [], ledger = emptyLedger(), written = null, sessionFile = null;
-  const goalOf = (ctx) => (ctx?.sessionManager?.getBranch?.() ?? []).filter((e) => e.type === 'custom' && e.customType === 'mina-goal').at(-1)?.data?.id ?? null;
+  const contract = (ctx) => (ctx?.sessionManager?.getBranch?.() ?? []).findLast((e) => e.type === 'custom' && e.customType === 'mina-goal')?.data;
+  const active = (ctx) => {
+    const current = contract(ctx);
+    const latest = (ctx?.sessionManager?.getBranch?.() ?? []).findLast((e) => e.type === 'custom' && e.customType === 'goal-state');
+    const upstream = nativeForContract(current, latest?.data?.goal);
+    return current?.status === 'active' && (!upstream || upstream.status === 'active');
+  };
   // A new goal starts an empty ledger: entries belong to the goal they were given for.
-  const sync = (ctx) => { const g = goalOf(ctx); if (ledger.goal !== g) ledger = emptyLedger(g); };
+  const goalOf = (ctx) => contract(ctx)?.id ?? null;
+  const sync = (ctx) => {
+    const g = goalOf(ctx);
+    if (ledger.goal !== g) ledger = { ...emptyLedger(g), ...(Object.hasOwn(ledger, 'focus') ? { focus: null } : {}) };
+  };
   // Messages from earlier sessions of the handoff chain that were sorted there (and so not carried).
   const older = (id) => {
     if (!sessionFile) return null;
@@ -206,7 +241,10 @@ export function installLedger(pi, { notify = () => {}, measure = () => {} } = {}
       written = text;
     } catch { /* the mirror is a convenience: the session file is the store */ }
   };
-  const save = (ctx) => { pi.appendEntry(LEDGER, ledger); mirror(ctx); };
+  const save = (ctx) => {
+    if (ledger.focus && !activeTask(ledger, ledger.focus.id)) ledger = { ...ledger, focus: null };
+    pi.appendEntry(LEDGER, ledger); mirror(ctx);
+  };
   const logMessage = (ctx, text, extra) => {
     const m = newMessage(text, ledger.goal, undefined, extra);
     log.push(m);
@@ -262,7 +300,9 @@ export function installLedger(pi, { notify = () => {}, measure = () => {} } = {}
       type: 'object',
       additionalProperties: false,
       properties: {
-        action: { type: 'string', enum: ['list', 'add', 'retire', 'resolve', 'sort'] },
+        action: { type: 'string', enum: ['list', 'add', 'retire', 'resolve', 'sort', 'focus', 'unfocus'] },
+        next_step: { type: 'string', description: 'focus: the next action or blocker to check; include a concrete receipt or path if available.' },
+        waiting: { type: 'boolean', description: 'focus: true if progress first needs a blocker to clear.' },
         outcome: { type: 'string', enum: ['new', 'old', 'both'], description: 'resolve: new (the disputed entry stands; the entries it conflicts with end), old (it ends), or both stand.' },
         kind: { type: 'string', enum: KINDS, description: 'add: what the quote is.' },
         message_id: { type: 'string', description: 'add: the message quoted. retire with status superseded: the later message that replaces the entry. resolve: the user\'s answer.' },
@@ -270,7 +310,7 @@ export function installLedger(pi, { notify = () => {}, measure = () => {} } = {}
         meaning: { type: 'string', description: 'add: your reading of the quote.' },
         conflicts_with: { type: 'array', items: { type: 'string' }, description: 'add: entry ids, or "goal", that this seems to conflict with. mina asks the user.' },
         conflict: { type: 'string', description: 'add with conflicts_with: the conflict, in one sentence.' },
-        id: { type: 'string', description: 'retire, resolve: the entry id (L1, L2, ...).' },
+        id: { type: 'string', description: 'focus, retire, resolve: the entry id (L1, L2, ...).' },
         status: { type: 'string', enum: ['superseded', 'done'] },
         evidence: { type: 'string', description: 'retire a task with status done: the recorded evidence (a file, a command and its output, a check result).' },
         message_ids: { type: 'array', items: { type: 'string' }, description: 'sort: messages whose standing content is recorded (or that have none).' },
@@ -283,16 +323,21 @@ export function installLedger(pi, { notify = () => {}, measure = () => {} } = {}
       try {
         if (params.action === 'list') {
           const all = goalMessages(ledger, log), open = unsorted(ledger, log);
-          return reply([ledgerSection(ledger, log, { maxUnsorted: Infinity }) || 'The ledger is empty and every message is sorted.',
-            `${all.length} message(s) for this goal, ${open.length} unsorted. Ended entries: ${ledger.entries.filter((e) => !live(e)).map((e) => `${e.id} ${e.status}`).join(', ') || 'none'}.`].join('\n\n'));
+          return reply([continuationSection(ledger, active(ctx)), ledgerSection(ledger, log, { maxUnsorted: Infinity }) || 'The ledger is empty and every message is sorted.',
+            `${all.length} message(s) for this goal, ${open.length} unsorted. Ended entries: ${ledger.entries.filter((e) => !live(e)).map((e) => `${e.id} ${e.status}`).join(', ') || 'none'}.`].filter(Boolean).join('\n\n'));
         }
+        if (params.action === 'focus') {
+          if (!active(ctx)) return reply('The goal is not active.', true);
+          ledger = focusTask(ledger, params); save(ctx); return reply(continuationSection(ledger));
+        }
+        if (params.action === 'unfocus') { ledger = { ...ledger, focus: null }; save(ctx); return reply(continuationSection(ledger, active(ctx))); }
         if (params.action === 'sort') { ledger = sortMessages(ledger, params.message_ids, find); save(ctx); return reply(`Sorted: ${(params.message_ids ?? []).join(', ')}.`); }
         if (params.action === 'retire') { ledger = retireEntry(ledger, params, find); save(ctx); return reply(`${params.id} is ${params.status}.`); }
         if (params.action === 'resolve') {
           ledger = resolveFromMessage(ledger, params, find); save(ctx);
           return reply(`${params.id} is ${ledger.entries.find((e) => e.id === params.id).status}, by the user's words in ${params.message_id}.`);
         }
-        if (params.action !== 'add') return reply('action must be list, add, retire, resolve or sort.', true);
+        if (params.action !== 'add') return reply('Unknown ledger action.', true);
         ledger = addEntry(ledger, params, find);
         const entry = ledger.entries.at(-1);
         save(ctx);
@@ -343,6 +388,7 @@ export function installLedger(pi, { notify = () => {}, measure = () => {} } = {}
     // The section for a restatement or a packet (exclude: message ids shown elsewhere in the same text).
     section: (ctx, opts) => { sync(ctx); return ledgerSection(ledger, log, opts); },
     latest: (ctx) => { sync(ctx); return goalMessages(ledger, log).at(-1) ?? null; },
+    continuation: (ctx) => { sync(ctx); return continuationSection(ledger, active(ctx)); },
     // The ledger a successor session starts with: the entries, and the unsorted messages carried word for word.
     successor: (ctx) => { sync(ctx); return { ...ledger, carried: unsorted(ledger, log), sorted: [] }; },
   };
